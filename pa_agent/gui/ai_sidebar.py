@@ -45,15 +45,24 @@ class AISidebar(QWidget):
         self._tabs.addTab(self.prompt_files, "调试")
 
         if settings is not None:
-            self.stream.bind_settings(settings)
+            self.bind_settings(settings)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._tabs)
 
+    TAB_STREAM = 0
+    TAB_DECISION_TREE = 1
+    TAB_DECISION_FLOW = 2
+
     def focus_stream(self) -> None:
         """Switch to the live AI output tab (index 0)."""
-        self._tabs.setCurrentIndex(0)
+        self._tabs.setCurrentIndex(self.TAB_STREAM)
+
+    def focus_decision_flow_viz(self) -> None:
+        """Switch to the decision flow visualization tab."""
+        self._tabs.setCurrentIndex(self.TAB_DECISION_FLOW)
 
     def bind_settings(self, settings: Optional["Settings"]) -> None:
         self.stream.bind_settings(settings)
+        self.decision_flow_viz.bind_settings(settings)

@@ -85,6 +85,9 @@ _GENERIC_ANSWER: dict[str, str] = {
     "不通过": "否",
     "违反": "否",
     "触犯": "否",
+    "无交易计划，不存在触犯": "否",
+    "未触犯": "否",
+    "不存在触犯": "否",
     "pass": "是",
     "fail": "否",
     "yes": "是",
@@ -92,6 +95,29 @@ _GENERIC_ANSWER: dict[str, str] = {
 }
 
 _BAR_RANGE_ALIASES = frozenset({"全局", "全图", "整体", "全部", "all"})
+_NULLISH_STRINGS = frozenset({"", "null", "none", "nil", "n/a"})
+
+
+def _is_nullish(value: Any) -> bool:
+    if value is None:
+        return True
+    return str(value).strip().lower() in _NULLISH_STRINGS
+
+
+def _ensure_trace_string_fields(item: dict[str, Any]) -> None:
+    """Coerce missing / null JSON values to strings before schema validation."""
+    for key in ("node_id", "question", "answer", "reason"):
+        if key not in item or _is_nullish(item.get(key)):
+            if key == "answer" and item.get("skipped"):
+                item[key] = "不适用"
+            elif key in ("question", "reason"):
+                item[key] = "—"
+            elif key == "node_id":
+                item[key] = ""
+            elif key == "answer":
+                item[key] = "不适用" if item.get("skipped") else "否"
+            else:
+                item[key] = ""
 
 _COMPOSITE_ANSWER_RE = re.compile(
     r"^(是|否|中性|等待|不适用)\s*[,，:：\-—]\s*(.+)$"
@@ -195,12 +221,63 @@ def _resolve_trace_answer(
     return None
 
 
+def _coerce_bar_range(
+    item: dict[str, Any],
+    *,
+    default_max_seq: int | None = None,
+    prior_bar_range: str | None = None,
+) -> None:
+    """Ensure bar_range is a non-null string (schema + validator)."""
+    nid = str(item.get("node_id", ""))
+    skipped = bool(item.get("skipped"))
+    ans = str(item.get("answer", "")).strip()
+
+    if skipped and not ans:
+        item["answer"] = "不适用"
+        ans = "不适用"
+
+    br = item.get("bar_range")
+    if _is_nullish(br):
+        if skipped or ans == "不适用":
+            item["bar_range"] = "不适用"
+            return
+        if prior_bar_range and prior_bar_range not in ("不适用", "—"):
+            item["bar_range"] = prior_bar_range
+            logger.debug(
+                "bar_range null -> copied %s (node %s)",
+                prior_bar_range,
+                nid,
+            )
+            return
+        if default_max_seq and default_max_seq > 1:
+            item["bar_range"] = f"K{default_max_seq}-K1"
+            logger.debug(
+                "bar_range null -> K%s-K1 (node %s)",
+                default_max_seq,
+                nid,
+            )
+            return
+        item["bar_range"] = "不适用"
+        return
+
+    fixed = fix_bar_range_string(str(br), default_max_seq=default_max_seq)
+    if fixed != str(br).strip():
+        logger.debug("bar_range %s -> %s (node %s)", br, fixed, nid)
+    item["bar_range"] = fixed
+
+
 def normalize_trace_item(
     item: dict[str, Any],
     *,
     default_max_seq: int | None = None,
+    prior_bar_range: str | None = None,
 ) -> None:
     """Mutate one trace item: answer + bar_range."""
+    _ensure_trace_string_fields(item)
+    nid = str(item.get("node_id", "")).strip()
+    if nid == "14":
+        item["node_id"] = "14.1"
+
     nid = str(item.get("node_id", ""))
 
     ans = str(item.get("answer", "")).strip()
@@ -220,18 +297,17 @@ def normalize_trace_item(
             if branch:
                 item.setdefault("branch", branch)
 
-    br = item.get("bar_range")
-    if br is not None and str(br).strip():
-        fixed = fix_bar_range_string(str(br), default_max_seq=default_max_seq)
-        if fixed != str(br).strip():
-            logger.debug("bar_range %s -> %s (node %s)", br, fixed, nid)
-        item["bar_range"] = fixed
-
     bar_from = item.get("bar_from")
     bar_to = item.get("bar_to")
-    if bar_from is not None and bar_to is not None and not item.get("bar_range"):
+    if bar_from is not None and bar_to is not None and _is_nullish(item.get("bar_range")):
         bf, bt = int(bar_from), int(bar_to)
         item["bar_range"] = f"K{max(bf, bt)}-K{min(bf, bt)}" if bf != bt else f"K{bf}"
+
+    _coerce_bar_range(
+        item,
+        default_max_seq=default_max_seq,
+        prior_bar_range=prior_bar_range,
+    )
 
 
 def normalize_trace_list(
@@ -242,9 +318,17 @@ def normalize_trace_list(
     if not isinstance(trace, list):
         return trace
     max_seq = default_max_seq or infer_max_bar_seq_from_trace(trace)
+    last_br: str | None = None
     for item in trace:
         if isinstance(item, dict):
-            normalize_trace_item(item, default_max_seq=max_seq)
+            normalize_trace_item(
+                item,
+                default_max_seq=max_seq,
+                prior_bar_range=last_br,
+            )
+            br = str(item.get("bar_range", "") or "")
+            if br and br not in ("不适用", "—", "-"):
+                last_br = br
     return trace
 
 

@@ -43,6 +43,15 @@ def test_load_decision_tree_has_sections() -> None:
     assert "0.1" in tree["node_index"]
 
 
+def test_node_branch_outcomes_from_txt() -> None:
+    tree = load_decision_tree()
+    n01 = tree["node_index"]["0.1"]
+    assert "继续" in n01.get("branch_yes", "")
+    assert "等待" in n01.get("branch_no", "")
+    n63 = tree["node_index"]["6.3"]
+    assert "下边界" in n63.get("branch_yes", "") or "看涨" in n63.get("branch_yes", "")
+
+
 def test_merge_traces_order() -> None:
     merged = merge_traces(SAMPLE_GATE_TRACE, SAMPLE_DECISION_TRACE)
     assert merged[0]["phase"] == "gate"

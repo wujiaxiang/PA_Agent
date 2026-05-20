@@ -12,6 +12,13 @@ _BINARY_DECISION_FILE = "二元决策.txt"
 
 _SECTION_RE = re.compile(r"^##\s+(\d+)\.\s+(.+)$")
 _NODE_RE = re.compile(r"^###\s+([\d.]+[A-Z]?)\s+(.+)$")
+_NODE_HEADER_LINE_RE = re.compile(r"^###\s+([\d.]+[A-Z]?)\s+")
+_BRANCH_OUTCOME_LINE_RE = re.compile(
+    r"^(是|否)(?:[，,]([^：:\n]+))?[：:]\s*(.*)$"
+)
+_BRANCH_OUTCOME_STOP_RE = re.compile(
+    r"^(处理|判断依据|条件|说明|多头条件|空头条件|上涨|下跌)[：:]"
+)
 _BAR_RANGE_RE = re.compile(r"^K(\d+)-K(\d+)$", re.IGNORECASE)
 _SINGLE_BAR_RE = re.compile(r"^K(\d+)$", re.IGNORECASE)
 _QUESTION_BAR_BASIS_SUFFIX_RE = re.compile(r"（基于[^）]+判断）$")
@@ -59,11 +66,100 @@ def _index_of(nodes: list[str], node_id: str) -> int:
         return -1
 
 
+def _collect_branch_outcome(block_lines: list[str], branch_char: str) -> str:
+    """Extract summary text after ``是：`` / ``否，…：`` in a node block."""
+    collecting = False
+    parts: list[str] = []
+    qualifier = ""
+
+    def _flush_qualifier() -> None:
+        nonlocal qualifier
+        if qualifier and (not parts or parts[-1] != qualifier):
+            parts.append(qualifier)
+        qualifier = ""
+
+    for raw in block_lines:
+        line = raw.strip()
+        if not line:
+            if collecting and parts:
+                break
+            continue
+        m = _BRANCH_OUTCOME_LINE_RE.match(line)
+        if m:
+            if m.group(1) == branch_char:
+                collecting = True
+                qualifier = (m.group(2) or "").strip()
+                rest = (m.group(3) or "").strip()
+                if qualifier and rest:
+                    parts.append(f"{qualifier}：{rest}")
+                    qualifier = ""
+                elif rest:
+                    parts.append(rest)
+                elif qualifier:
+                    parts.append(qualifier)
+                    qualifier = ""
+            elif collecting:
+                break
+            continue
+        if collecting:
+            if _BRANCH_OUTCOME_LINE_RE.match(line):
+                if parts:
+                    break
+                continue
+            if line.startswith("###") or line.startswith("##"):
+                break
+            if _BRANCH_OUTCOME_STOP_RE.match(line):
+                break
+            bullet = line.lstrip("-• ").strip()
+            if qualifier:
+                parts.append(f"{qualifier}：{bullet}")
+                qualifier = ""
+            else:
+                parts.append(bullet)
+            if len(parts) >= 5:
+                break
+    _flush_qualifier()
+    text = " · ".join(p for p in parts if p)
+    if len(text) > 140:
+        return text[:137] + "…"
+    return text
+
+
+def _parse_all_branch_outcomes(text: str) -> dict[str, dict[str, str]]:
+    """Map node_id -> {branch_yes, branch_no} from decision tree source text."""
+    outcomes: dict[str, dict[str, str]] = {}
+    chunks = re.split(r"(?=^###\s+[\d.])", text, flags=re.MULTILINE)
+    for chunk in chunks:
+        header = chunk.strip().splitlines()[0] if chunk.strip() else ""
+        hm = _NODE_HEADER_LINE_RE.match(header)
+        if not hm:
+            continue
+        nid = hm.group(1)
+        lines = chunk.splitlines()[1:]
+        outcomes[nid] = {
+            "branch_yes": _collect_branch_outcome(lines, "是"),
+            "branch_no": _collect_branch_outcome(lines, "否"),
+        }
+    return outcomes
+
+
+def get_node_branch_outcome(node_id: str, branch: str) -> str:
+    """Return human-readable outcome for the ``是`` or ``否`` arm (branch=yes|no)."""
+    tree = load_decision_tree()
+    node = tree.get("node_index", {}).get(str(node_id), {})
+    key = "branch_yes" if branch in ("yes", "是", "y") else "branch_no"
+    text = str(node.get(key, "") or "").strip()
+    if text:
+        return text
+    return "继续下一步" if key == "branch_yes" else "等待 / 切换逻辑"
+
+
 @lru_cache(maxsize=1)
 def load_decision_tree(path: Path | None = None) -> dict[str, Any]:
     """Parse ``二元决策.txt`` into sections + nodes for the UI tree."""
     txt_path = path or (PROMPT_DIR / _BINARY_DECISION_FILE)
     text = txt_path.read_text(encoding="utf-8")
+    branch_outcomes = _parse_all_branch_outcomes(text)
     sections: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
 
@@ -94,10 +190,14 @@ def load_decision_tree(path: Path | None = None) -> dict[str, Any]:
     node_index: dict[str, dict[str, Any]] = {}
     for sec in sections:
         for node in sec["nodes"]:
-            node_index[node["id"]] = {
+            nid = node["id"]
+            bo = branch_outcomes.get(nid, {})
+            node_index[nid] = {
                 **node,
                 "section_id": sec["id"],
                 "section_title": sec["title"],
+                "branch_yes": bo.get("branch_yes", ""),
+                "branch_no": bo.get("branch_no", ""),
             }
 
     return {

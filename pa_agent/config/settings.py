@@ -1,7 +1,7 @@
 """Pydantic settings models for PA Agent."""
 from __future__ import annotations
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class AIProviderSettings(BaseModel):
@@ -26,6 +26,17 @@ class GeneralSettings(BaseModel):
     context_warning_threshold_pct: float = 80.0
     last_symbol: str = "XAUUSD"
     last_timeframe: str = "1h"
+    decision_flow_auto_play: bool = False
+    decision_flow_play_seconds: int = 50
+    #: 决策树可视化：在「整图适配」基础上的缩放百分比（100=与适配一致；可任意放大，仅下限 10%）
+    decision_flow_default_zoom_pct: int = Field(default=500, ge=10)
+
+    @field_validator("decision_flow_default_zoom_pct", mode="before")
+    @classmethod
+    def _coerce_zoom_pct(cls, v: object) -> object:
+        if v is None:
+            return 50
+        return v
 
 
 class Settings(BaseModel):

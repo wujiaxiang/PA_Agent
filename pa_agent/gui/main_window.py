@@ -8,10 +8,13 @@ from PyQt6.QtCore import QThread, pyqtSignal, QObject
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMenuBar,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -156,6 +159,9 @@ class MainWindow(QMainWindow):
         self._last_forming_ts_open: int | None = None
         self._free_chat_session: Any = None
         self._last_stage1_diagnosis: dict | None = None
+        self._demo_mode = False
+        self._demo_record_path: str | None = None
+        self._demo_replayer: Any = None
         # RefreshLoop runs in its own QThread
         self._refresh_loop: Any = None
         self._refresh_thread: QThread | None = None
@@ -195,6 +201,12 @@ class MainWindow(QMainWindow):
         # ── Status bar ────────────────────────────────────────────────────────
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
+        self._demo_mode_label = QLabel("")
+        self._demo_mode_label.setStyleSheet(
+            "color: #e6b800; font-weight: 600; padding-left: 4px;"
+        )
+        self._demo_mode_label.hide()
+        self._status_bar.addWidget(self._demo_mode_label, 1)
         self._status_bar.showMessage("就绪")
         self._sync_submit_button_state()
 
@@ -254,6 +266,7 @@ class MainWindow(QMainWindow):
         ctrl_layout.addStretch()
 
         self._wait_close_checkbox = QCheckBox("等待最新K线收盘后再提交分析")
+        self._wait_close_checkbox.setObjectName("waitCloseCheckbox")
         self._wait_close_checkbox.setChecked(False)
         self._wait_close_checkbox.setToolTip(
             "勾选后，点击提交分析将先等待当前未收盘K线走完，再抓取数据并开始分析"
@@ -271,6 +284,11 @@ class MainWindow(QMainWindow):
         self._submit_btn.setMinimumWidth(100)
         self._submit_btn.clicked.connect(self._on_submit_analysis)
         ctrl_layout.addWidget(self._submit_btn)
+
+        self._demo_btn = QPushButton("演示模式")
+        self._demo_btn.setToolTip("用 records/pending 中已保存的分析记录回放界面")
+        self._demo_btn.clicked.connect(self._on_demo_mode_button)
+        ctrl_layout.addWidget(self._demo_btn)
 
         self._resume_chart_btn = QPushButton("图表实时更新")
         self._resume_chart_btn.setEnabled(False)
@@ -493,49 +511,11 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            from pa_agent.data.snapshot import compute_indicators
-            from pa_agent.data.base import KlineBar, KlineFrame
-            from pa_agent.util.timefmt import now_local_ms
             import time as _time
 
-            settings = getattr(self._ctx, "settings", None)
-            n_bars = 200
-            if settings is not None:
-                n_bars = getattr(settings.general, "default_bar_count", 200)
-
-            symbol = self._symbol_combo.currentText().strip()
-            timeframe = self._tf_combo.currentText()
-
-            # Use the bars directly from latest_snapshot (already newest-first,
-            # bars[0] is the forming bar).  Re-assign seq numbers to guarantee
-            # the bijection invariant expected by the rest of the system.
-            raw = bars[:n_bars]
-            if len(raw) < n_bars:
-                # Not enough bars yet — skip this tick silently
+            frame = self._build_chart_frame_from_bars(bars, include_forming=True)
+            if frame is None:
                 return
-
-            rebased: list[KlineBar] = [
-                KlineBar(
-                    seq=i + 1,
-                    ts_open=b.ts_open,
-                    open=b.open,
-                    high=b.high,
-                    low=b.low,
-                    close=b.close,
-                    volume=b.volume,
-                    closed=(i != 0),
-                )
-                for i, b in enumerate(raw)
-            ]
-
-            indicators = compute_indicators(rebased)
-            frame = KlineFrame(
-                symbol=symbol,
-                timeframe=timeframe,
-                bars=tuple(rebased),
-                indicators=indicators,
-                snapshot_ts_local_ms=now_local_ms(),
-            )
 
             self._chart_widget.set_frame(frame)
 
@@ -794,6 +774,169 @@ class MainWindow(QMainWindow):
             )
         return True
 
+    def _on_demo_mode_button(self) -> None:
+        """Enter demo mode (manual/auto) or exit if already active."""
+        if self._demo_mode:
+            self._exit_demo_mode()
+            return
+        menu = QMenu(self)
+        menu.addAction("手动选择记录…", lambda: self._start_demo_mode("manual"))
+        menu.addAction("自动随机记录", lambda: self._start_demo_mode("auto"))
+        menu.exec(self._demo_btn.mapToGlobal(self._demo_btn.rect().bottomLeft()))
+
+    def _start_demo_mode(self, mode: str) -> None:
+        """Load a pending JSON record and replay it through the UI."""
+        from pa_agent.config.paths import RECORDS_PENDING_DIR
+        from pa_agent.demo.record_loader import load_analysis_record, pick_random_record_path
+
+        if mode == "manual":
+            start_dir = str(RECORDS_PENDING_DIR)
+            path_str, _ = QFileDialog.getOpenFileName(
+                self,
+                "选择演示记录",
+                start_dir,
+                "分析记录 (*.json);;所有文件 (*.*)",
+            )
+            if not path_str:
+                return
+            from pathlib import Path
+
+            path = Path(path_str)
+        else:
+            path = pick_random_record_path()
+            if path is None:
+                QMessageBox.warning(
+                    self,
+                    "演示模式",
+                    f"未找到可用记录：\n{RECORDS_PENDING_DIR}",
+                )
+                return
+
+        try:
+            record = load_analysis_record(path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "演示模式", f"无法读取记录：\n{exc}")
+            return
+
+        if not record.stage2_decision and not record.stage1_diagnosis:
+            QMessageBox.warning(
+                self,
+                "演示模式",
+                "该记录缺少阶段一/阶段二结果，无法完整演示。",
+            )
+            return
+
+        self._enter_demo_mode(path, record)
+
+    def _enter_demo_mode(self, path: Any, record: Any) -> None:
+        """Switch UI into demo state and start timed replay."""
+        from pathlib import Path
+
+        from pa_agent.demo.record_loader import frame_from_record_klines
+        from pa_agent.demo.replayer import DemoReplayer
+
+        if self._worker is not None and self._worker.isRunning():
+            if self._cancel_token is not None:
+                self._cancel_token.set()
+            self._worker.wait(_WORKER_JOIN_TIMEOUT_MS)
+            self._worker = None
+
+        self._exit_demo_mode(silent=True)
+
+        self._demo_mode = True
+        self._demo_record_path = str(Path(path))
+        self._demo_btn.setText("退出演示模式")
+
+        meta = record.meta
+        self._symbol_combo.setCurrentText(meta.symbol)
+        self._tf_combo.setCurrentText(meta.timeframe)
+        self._bar_count_spin.setValue(int(meta.bar_count))
+
+        try:
+            frame = frame_from_record_klines(
+                record.kline_data,
+                symbol=meta.symbol,
+                timeframe=meta.timeframe,
+                snapshot_ts_local_ms=meta.timestamp_local_ms,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._exit_demo_mode()
+            QMessageBox.critical(self, "演示模式", f"无法构建 K 线快照：\n{exc}")
+            return
+
+        self._chart_widget.set_frame(frame)
+        self._set_chart_refresh_paused(True)
+        self._analysis_in_progress = True
+        self._update_submit_button_state()
+
+        name = Path(path).name
+        self._demo_mode_label.setText(f"当前为演示模式 · {name}")
+        self._demo_mode_label.show()
+        self._status_bar.showMessage(f"演示回放中… ({name})")
+        self._decision_badge.setText("演示中…")
+
+        self._ai_sidebar.focus_stream()
+        panel = self._stream_panel
+        panel.clear()
+        panel.on_analysis_started()
+        panel.set_input_enabled(False)
+        self._debug_widget.clear()
+        self._decision_tree_panel.clear()
+        self._decision_flow_viz_panel.clear()
+        self._decision_panel.clear()
+
+        from pa_agent.ai.prompt_assembler import stage1_prompt_txt_files
+
+        self._prompt_files_panel.clear()
+        self._prompt_files_panel.set_stage1_files(stage1_prompt_txt_files())
+        self._prompt_files_panel.set_extras(stage1_builtin=True)
+
+        self._demo_replayer = DemoReplayer(record, parent=self)
+        self._demo_replayer.status_update.connect(self._on_status_update)
+        self._demo_replayer.finished.connect(self._on_analysis_finished)
+        self._demo_replayer.record_ready.connect(self._on_record_ready)
+        self._demo_replayer.stage_prompt_ready.connect(panel.on_stage_prompt_ready)
+        self._demo_replayer.reasoning_token.connect(panel.on_reasoning_token)
+        self._demo_replayer.stage2_files_ready.connect(self._on_stage2_files_ready)
+        self._demo_replayer.replay_finished.connect(self._on_demo_replay_done)
+        self._demo_replayer.start()
+
+    def _on_demo_replay_done(self) -> None:
+        """End demo analysis-in-progress state after replay completes."""
+        from pathlib import Path
+
+        self._analysis_in_progress = False
+        self._update_submit_button_state()
+        if self._demo_mode:
+            name = Path(self._demo_record_path).name if self._demo_record_path else ""
+            self._status_bar.showMessage(f"演示回放完成 · {name}")
+        panel = getattr(self, "_stream_panel", None)
+        if panel is not None:
+            panel.set_input_enabled(False)
+
+    def _exit_demo_mode(self, *, silent: bool = False) -> None:
+        """Leave demo mode and restore live controls."""
+        from pathlib import Path
+
+        if self._demo_replayer is not None:
+            self._demo_replayer.stop()
+            self._demo_replayer.deleteLater()
+            self._demo_replayer = None
+
+        was_demo = self._demo_mode
+        self._demo_mode = False
+        self._demo_record_path = None
+        self._demo_btn.setText("演示模式")
+        self._demo_mode_label.hide()
+        self._analysis_in_progress = False
+        self._set_chart_refresh_paused(False)
+        self._update_submit_button_state()
+        self._decision_badge.setText("")
+
+        if was_demo and not silent:
+            self._status_bar.showMessage("已退出演示模式")
+            self._refresh_chart_once()
+
     def _on_submit_analysis(self) -> None:
         """Handle the '提交分析' button click."""
         if not self._can_submit():
@@ -852,11 +995,16 @@ class MainWindow(QMainWindow):
             self._worker.reasoning_token.connect(panel.on_reasoning_token)
             self._worker.content_token.connect(panel.on_content_token)
 
+        # Freeze chart on the exact frame sent to the AI (avoids K1 = forming vs K1 = closed mismatch).
+        self._chart_widget.set_frame(frame)
+
         self._set_chart_refresh_paused(True)
 
         self._analysis_in_progress = True
         self._update_submit_button_state()
-        self._status_bar.showMessage("分析中…（图表已暂停刷新）")
+        self._status_bar.showMessage(
+            "分析中…（图表已冻结，K1=最新已收盘K线，与提交给 AI 的数据一致）"
+        )
         self._decision_badge.setText("分析中…")
         self._ai_sidebar.focus_stream()
 
@@ -917,6 +1065,8 @@ class MainWindow(QMainWindow):
             self._bind_decision_tree(decision, self._last_stage1_diagnosis)
             order = inner.get("order_type", "—")
             self._decision_badge.setText(f"决策: {order}")
+            if getattr(self, "_demo_mode", False):
+                self._present_decision_flow_playback(force_play=True)
         else:
             self._decision_panel.clear()
             self._decision_tree_panel.clear()
@@ -1029,6 +1179,35 @@ class MainWindow(QMainWindow):
                         s2_reasoning = msg.get("reasoning_content", "") or ""
                 panel.show_stage_result("阶段二：交易决策", s2_content, s2_reasoning)
 
+            if getattr(self, "_demo_mode", False):
+                panel.on_record_saved()
+                panel.set_input_enabled(False)
+                usage_total = getattr(record, "usage_total", {}) or {}
+                if usage_total:
+                    settings = getattr(self._ctx, "settings", None)
+                    context_window = 1_000_000
+                    if settings is not None:
+                        context_window = (
+                            getattr(settings.provider, "context_window", 1_000_000)
+                            or 1_000_000
+                        )
+                    prompt_tokens = usage_total.get("prompt_tokens", 0)
+                    cached_tokens = usage_total.get("cached_prompt_tokens", 0)
+                    completion_tokens = usage_total.get("completion_tokens", 0)
+                    total_tokens = usage_total.get("total_tokens", 0) or (
+                        prompt_tokens + completion_tokens
+                    )
+                    panel.update_token_display(
+                        {
+                            "context_used": total_tokens,
+                            "context_window": context_window,
+                            "total_input": prompt_tokens,
+                            "total_cached_input": cached_tokens,
+                            "total_output": completion_tokens,
+                        }
+                    )
+                return
+
             # ── Create FreeChatSession and wire to stream panel ───────────────
             try:
                 from pa_agent.orchestrator.free_chat import FreeChatSession
@@ -1100,8 +1279,32 @@ class MainWindow(QMainWindow):
         )
         panel.set_trace(**trace_kw)
         flow_viz = getattr(self, "_decision_flow_viz_panel", None)
+        has_path = False
         if flow_viz is not None:
-            flow_viz.set_trace(**trace_kw)
+            has_path = bool(flow_viz.set_trace(**trace_kw))
+        if has_path and flow_viz is not None:
+            # 演示模式：等 finished 回调后再切「决策树可视化」，与真实流式结束顺序一致
+            if getattr(self, "_demo_mode", False):
+                pass
+            elif flow_viz.should_auto_play_after_load():
+                self._present_decision_flow_playback(force_play=False)
+
+    def _trigger_decision_flow_playback(self) -> None:
+        """Switch to flow viz tab and play path (settings button or auto)."""
+        self._present_decision_flow_playback(force_play=True)
+
+    def _present_decision_flow_playback(self, *, force_play: bool = False) -> None:
+        """Show decision-flow tab, then start path animation."""
+        from PyQt6.QtCore import QTimer
+
+        flow_viz = getattr(self, "_decision_flow_viz_panel", None)
+        sidebar = getattr(self, "_ai_sidebar", None)
+        if flow_viz is None or sidebar is None:
+            return
+        if not force_play and not flow_viz.should_auto_play_after_load():
+            return
+        sidebar.focus_decision_flow_viz()
+        QTimer.singleShot(120, flow_viz.play_path)
 
     def _on_worker_done(self) -> None:
         """Reset in-progress flag and re-enable the submit button."""
@@ -1120,6 +1323,7 @@ class MainWindow(QMainWindow):
             settings = Settings()
 
         dlg = SettingsDialog(settings, parent=self)
+        dlg.set_decision_flow_play_handler(self._trigger_decision_flow_playback)
         if dlg.exec():
             self._ctx.settings = settings
             client = getattr(self._ctx, "client", None)
@@ -1160,6 +1364,8 @@ class MainWindow(QMainWindow):
 
     def _submit_block_reason(self) -> str | None:
         """Human-readable reason when submit is disabled, or None if allowed."""
+        if self._demo_mode:
+            return "演示模式中，请退出演示后再提交真实分析"
         if self._analysis_in_progress:
             return "分析进行中"
         if self._pending_submit_after_close:
@@ -1205,11 +1411,32 @@ class MainWindow(QMainWindow):
             pass
         return 0
 
+    def _build_chart_frame_from_bars(
+        self,
+        bars_raw: Any,
+        *,
+        bar_count: int | None = None,
+        include_forming: bool = True,
+    ) -> Any:
+        """Build chart KlineFrame.
+
+        - include_forming=True: show forming bar + N closed bars (live UI)
+        - include_forming=False: closed-only (matches AI snapshot semantics)
+        """
+        from pa_agent.data.snapshot import build_display_frame, build_live_frame
+
+        n = bar_count if bar_count is not None else self._bar_count_spin.value()
+        symbol = self._symbol_combo.currentText().strip()
+        timeframe = self._tf_combo.currentText()
+        if not bars_raw:
+            return None
+        if include_forming:
+            return build_live_frame(bars_raw, n, symbol, timeframe)
+        return build_display_frame(bars_raw, n, symbol, timeframe)
+
     def _take_snapshot(self, symbol: str, timeframe: str, bar_count: int) -> Any:
         """Snapshot for analysis: *bar_count* closed bars (newest forming bar excluded)."""
         try:
-            from pa_agent.data.snapshot import build_analysis_frame
-
             data_source = getattr(self._ctx, "data_source", None)
             if data_source is None or not getattr(data_source, "_connected", False):
                 return None
@@ -1218,7 +1445,11 @@ class MainWindow(QMainWindow):
             if not bars_raw:
                 return None
 
-            return build_analysis_frame(bars_raw, bar_count, symbol, timeframe)
+            return self._build_chart_frame_from_bars(
+                bars_raw,
+                bar_count=bar_count,
+                include_forming=False,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Snapshot failed: %s", exc)
             return None

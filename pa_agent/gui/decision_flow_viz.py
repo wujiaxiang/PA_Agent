@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from PyQt6.QtCore import QPointF, QRectF, Qt
+from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
 from PyQt6.QtGui import (
     QBrush,
     QColor,
@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 from pa_agent.ai.decision_tree import (
     _BRANCH_DISPLAY_ZH,
     format_trace_answer,
+    get_node_branch_outcome,
     merge_traces,
     plain_trace_question,
 )
@@ -53,16 +54,24 @@ _ANSWER_COLOR = {
     "不适用": T.TEXT_MUTED,
 }
 
-# Larger nodes for readability in the sidebar
-_NODE_W = 420
-_NODE_H = 128
-_STUB_W = 168
-_STUB_H = 52
-_TERMINAL_W = 460
-_TERMINAL_H = 100
-_LEVEL_DY = 200
-_BRANCH_DX = 260
-_MIN_ZOOM = 0.82
+# Larger card nodes for readability in the sidebar.
+_NODE_W = 580
+_NODE_H = 196
+_STUB_W = 390
+_STUB_H = 132
+_TERMINAL_W = 560
+_TERMINAL_H = 132
+_LEVEL_DY = 270
+_BRANCH_DX = 360
+_PLAY_TICK_MS = 40
+
+
+def _font_ui(pt: int, *, bold: bool = False, mono: bool = False) -> QFont:
+    family = "Consolas" if mono else "Microsoft YaHei UI"
+    font = QFont(family, pt)
+    if bold:
+        font.setBold(True)
+    return font
 
 
 def _answer_color(answer: str) -> str:
@@ -91,6 +100,8 @@ class _Placed:
     item: dict[str, Any] | None = None
     step: int = 0
     active: bool = True
+    alt_branch: str | None = None  # yes | no — outcome shown on the untaken side
+    alt_node_id: str | None = None
 
 
 class _FlowScene(QGraphicsScene):
@@ -143,7 +154,7 @@ class _BranchEdge(QGraphicsObject):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
         pen = QPen(col)
-        pen.setWidth(3 if self._active else 1.5)
+        pen.setWidth(3 if self._active else 2)
         if not self._active:
             pen.setStyle(Qt.PenStyle.DotLine)
         painter.setPen(pen)
@@ -198,9 +209,9 @@ class _BranchEdge(QGraphicsObject):
 
     def _curve(self) -> QPainterPath:
         path = QPainterPath(self._p0)
-        mid_y = (self._p0.y() + self._p1.y()) / 2
-        c1 = QPointF(self._p0.x(), mid_y)
-        c2 = QPointF(self._p1.x(), mid_y)
+        dy = max(60.0, abs(self._p1.y() - self._p0.y()) * 0.52)
+        c1 = QPointF(self._p0.x(), self._p0.y() + dy)
+        c2 = QPointF(self._p1.x(), self._p1.y() - dy)
         path.cubicTo(c1, c2, self._p1)
         return path
 
@@ -220,14 +231,12 @@ class _PhaseBandItem(QGraphicsObject):
         painter.setPen(pen)
         painter.drawLine(QPointF(-260, 0), QPointF(-70, 0))
         painter.drawLine(QPointF(70, 0), QPointF(260, 0))
-        font = QFont(T.FONT_UI.split(",")[0].strip('"'), 11)
-        font.setBold(True)
-        painter.setFont(font)
+        painter.setFont(_font_ui(11, bold=True))
         painter.drawText(QRectF(-70, -12, 140, 24), int(Qt.AlignmentFlag.AlignCenter), self._title)
 
 
 class _DecisionNode(QGraphicsObject):
-    """Large diamond — active decision on the walk path."""
+    """Large card — active decision on the walk path."""
 
     def __init__(self, item: dict[str, Any], step: int) -> None:
         super().__init__()
@@ -243,6 +252,8 @@ class _DecisionNode(QGraphicsObject):
         self._answer = format_trace_answer(item) or str(item.get("answer", "—"))
         self._branch = item.get("branch")
         self._skipped = bool(item.get("skipped"))
+        self._section = str(item.get("section", "") or "")
+        self._bar_range = str(item.get("bar_range", "") or "")
         tip = [self._question]
         if item.get("bar_range"):
             tip.append(f"K线：{item.get('bar_range')}")
@@ -251,7 +262,7 @@ class _DecisionNode(QGraphicsObject):
         self.setToolTip("\n".join(tip))
 
     def boundingRect(self) -> QRectF:  # noqa: N802
-        pad = 14
+        pad = 18
         return QRectF(-_NODE_W / 2 - pad, -pad, _NODE_W + pad * 2, _NODE_H + pad * 2)
 
     def hoverEnterEvent(self, _event: Any) -> None:  # noqa: N802
@@ -268,55 +279,94 @@ class _DecisionNode(QGraphicsObject):
         accent = QColor(_answer_color(self._answer))
         if self._skipped:
             accent = QColor(T.TEXT_MUTED)
+        rect = QRectF(-w / 2, 0, w, h)
 
         if self._hover:
             glow = QPen(QColor(accent.red(), accent.green(), accent.blue(), 120))
-            glow.setWidth(12)
+            glow.setWidth(14)
             painter.setPen(glow)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            _diamond(painter, 0, 0, w + 16, h + 16)
+            painter.drawRoundedRect(rect.adjusted(-6, -6, 6, 6), 22, 22)
 
         grad = QLinearGradient(0, 0, 0, h)
-        grad.setColorAt(0, QColor("#243552"))
-        grad.setColorAt(0.5, QColor("#18243a"))
-        grad.setColorAt(1, QColor("#0a0e16"))
+        grad.setColorAt(0, QColor("#1f2c46"))
+        grad.setColorAt(0.55, QColor("#142035"))
+        grad.setColorAt(1, QColor("#0a0f18"))
         painter.setBrush(QBrush(grad))
-        painter.setPen(QPen(accent, 2.5 if self._hover else 2))
-        _diamond(painter, 0, 0, w, h)
+        painter.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 190), 2))
+        painter.drawRoundedRect(rect, 18, 18)
 
-        font_id = QFont("Consolas", 11)
-        font_id.setBold(True)
-        painter.setFont(font_id)
+        # A status stripe makes the answer visible even when zoomed out.
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(accent))
+        painter.drawRoundedRect(QRectF(-w / 2, 0, 10, h), 5, 5)
+
+        pad_x = 24
+        inner_w = w - pad_x * 2
+
+        painter.setFont(_font_ui(12, bold=True))
+        painter.setPen(QPen(QColor(T.TEXT_MUTED)))
+        painter.drawText(
+            QRectF(-w / 2 + pad_x, 14, inner_w * 0.62, 24),
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            f"#{self._step:02d} · {self._phase_zh}",
+        )
+
+        painter.setFont(_font_ui(12, mono=True, bold=True))
         painter.setPen(QPen(QColor(T.ACCENT_PRIMARY)))
         painter.drawText(
-            QRectF(-w / 2 + 14, 12, w - 28, 22),
-            int(Qt.AlignmentFlag.AlignLeft),
-            f"#{self._step:02d}   [{self._phase_zh}]   §{self._nid}",
+            QRectF(w / 2 - pad_x - 170, 14, 170, 24),
+            int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+            f"§{self._nid}",
         )
 
-        font_q = QFont(T.FONT_UI.split(",")[0].strip('"'), 11)
-        painter.setFont(font_q)
+        meta = self._section
+        if self._bar_range:
+            meta = f"{meta} · {self._bar_range}" if meta else self._bar_range
+        if meta:
+            painter.setFont(_font_ui(11))
+            painter.setPen(QPen(QColor(T.TEXT_SECONDARY)))
+            painter.drawText(
+                QRectF(-w / 2 + pad_x, 38, inner_w, 22),
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                meta,
+            )
+
+        question_rect = QRectF(-w / 2 + pad_x, 66, inner_w, 76)
+        painter.setFont(_font_ui(16, bold=True))
         painter.setPen(QPen(QColor(T.TEXT_PRIMARY)))
+        painter.save()
+        painter.setClipRect(question_rect)
         painter.drawText(
-            QRectF(-w / 2 + 14, 36, w - 28, 52),
-            int(Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap),
+            question_rect,
+            int(
+                Qt.AlignmentFlag.AlignLeft
+                | Qt.AlignmentFlag.AlignTop
+                | Qt.TextFlag.TextWordWrap
+            ),
             self._question,
         )
+        painter.restore()
 
         ans = self._answer
         if self._branch:
             bzh = _BRANCH_DISPLAY_ZH.get(str(self._branch), str(self._branch))
             if bzh and bzh not in ans:
-                ans = f"{ans}  ·  {bzh}"
-        font_a = QFont(T.FONT_UI.split(",")[0].strip('"'), 13)
-        font_a.setBold(True)
-        painter.setFont(font_a)
+                ans = f"{ans} · {bzh}"
+        footer_rect = QRectF(-w / 2 + pad_x, h - 44, inner_w, 30)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(accent.red(), accent.green(), accent.blue(), 34)))
+        painter.drawRoundedRect(footer_rect, 10, 10)
+        painter.setFont(_font_ui(14, bold=True))
         painter.setPen(QPen(accent))
+        painter.save()
+        painter.setClipRect(footer_rect.adjusted(12, 0, -12, 0))
         painter.drawText(
-            QRectF(-w / 2 + 14, h - 36, w - 28, 28),
-            int(Qt.AlignmentFlag.AlignLeft),
-            f"▸ {ans}",
+            footer_rect.adjusted(12, 0, -12, 0),
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            f"结论：{ans}",
         )
+        painter.restore()
 
     def port_bottom(self) -> QPointF:
         return self.scenePos() + QPointF(0, _NODE_H)
@@ -325,34 +375,60 @@ class _DecisionNode(QGraphicsObject):
         return self.scenePos()
 
     def port_left(self) -> QPointF:
-        return self.scenePos() + QPointF(-_NODE_W / 4, _NODE_H * 0.92)
+        return self.scenePos() + QPointF(-_NODE_W * 0.24, _NODE_H)
 
     def port_right(self) -> QPointF:
-        return self.scenePos() + QPointF(_NODE_W / 4, _NODE_H * 0.92)
+        return self.scenePos() + QPointF(_NODE_W * 0.24, _NODE_H)
 
 
-class _StubNode(QGraphicsObject):
-    """Dimmed leaf — branch not taken."""
+class _AltBranchNode(QGraphicsObject):
+    """Untaken branch — shows what 是/否 would mean per 二元决策.txt."""
 
-    def __init__(self, label: str = "未走") -> None:
+    def __init__(self, branch: str, outcome: str, node_id: str) -> None:
         super().__init__()
-        self._label = label
+        self._branch = branch
+        self._outcome = outcome or ("继续" if branch == "yes" else "等待")
+        self._node_id = node_id
         self.setZValue(3)
-        self.setToolTip("该分支未进入，分析在另一侧继续")
+        self._title = "是" if branch == "yes" else "否"
+        self._title_color = QColor(
+            T.ACCENT_SUCCESS if branch == "yes" else T.ACCENT_DANGER
+        )
+        self.setToolTip(
+            f"§{node_id} · 若选「{self._title}」\n{self._outcome}"
+        )
 
     def boundingRect(self) -> QRectF:  # noqa: N802
-        return QRectF(-_STUB_W / 2 - 4, -4, _STUB_W + 8, _STUB_H + 8)
+        return QRectF(-_STUB_W / 2 - 6, -6, _STUB_W + 12, _STUB_H + 12)
 
     def paint(self, painter: QPainter, _option: Any, _widget: Any = None) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(-_STUB_W / 2, 0, _STUB_W, _STUB_H)
-        painter.setBrush(QBrush(QColor(18, 22, 30, 200)))
-        painter.setPen(QPen(QColor(T.TEXT_MUTED), 1.5, Qt.PenStyle.DotLine))
-        painter.drawRoundedRect(rect, 10, 10)
-        font = QFont(T.FONT_UI.split(",")[0].strip('"'), 11)
-        painter.setFont(font)
-        painter.setPen(QPen(QColor(T.TEXT_MUTED)))
-        painter.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), self._label)
+        painter.setBrush(QBrush(QColor(13, 18, 29, 235)))
+        border = QColor(self._title_color)
+        border.setAlpha(120)
+        painter.setPen(QPen(border, 2, Qt.PenStyle.DashLine))
+        painter.drawRoundedRect(rect, 16, 16)
+        pad = 18
+        inner_w = _STUB_W - pad * 2
+        painter.setFont(_font_ui(13, bold=True))
+        painter.setPen(QPen(self._title_color))
+        painter.drawText(
+            QRectF(-_STUB_W / 2 + pad, 12, inner_w, 26),
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            f"未走分支：{self._title}",
+        )
+        painter.setFont(_font_ui(12))
+        painter.setPen(QPen(QColor(T.TEXT_SECONDARY)))
+        body = QRectF(-_STUB_W / 2 + pad, 42, inner_w, _STUB_H - 54)
+        painter.save()
+        painter.setClipRect(body)
+        painter.drawText(
+            body,
+            int(Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap),
+            self._outcome,
+        )
+        painter.restore()
 
     def port_top(self) -> QPointF:
         return self.scenePos()
@@ -386,26 +462,33 @@ class _TerminalNode(QGraphicsObject):
         grad.setColorAt(0.5, QColor("#223358"))
         grad.setColorAt(1, QColor("#1a2844"))
         painter.setBrush(QBrush(grad))
-        painter.setPen(QPen(self._color, 2.5))
+        painter.setPen(QPen(self._color, 3))
         painter.drawRoundedRect(rect, 14, 14)
-        font = QFont(T.FONT_UI.split(",")[0].strip('"'), 13)
-        font.setBold(True)
-        painter.setFont(font)
+        painter.setFont(_font_ui(12, mono=True))
+        painter.setPen(QPen(QColor(T.TEXT_MUTED)))
+        painter.drawText(
+            QRectF(-w / 2, 12, w, 22),
+            int(Qt.AlignmentFlag.AlignCenter),
+            f"§{self._nid}",
+        )
+        painter.setFont(_font_ui(16, bold=True))
         painter.setPen(QPen(self._color))
         painter.drawText(
-            QRectF(-w / 2, 14, w, 28),
+            QRectF(-w / 2, 36, w, 32),
             int(Qt.AlignmentFlag.AlignCenter),
-            f"◆  终点  §{self._nid}  ·  {self._outcome_zh}",
+            f"终点 · {self._outcome_zh}",
         )
-        font.setBold(False)
-        font.setPointSize(11)
-        painter.setFont(font)
+        painter.setFont(_font_ui(12))
         painter.setPen(QPen(QColor(T.TEXT_PRIMARY)))
+        body = QRectF(-w / 2 + 22, 72, w - 44, 48)
+        painter.save()
+        painter.setClipRect(body)
         painter.drawText(
-            QRectF(-w / 2 + 16, 44, w - 32, 48),
+            body,
             int(Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap),
             self._label,
         )
+        painter.restore()
 
     def port_top(self) -> QPointF:
         return self.scenePos()
@@ -421,19 +504,8 @@ class _EmptyHint(QGraphicsObject):
 
     def paint(self, painter: QPainter, _option: Any, _widget: Any = None) -> None:
         painter.setPen(QPen(QColor(T.TEXT_MUTED)))
-        painter.setFont(QFont(T.FONT_UI.split(",")[0].strip('"'), 13))
+        painter.setFont(_font_ui(13))
         painter.drawText(self.boundingRect(), int(Qt.AlignmentFlag.AlignCenter), self._text)
-
-
-def _diamond(painter: QPainter, cx: float, top: float, w: float, h: float) -> None:
-    path = QPainterPath()
-    path.moveTo(cx, top)
-    path.lineTo(cx + w / 2, top + h / 2)
-    path.lineTo(cx, top + h)
-    path.lineTo(cx - w / 2, top + h / 2)
-    path.closeSubpath()
-    painter.drawPath(path)
-
 
 def _layout_branched_path(
     merged: list[dict[str, Any]],
@@ -460,8 +532,8 @@ def _layout_branched_path(
         nodes.append(_Placed(x=x, y=y, kind="decision", item=item, step=i + 1, active=True))
         ny = y + _LEVEL_DY
         side = _taken_branch_side(item)
-        port_l = QPointF(x - _NODE_W / 4, y + _NODE_H * 0.9)
-        port_r = QPointF(x + _NODE_W / 4, y + _NODE_H * 0.9)
+        port_l = QPointF(x - _NODE_W * 0.24, y + _NODE_H)
+        port_r = QPointF(x + _NODE_W * 0.24, y + _NODE_H)
         port_m = QPointF(x, y + _NODE_H)
 
         if side == "down":
@@ -479,15 +551,37 @@ def _layout_branched_path(
 
         lx = x - _BRANCH_DX
         rx = x + _BRANCH_DX
+        # Keep the untaken side far enough from the next active card.
+        stub_lx = x - _BRANCH_DX * 1.28
+        stub_rx = x + _BRANCH_DX * 1.28
+        nid = str(item.get("node_id", ""))
         if side == "left":
             edges.append((port_l, QPointF(lx, ny), "否", True))
-            edges.append((port_r, QPointF(rx, ny), "是", False))
-            nodes.append(_Placed(x=rx, y=ny, kind="stub", active=False))
+            edges.append((port_r, QPointF(stub_rx, ny), "是", False))
+            nodes.append(
+                _Placed(
+                    x=stub_rx,
+                    y=ny,
+                    kind="alt",
+                    alt_branch="yes",
+                    alt_node_id=nid,
+                    active=False,
+                )
+            )
             x, y = lx, ny
         else:
-            edges.append((port_l, QPointF(lx, ny), "否", False))
+            edges.append((port_l, QPointF(stub_lx, ny), "否", False))
             edges.append((port_r, QPointF(rx, ny), "是", True))
-            nodes.append(_Placed(x=lx, y=ny, kind="stub", active=False))
+            nodes.append(
+                _Placed(
+                    x=stub_lx,
+                    y=ny,
+                    kind="alt",
+                    alt_branch="no",
+                    alt_node_id=nid,
+                    active=False,
+                )
+            )
             x, y = rx, ny
 
     if terminal:
@@ -505,13 +599,51 @@ def _layout_branched_path(
     return nodes, edges, bands
 
 
+def _build_playback_path(placed: list[_Placed], *, total_steps: int) -> list[QPointF]:
+    """Dense scene points along the AI walk (decision nodes → terminal)."""
+    anchors: list[QPointF] = []
+    for p in placed:
+        if p.kind == "decision":
+            anchors.append(QPointF(p.x, p.y + _NODE_H / 2))
+        elif p.kind == "terminal":
+            anchors.append(QPointF(p.x, p.y + _TERMINAL_H / 2))
+    if len(anchors) < 2:
+        return anchors
+
+    seg_count = len(anchors) - 1
+    per_seg = max(8, total_steps // seg_count)
+    dense: list[QPointF] = []
+    for i in range(seg_count):
+        a, b = anchors[i], anchors[i + 1]
+        for k in range(per_seg):
+            t = k / per_seg
+            dense.append(
+                QPointF(
+                    a.x() + (b.x() - a.x()) * t,
+                    a.y() + (b.y() - a.y()) * t,
+                )
+            )
+    dense.append(anchors[-1])
+    return dense
+
+
 class DecisionFlowVizPanel(QWidget):
     """Branched flowchart of the AI walk (yes=右 / no=左)."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._settings: Any = None
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._on_play_tick)
+        self._play_points: list[QPointF] = []
+        self._play_index = 0
+        self._play_active = False
+        self._last_placed: list[_Placed] = []
+        self._last_rect = QRectF(-400, 0, 800, 200)
+
         self._scene = _FlowScene()
         self._view = QGraphicsView(self._scene)
+        self._view.viewport().installEventFilter(self)
         self._view.setRenderHints(
             QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform
         )
@@ -524,20 +656,113 @@ class DecisionFlowVizPanel(QWidget):
 
         title = QLabel("决策路径可视化")
         title.setObjectName("toolbarTitle")
+        title.setStyleSheet(
+            "font-size: 15px; font-weight: 600; letter-spacing: 0.5px;"
+        )
         sub = QLabel(
-            "菱形=判断节点 · 左=否 / 右=是 · 高亮=AI 实际路径 · 虚线框=未走分支"
-            " · 拖拽平移 · Ctrl+滚轮缩放"
+            "卡片 = 判断节点 · 左 = 否 / 右 = 是 · 亮线 = AI 实际路径\n"
+            "虚线框 = 未走分支含义（二元决策树） · 拖拽平移 · Ctrl + 滚轮缩放"
         )
         sub.setObjectName("mutedLabel")
         sub.setWordWrap(True)
+        sub.setStyleSheet(
+            f"color: {T.TEXT_SECONDARY}; font-size: 12px; line-height: 1.45;"
+        )
+
+        self._play_status = QLabel("")
+        self._play_status.setObjectName("mutedLabel")
+        self._play_status.setStyleSheet(
+            f"color: {T.ACCENT_PRIMARY}; font-size: 12px; min-height: 18px;"
+        )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(6)
         layout.addWidget(title)
         layout.addWidget(sub)
+        layout.addWidget(self._play_status)
         layout.addWidget(self._view, stretch=1)
         self.clear()
+
+    def bind_settings(self, settings: Any) -> None:
+        """Receive persisted settings (auto-play toggle)."""
+        self._settings = settings
+
+    def should_auto_play_after_load(self) -> bool:
+        """Whether to switch tab and play when new trace data is loaded."""
+        return self._playback_enabled()
+
+    def _playback_enabled(self) -> bool:
+        if self._settings is None:
+            return False
+        return bool(getattr(self._settings.general, "decision_flow_auto_play", False))
+
+    def play_path(self) -> bool:
+        """Play camera animation along the current AI path."""
+        if not self._last_placed:
+            self._play_status.setText("暂无可播放路径，请先完成一次分析")
+            return False
+        self._fit_scene(self._last_rect)
+        self._start_playback(self._last_placed)
+        return True
+
+    def _play_duration_seconds(self) -> int:
+        if self._settings is None:
+            return 50
+        return int(getattr(self._settings.general, "decision_flow_play_seconds", 50))
+
+    def _default_zoom_factor(self) -> float:
+        """Scale applied after fitInView (1.0 = fit size; no upper cap—uses settings % / 100)."""
+        if self._settings is None:
+            return 5.0
+        pct = int(getattr(self._settings.general, "decision_flow_default_zoom_pct", 500))
+        return max(0.25, pct / 100.0)
+
+    def eventFilter(self, obj: Any, event: QEvent) -> bool:  # noqa: N802
+        if (
+            self._play_active
+            and obj is self._view.viewport()
+            and event.type() == QEvent.Type.MouseButtonPress
+        ):
+            self._stop_playback(user_cancelled=True)
+        return super().eventFilter(obj, event)
+
+    def _stop_playback(self, *, user_cancelled: bool = False) -> None:
+        self._play_timer.stop()
+        self._play_active = False
+        self._play_points = []
+        self._play_index = 0
+        self._view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        if user_cancelled:
+            self._play_status.setText("已手动停止播放")
+        else:
+            self._play_status.setText("")
+
+    def _start_playback(self, placed: list[_Placed]) -> None:
+        self._stop_playback()
+        secs = max(3, self._play_duration_seconds())
+        total_steps = max(40, (secs * 1000) // _PLAY_TICK_MS)
+        points = _build_playback_path(placed, total_steps=total_steps)
+        if len(points) < 2:
+            return
+        self._play_points = points
+        self._play_index = 0
+        self._play_active = True
+        self._view.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self._play_status.setText("路径播放中…（点击画面可停止）")
+        self._on_play_tick()
+        self._play_timer.start(_PLAY_TICK_MS)
+
+    def _on_play_tick(self) -> None:
+        if not self._play_active or not self._play_points:
+            return
+        self._view.centerOn(self._play_points[self._play_index])
+        pct = int((self._play_index + 1) * 100 / len(self._play_points))
+        self._play_status.setText(f"路径播放中… {pct}%（点击画面可停止）")
+        self._play_index += 1
+        if self._play_index >= len(self._play_points):
+            self._stop_playback()
+            self._play_status.setText("播放完成")
 
     def wheelEvent(self, event: Any) -> None:  # noqa: N802
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -550,12 +775,14 @@ class DecisionFlowVizPanel(QWidget):
     def _fit_scene(self, rect: QRectF) -> None:
         self._view.resetTransform()
         self._view.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
-        if self._view.transform().m11() < _MIN_ZOOM:
-            self._view.resetTransform()
-            self._view.scale(_MIN_ZOOM, _MIN_ZOOM)
+        z = self._default_zoom_factor()
+        if abs(z - 1.0) > 1e-6:
+            self._view.scale(z, z)
         self._view.centerOn(rect.center())
 
     def clear(self) -> None:
+        self._stop_playback()
+        self._last_placed = []
         self._scene.clear()
         hint = _EmptyHint("等待分析…\n提交后将显示左右分支决策流程图")
         hint.setPos(-200, 60)
@@ -572,12 +799,13 @@ class DecisionFlowVizPanel(QWidget):
         terminal: dict[str, Any] | None = None,
         gate_result: str | None = None,
         gate_shortcircuited: bool = False,
-    ) -> None:
+    ) -> bool:
+        """Build flowchart; return True if there is a path to play."""
         merged = merge_traces(gate_trace, decision_trace)
         self._scene.clear()
         if not merged and not terminal:
             self.clear()
-            return
+            return False
 
         placed, edge_specs, bands = _layout_branched_path(merged, terminal)
 
@@ -603,22 +831,28 @@ class DecisionFlowVizPanel(QWidget):
         for p in placed:
             if p.kind == "decision" and p.item:
                 node = _DecisionNode(p.item, p.step)
-                node.setPos(p.x - _NODE_W / 2, p.y)
+                node.setPos(p.x, p.y)
                 self._scene.addItem(node)
-            elif p.kind == "stub":
-                stub = _StubNode("未走")
-                stub.setPos(p.x - _STUB_W / 2, p.y)
-                self._scene.addItem(stub)
+            elif p.kind == "alt" and p.alt_branch and p.alt_node_id:
+                outcome = get_node_branch_outcome(p.alt_node_id, p.alt_branch)
+                alt = _AltBranchNode(p.alt_branch, outcome, p.alt_node_id)
+                alt.setPos(p.x, p.y)
+                self._scene.addItem(alt)
             elif p.kind == "terminal" and p.item:
                 term = _TerminalNode(p.item)
-                term.setPos(p.x - _TERMINAL_W / 2, p.y)
+                term.setPos(p.x, p.y)
                 self._scene.addItem(term)
 
         xs = [p.x for p in placed]
         ys = [p.y for p in placed]
+        widest = max(_NODE_W, _STUB_W, _TERMINAL_W)
         max_y = max(ys) + _TERMINAL_H + 80 if ys else 400
-        min_x = min(xs) - _NODE_W if xs else -400
-        max_x = max(xs) + _NODE_W if xs else 400
+        min_x = min(xs) - widest / 2 if xs else -400
+        max_x = max(xs) + widest / 2 if xs else 400
         rect = QRectF(min_x - 80, 0, max_x - min_x + 160, max_y)
         self._scene.setSceneRect(rect)
+        self._last_placed = placed
+        self._last_rect = rect
         self._fit_scene(rect)
+        self._play_status.setText("")
+        return bool(placed)

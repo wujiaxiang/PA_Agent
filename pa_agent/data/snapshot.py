@@ -82,6 +82,54 @@ def compute_indicators(bars: list[KlineBar]) -> IndicatorBundle:
     return IndicatorBundle(ema20=ema20, atr14=atr14)
 
 
+def build_display_frame(
+    bars_raw: list[KlineBar],
+    n: int,
+    symbol: str,
+    timeframe: str,
+) -> KlineFrame | None:
+    """Chart display frame — same semantics as AI (K1 = newest **closed** bar)."""
+    return build_analysis_frame(bars_raw, n, symbol, timeframe)
+
+
+def build_live_frame(
+    bars_raw: list[KlineBar],
+    n_closed: int,
+    symbol: str,
+    timeframe: str,
+) -> KlineFrame | None:
+    """Live chart frame: include the forming bar + *n_closed* closed bars.
+
+    This is for UI only. The analysis snapshot must still use
+    ``build_analysis_frame`` so AI always sees closed-only candles.
+    """
+    if len(bars_raw) < n_closed + 1:
+        return None
+
+    raw = bars_raw[: n_closed + 1]  # forming + N closed
+    rebased: list[KlineBar] = [
+        KlineBar(
+            seq=i + 1,
+            ts_open=b.ts_open,
+            open=b.open,
+            high=b.high,
+            low=b.low,
+            close=b.close,
+            volume=b.volume,
+            closed=(i != 0),
+        )
+        for i, b in enumerate(raw)
+    ]
+    indicators = compute_indicators(rebased)
+    return KlineFrame(
+        symbol=symbol,
+        timeframe=timeframe,
+        bars=tuple(rebased),
+        indicators=indicators,
+        snapshot_ts_local_ms=now_local_ms(),
+    )
+
+
 def build_analysis_frame(
     bars_raw: list[KlineBar],
     n: int,
@@ -92,6 +140,9 @@ def build_analysis_frame(
 
     *bars_raw* is newest-first; ``bars_raw[0]`` is the forming (unclosed) bar
     and is discarded. Returns None if fewer than ``n + 1`` bars are available.
+
+    Chart and AI must both use this (or ``build_display_frame``) so K-line
+    seq numbers refer to the same candles.
     """
     if len(bars_raw) < n + 1:
         return None

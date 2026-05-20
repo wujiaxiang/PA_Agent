@@ -8,6 +8,7 @@ Design reference: design.md §B.17
 from __future__ import annotations
 
 import logging
+import json
 from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
@@ -152,43 +153,51 @@ class FreeChatSession:
         # ── 1. Build history_for_api ──────────────────────────────────────────
         history_for_api: list[dict] = []
 
-        # System prompt — taken from stage2_messages[0]
-        stage2_messages = self._base_record.stage2_messages
-        if stage2_messages:
-            system_msg = stage2_messages[0]
-            history_for_api.append({"role": "system", "content": system_msg["content"]})
+        # Follow-up system prompt (NOT the Stage2 decision JSON prompt).
+        history_for_api.append(
+            {
+                "role": "system",
+                "content": (
+                    "你是 PA Agent 的【追问助手】（post-analysis advisor），不是在执行新的完整两阶段分析。\n"
+                    "你的目标是：优先、直接回答用户当前问题；必要时引用价格行为/关键价位/风险控制。\n"
+                    "\n"
+                    "严格规则：\n"
+                    "1) 默认用自然语言回答；除非用户明确要求 JSON/决策树，否则不要输出二元决策树 JSON。\n"
+                    "2) 如果用户问的是【已有仓位管理】（止损/止盈/减仓/持有/加仓）：\n"
+                    "   - 只围绕持仓管理回答，不要重新跑完整下单决策。\n"
+                    "   - 先给结论（可以/不建议/条件允许），再给依据（结构/关键位/信号），再给风险控制（最大亏损、触发条件）。\n"
+                    "3) 如果用户问题信息不足，最多问 1-2 个澄清点（例如仓位大小、入场价、账户风险上限）。\n"
+                    "4) 不要编造数据；以“最新已收盘K线数据”为准。\n"
+                ),
+            }
+        )
 
-        # Stage-2 user message — last message in stage2_messages
-        if len(stage2_messages) >= 2:
-            user_msg_s2 = stage2_messages[-1]
-            history_for_api.append({"role": "user", "content": user_msg_s2["content"]})
-
-        # Stage-2 assistant response
-        stage2_response = self._base_record.stage2_response or {}
-        stage2_content = stage2_response.get("content", "")
-        stage2_reasoning = stage2_response.get("reasoning_content", "")
-
-        assistant_s2: dict = {"role": "assistant", "content": stage2_content}
-        if self.keep_reasoning_in_resend and stage2_reasoning:
-            assistant_s2["reasoning_content"] = stage2_reasoning
-        history_for_api.append(assistant_s2)
+        # Provide a compact reference summary of the last completed analysis.
+        meta = getattr(self._base_record, "meta", None)
+        s1 = getattr(self._base_record, "stage1_diagnosis", None)
+        s2 = getattr(self._base_record, "stage2_decision", None)
+        ref = {
+            "meta": meta.model_dump() if meta is not None else {},
+            "stage1_diagnosis": s1 or {},
+            "stage2_decision": s2 or {},
+        }
+        history_for_api.append(
+            {
+                "role": "user",
+                "content": (
+                    "## 上次分析结果（仅供参考，不是新的决策任务）\n\n"
+                    f"```json\n{json.dumps(ref, ensure_ascii=False, indent=2)}\n```\n"
+                ),
+            }
+        )
 
         # Previous free-chat turns from history_full
         for msg in self._history_full:
             if msg["role"] == "user":
                 history_for_api.append({"role": "user", "content": msg["content"]})
             elif msg["role"] == "assistant":
-                if self.keep_reasoning_in_resend and msg.get("reasoning_content"):
-                    history_for_api.append({
-                        "role": "assistant",
-                        "content": msg["content"],
-                        "reasoning_content": msg["reasoning_content"],
-                    })
-                else:
-                    history_for_api.append({
-                        "role": "assistant",
-                        "content": msg["content"],
-                    })
+                # Follow-up chat should not resend chain-of-thought.
+                history_for_api.append({"role": "assistant", "content": msg["content"]})
 
         # New user message — prepend latest K-line snapshot if available
         user_content = user_text

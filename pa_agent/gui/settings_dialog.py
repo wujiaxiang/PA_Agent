@@ -1,6 +1,8 @@
 """Settings dialog for PA Agent — edits all Settings fields via a form."""
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -102,6 +104,32 @@ class SettingsDialog(QDialog):
         self._last_timeframe_edit = QLineEdit()
         general_form.addRow("上次周期:", self._last_timeframe_edit)
 
+        self._flow_auto_play_check = QCheckBox("决策树可视化生成后自动播放路径")
+        general_form.addRow("决策树播放:", self._flow_auto_play_check)
+
+        self._flow_play_seconds_spin = QSpinBox()
+        self._flow_play_seconds_spin.setRange(3, 120)
+        self._flow_play_seconds_spin.setSuffix(" 秒")
+        general_form.addRow("播放时长:", self._flow_play_seconds_spin)
+
+        self._flow_default_zoom_spin = QSpinBox()
+        self._flow_default_zoom_spin.setRange(10, 9_999_999)
+        self._flow_default_zoom_spin.setSuffix(" %")
+        self._flow_default_zoom_spin.setToolTip(
+            "相对「整图适配」视图：100% 与适配一致，50% 再缩小一半；"
+            "可填任意更大百分比以放大（分析完成、播放路径、手动播放均用此比例）"
+        )
+        general_form.addRow("决策树可视化默认缩放:", self._flow_default_zoom_spin)
+
+        self._flow_play_now_btn = QPushButton("播放决策树可视化")
+        self._flow_play_now_btn.setToolTip(
+            "使用当前已加载的决策路径重新播放动画（若尚未分析则无可播放内容）"
+        )
+        self._flow_play_now_btn.clicked.connect(self._on_play_decision_flow_now)
+        general_form.addRow("", self._flow_play_now_btn)
+
+        self._decision_flow_play_handler: Callable[[], None] | None = None
+
         form_layout.addWidget(general_group)
 
         buttons = QDialogButtonBox(
@@ -131,6 +159,15 @@ class SettingsDialog(QDialog):
         self._context_warning_spin.setValue(int(g.context_warning_threshold_pct))
         self._last_symbol_edit.setText(g.last_symbol)
         self._last_timeframe_edit.setText(g.last_timeframe)
+        self._flow_auto_play_check.setChecked(
+            getattr(g, "decision_flow_auto_play", False)
+        )
+        self._flow_play_seconds_spin.setValue(
+            getattr(g, "decision_flow_play_seconds", 50)
+        )
+        self._flow_default_zoom_spin.setValue(
+            int(getattr(g, "decision_flow_default_zoom_pct", 500))
+        )
 
     def _on_save(self) -> None:
         p = self._settings.provider
@@ -148,9 +185,27 @@ class SettingsDialog(QDialog):
         g.context_warning_threshold_pct = float(self._context_warning_spin.value())
         g.last_symbol = self._last_symbol_edit.text().strip()
         g.last_timeframe = self._last_timeframe_edit.text().strip()
+        g.decision_flow_auto_play = self._flow_auto_play_check.isChecked()
+        g.decision_flow_play_seconds = self._flow_play_seconds_spin.value()
+        g.decision_flow_default_zoom_pct = self._flow_default_zoom_spin.value()
 
         save_settings(self._settings, SETTINGS_JSON_PATH)
         self.accept()
+
+    def set_decision_flow_play_handler(self, handler: Callable[[], None] | None) -> None:
+        """Register callback invoked when user clicks 播放决策树可视化."""
+        self._decision_flow_play_handler = handler
+
+    def _on_play_decision_flow_now(self) -> None:
+        # Allow previewing playback without pressing “保存”:
+        # sync relevant fields from widgets into the in-memory settings object.
+        g = self._settings.general
+        g.decision_flow_auto_play = self._flow_auto_play_check.isChecked()
+        g.decision_flow_play_seconds = self._flow_play_seconds_spin.value()
+        g.decision_flow_default_zoom_pct = self._flow_default_zoom_spin.value()
+
+        if self._decision_flow_play_handler is not None:
+            self._decision_flow_play_handler()
 
     def _toggle_api_key_visibility(self, checked: bool) -> None:
         if checked:

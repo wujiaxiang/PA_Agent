@@ -72,6 +72,31 @@ QGroupBox::title {
     padding: 0 4px;
 }
 
+QCheckBox {
+    color: #e6edf3;
+    spacing: 8px;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid #484f58;
+    border-radius: 4px;
+    background-color: #161b22;
+}
+QCheckBox::indicator:hover {
+    border-color: #58a6ff;
+}
+QCheckBox::indicator:checked {
+    background-color: #1f6feb;
+    border-color: #58a6ff;
+}
+QCheckBox::indicator:checked:hover {
+    background-color: #388bfd;
+}
+QCheckBox:disabled {
+    color: #6e7681;
+}
+
 QPushButton {
     background-color: #21262d;
     color: #e6edf3;
