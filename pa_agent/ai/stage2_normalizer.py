@@ -1364,6 +1364,8 @@ def normalize_stage2(
     decision_stance: str | None = None,
     stage1_json: dict[str, Any] | None = None,
     skip_next_bar: bool = False,
+    previous_record: Any | None = None,
+    structure_flip_cooldown_bars: int = 3,
 ) -> dict[str, Any]:
     """Return a copy of *obj* with decision_trace quirks corrected."""
     out = copy.deepcopy(obj)
@@ -1394,6 +1396,11 @@ def normalize_stage2(
             "breakout entry_price adjusted to basis extreme ± 1 tick (basis=%s)",
             decision.get("entry_basis_bar"),
         )
+    if isinstance(decision, dict):
+        from pa_agent.util.trade_metrics import adjust_decision_stop_for_tp1_rr_cap
+
+        if adjust_decision_stop_for_tp1_rr_cap(decision, kline_frame=kline_frame):
+            logger.debug("stop_loss widened to bring TP1 RR within program cap")
     _coerce_decision_when_trade_metrics_fail(
         out,
         decision_stance=decision_stance,
@@ -1544,5 +1551,22 @@ def normalize_stage2(
     pred_c = out.get("next_cycle_prediction")
     if isinstance(pred_c, dict):
         _normalize_next_cycle_prediction(pred_c, stage1_json=stage1_json)
+
+    if kline_frame is not None and stage1_json:
+        try:
+            from pa_agent.ai.decision_continuity import (
+                apply_continuity_guard,
+                build_continuity_context,
+            )
+
+            ctx = build_continuity_context(
+                frame=kline_frame,
+                stage1_json=stage1_json,
+                previous_record=previous_record,
+                cooldown_bars=structure_flip_cooldown_bars,
+            )
+            out = apply_continuity_guard(out, ctx)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("apply_continuity_guard failed: %s", exc)
 
     return out

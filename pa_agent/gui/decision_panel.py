@@ -533,7 +533,8 @@ class DecisionPanel(QWidget):
                 min_rr = min_risk_reward_ratio(decision_stance)
                 max_rr = max_risk_reward_ratio()
                 metrics_ok = (
-                    min_rr <= ratio <= max_rr
+                    ratio >= min_rr
+                    and (max_rr is None or ratio <= max_rr)
                     and (eq_ok if win_pct is not None else True)
                 )
                 eq_note = ""

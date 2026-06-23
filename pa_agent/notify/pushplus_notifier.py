@@ -36,6 +36,14 @@ def resolve_pushplus_token(settings: "Settings | None" = None) -> str:
     return token
 
 
+def pushplus_is_active(settings: "Settings | None" = None) -> bool:
+    """True only when PushPlus is enabled and a token is configured."""
+    cfg = _pushplus_config_dict(settings)
+    if not cfg.get("enabled", False):
+        return False
+    return bool(resolve_pushplus_token(settings))
+
+
 def send_pushplus_raw(
     title: str,
     html_content: str,
@@ -46,7 +54,7 @@ def send_pushplus_raw(
     """最底层的原始 PUSHPLUS 推送服务."""
     push_token = (token or resolve_pushplus_token(settings)).strip()
     if not push_token:
-        logger.warning("未配置 PUSHPLUS_TOKEN，推送跳过")
+        logger.debug("PushPlus 未配置 token，跳过推送")
         return False
 
     payload = {
@@ -150,9 +158,7 @@ def send_order_signal(
     settings: "Settings | None" = None,
 ) -> bool:
     """下单决策触发时向 PushPlus 推送 HTML 消息（与飞书并行，互不依赖）。"""
-    cfg = _pushplus_config_dict(settings)
-    if not cfg.get("enabled", True):
-        logger.debug("PushPlus 通知已禁用（settings.json pushplus.enabled=false）")
+    if not pushplus_is_active(settings):
         return False
 
     title = f"PA Agent 下单信号 — {symbol} {timeframe}"

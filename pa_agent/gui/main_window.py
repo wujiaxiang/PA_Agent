@@ -3831,6 +3831,11 @@ class MainWindow(QMainWindow):
                     meta_timeframe=meta_timeframe,
                     decision_stance=decision_stance,
                     model_name=model_name,
+                    structure_flip_cooldown_bars=int(
+                        getattr(settings.general, "structure_flip_cooldown_bars", 3) or 3
+                    )
+                    if settings is not None
+                    else 3,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Trade record logging failed: %s", exc)
@@ -3858,13 +3863,16 @@ class MainWindow(QMainWindow):
                     chart_image_path=latest_img,
                     settings=settings,
                 )
-                send_pushplus_order(
-                    decision_inner=inner,
-                    stage2_full=decision,
-                    symbol=meta_symbol,
-                    timeframe=meta_timeframe,
-                    settings=settings,
-                )
+                from pa_agent.notify.pushplus_notifier import pushplus_is_active
+
+                if pushplus_is_active(settings):
+                    send_pushplus_order(
+                        decision_inner=inner,
+                        stage2_full=decision,
+                        symbol=meta_symbol,
+                        timeframe=meta_timeframe,
+                        settings=settings,
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("下单信号通知失败（不影响主流程）: %s", exc)
 

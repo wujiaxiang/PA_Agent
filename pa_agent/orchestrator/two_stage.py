@@ -687,6 +687,14 @@ class TwoStageOrchestrator:
         _enable_next_bar = bool(
             getattr(getattr(self._settings, "general", None), "enable_next_bar_prediction", False)
         )
+        _flip_cooldown = int(
+            getattr(
+                getattr(self._settings, "general", None),
+                "structure_flip_cooldown_bars",
+                3,
+            )
+            or 3
+        )
         messages_s2 = self._assembler.build_stage2_continuation(
             frame=frame,
             stage1_messages=messages_s1,
@@ -698,6 +706,7 @@ class TwoStageOrchestrator:
             previous_record=previous_record,
             enable_next_bar_prediction=_enable_next_bar,
             provider_settings=getattr(self._settings, "provider", None),
+            structure_flip_cooldown_bars=_flip_cooldown,
         )
 
         # ── Step 15: Call AI for Stage 2 ──────────────────────────────────────
@@ -845,6 +854,8 @@ class TwoStageOrchestrator:
                 "decision_stance": record.meta.decision_stance,
                 "stage1_json": stage1_json,
                 "skip_next_bar": not _enable_next_bar,
+                "previous_record": previous_record,
+                "structure_flip_cooldown_bars": _flip_cooldown,
             },
             call_api=_call_s2_retry,
             provider_settings=getattr(self._settings, "provider", None),

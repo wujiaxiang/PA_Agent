@@ -1,6 +1,8 @@
 """Unit tests for settings load/save round-trip (task 2.4)."""
 from __future__ import annotations
 import json
+from unittest.mock import patch
+
 import pytest
 from pathlib import Path
 from pa_agent.config.settings import Settings, load_settings, save_settings
@@ -102,6 +104,20 @@ def test_tushare_round_trip(tmp_path):
     save_settings(original, p)
     loaded = load_settings(p)
     assert loaded.tushare.token == "ts-test-token"
+
+
+def test_pushplus_auto_disabled_when_enabled_without_token(tmp_path):
+    """load_settings disables pushplus when enabled but token empty."""
+    p = tmp_path / "settings.json"
+    p.write_text(
+        '{"pushplus": {"enabled": true, "token": ""}}',
+        encoding="utf-8",
+    )
+    with patch.dict("os.environ", {}, clear=True):
+        loaded = load_settings(p)
+    assert loaded.pushplus.enabled is False
+    saved = json.loads(p.read_text(encoding="utf-8"))
+    assert saved["pushplus"]["enabled"] is False
 
 
 def test_migrate_legacy_feishu_json(tmp_path):

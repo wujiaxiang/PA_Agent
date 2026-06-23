@@ -7,6 +7,7 @@
 | 缩写 | 英文 | 中文要点 |
 |------|------|----------|
 | FF | Final Flag | 趋势末端水平旗形，突破常失败反转 |
+| 尖峰旗形 | Spike Flag | 尖峰中第一次整理；**允许** SPS 顺向突破入场（≠ FF） |
 | MW | Micro Wedge | 3–4 棒楔形 |
 | NW | Nested Wedge | 嵌套楔形 |
 | MM | Measured Move | 测量移动目标 |

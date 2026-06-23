@@ -19,6 +19,7 @@
     "decision_flow_play_seconds": 50,
     "incremental_max_new_bars": 10,
     "decision_stance": "balanced",
+    "structure_flip_cooldown_bars": 3,
     "decision_flow_default_zoom_pct": 600,
     "stream_pane_font_pt": 11,
     "chart_seq_label_font_pt": 7,
@@ -46,7 +47,7 @@
     "notify_on_order_only": true
   },
   "pushplus": {
-    "enabled": true,
+    "enabled": false,
     "token": ""
   },
   "tushare": {

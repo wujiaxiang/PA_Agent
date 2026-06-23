@@ -190,6 +190,12 @@ def _base_files_for_cycle(
     # ── Channel states ────────────────────────────────────────────────────────
     if cp in _CHANNEL_STATES:
         files.extend(_channel_files(direction))
+        # micro_channel is often spike on the signal window; load spike playbooks when active/ending.
+        if cp == "micro_channel" and spike_stage in ("active", "ending"):
+            if direction == "bullish":
+                files.extend(_BULLISH_SPIKE_FILES)
+            elif direction == "bearish":
+                files.extend(_BEARISH_SPIKE_FILES)
 
     # ── Spike state ───────────────────────────────────────────────────────────
     elif cp == "spike":

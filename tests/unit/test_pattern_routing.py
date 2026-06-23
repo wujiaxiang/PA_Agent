@@ -107,6 +107,19 @@ def test_tr_boundary_syncs_middle_range_and_barbwire() -> None:
     assert "文件21-铁丝网与无交易环境.txt" in files
 
 
+def test_route_loads_spike_files_for_micro_channel_active() -> None:
+    s1 = {
+        "cycle_position": "micro_channel",
+        "direction": "bullish",
+        "spike_stage": "active",
+        "detected_patterns": [],
+    }
+    files = route_strategy_files(s1)
+    assert "极速上涨分析识别.txt" in files
+    assert "极速上涨交易策略.txt" in files
+    assert "上涨通道分析识别.txt" in files
+
+
 def test_ema_gap_count_does_not_trigger_hl_count_setup() -> None:
     """「EMA缺口计数」must not be mistaken for H1/H2/L1/L2 count entry."""
     s1 = {

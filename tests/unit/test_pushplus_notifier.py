@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from pa_agent.config.settings import Settings
 from pa_agent.notify.pushplus_notifier import (
+    pushplus_is_active,
     resolve_pushplus_token,
     send_order_signal,
     send_pushplus_raw,
@@ -59,3 +60,16 @@ def test_send_order_signal_respects_enabled_flag() -> None:
             is False
         )
         raw.assert_not_called()
+
+
+def test_pushplus_is_active_requires_enabled_and_token() -> None:
+    s = Settings()
+    s.pushplus.enabled = False
+    s.pushplus.token = "tok"
+    assert pushplus_is_active(s) is False
+    s.pushplus.enabled = True
+    s.pushplus.token = ""
+    with patch.dict("os.environ", {}, clear=True):
+        assert pushplus_is_active(s) is False
+    s.pushplus.token = "tok"
+    assert pushplus_is_active(s) is True

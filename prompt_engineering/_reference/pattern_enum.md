@@ -7,7 +7,7 @@
 - `wedge`：楔形或三推结构（含 Micro Wedge、Nested Wedge）。
 - `reversal_attempt`：反转尝试，未必满足完整 MTR。
 - `mtr`：主要趋势反转，需趋势线突破 + 前极点测试失败等核心条件（见文件25）。
-- `final_flag`：最终旗形或趋势末端旗形失败（见文件24）。
+- `final_flag`：最终旗形或趋势末端旗形失败（见文件24）。**勿与尖峰旗形（Spike Flag）混淆**：尖峰旗形顺向突破属 SPS 变体，允许顺主趋势评估；FF 禁止追顺势。
 - `h1` / `h2` / `l1` / `l2`：High1/High2/Low1/Low2 计数入场结构。
 - `breakout_failure`：突破失败，突破后快速回到原结构内。
 - `failed_breakout`：`breakout_failure` 的同义标签；优先统一为 `breakout_failure`。
@@ -25,7 +25,7 @@
 - `spike_candidate`：单根超大突破棒或尚未达到2根的尖峰候选；不得单独触发 `cycle_position=spike`。
 - `spike_active` / `spike_ending` / `spike_transitioning`：尖峰阶段标签。
 - `double_top_bottom`：双顶、双底、微型双顶或微型双底（见文件28）。
-- `climax` / `climax_warning` / `climax_triggered`：高潮风险，与 spike 结构状态分开记录。
+- `climax_warning` / `climax_triggered`：高潮风险（与 JSON 字段 `climax_risk=warning/triggered` 对应；**勿**单独使用裸 `climax`）
 - `shrinking_stairs`：收缩台阶或推进幅度递减。
 - `failed_signal`：信号失败，失败信号的入场价/止损位成为磁力位。
 - `magnet`：磁力位（见文件22）。

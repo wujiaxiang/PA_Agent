@@ -92,6 +92,8 @@ class GeneralSettings(BaseModel):
     decision_confidence_threshold: int = Field(default=40, ge=0, le=100)
     #: 开启下根K线预期功能；关闭时不向模型请求该预测，节省 token
     enable_next_bar_prediction: bool = False
+    #: 同一结构位 entry 相差≤3跳时，禁止反向新方案的冷却 K 线根数（已收盘）
+    structure_flip_cooldown_bars: int = Field(default=3, ge=1, le=50)
 
     @field_validator("last_data_source", mode="before")
     @classmethod
@@ -148,7 +150,7 @@ class PushPlusSettings(BaseModel):
     """PushPlus notification settings (settings.json only; no GUI)."""
     model_config = ConfigDict(extra="ignore")
 
-    enabled: bool = True
+    enabled: bool = False
     token: str = ""
 
 
@@ -175,6 +177,7 @@ def provider_api_key_configured(settings: Settings | None) -> bool:
 # ── Persistence ───────────────────────────────────────────────────────────────
 import json
 import logging
+import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -251,7 +254,16 @@ def load_settings(path: Path | None = None) -> "Settings":
 
     migrated_feishu = _migrate_legacy_feishu_json(raw, path)
     settings = Settings.model_validate(raw)
-    if migrated_feishu:
+    dirty = migrated_feishu
+    if settings.pushplus.enabled and not settings.pushplus.token.strip():
+        if not (os.environ.get("PUSHPLUS_TOKEN") or "").strip():
+            settings.pushplus.enabled = False
+            logger.info(
+                "PushPlus enabled but token empty — auto-disabled "
+                "(Feishu notifications unaffected)"
+            )
+            dirty = True
+    if dirty:
         save_settings(settings, path)
     return settings
 

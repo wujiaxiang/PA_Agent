@@ -90,6 +90,11 @@ _CSV_FIELDNAMES = [
     "terminal_label",
     # ── Decision trace summary ────────────────────────────────────────────────
     "decision_trace_summary",
+    # ── Continuity audit (vs previous CSV row) ────────────────────────────────
+    "prev_plan_relation",
+    "prev_plan_invalidated",
+    "prev_plan_entry",
+    "bars_since_prev_plan",
     # ── Image path ────────────────────────────────────────────────────────────
     "chart_image",
 ]
@@ -433,6 +438,7 @@ def save_trade_record(
     meta_timeframe: str,
     decision_stance: str,
     model_name: str,
+    structure_flip_cooldown_bars: int = 3,
 ) -> None:
     """Append one row to the trade CSV and generate the chart image.
 
@@ -448,6 +454,7 @@ def save_trade_record(
             meta_timeframe=meta_timeframe,
             decision_stance=decision_stance,
             model_name=model_name,
+            structure_flip_cooldown_bars=structure_flip_cooldown_bars,
         )
     except Exception as exc:  # noqa: BLE001
         logger.error("save_trade_record failed: %s", exc, exc_info=True)
@@ -463,6 +470,7 @@ def _save_trade_record_impl(
     meta_timeframe: str,
     decision_stance: str,
     model_name: str,
+    structure_flip_cooldown_bars: int = 3,
 ) -> None:
     s1 = stage1_diagnosis or {}
     dec = decision_inner or {}
@@ -515,6 +523,19 @@ def _save_trade_record_impl(
     trace = stage2_full.get("decision_trace") or []
     trace_summary = " | ".join(
         f"{t.get('node_id','')}:{t.get('answer','')}" for t in trace if isinstance(t, dict)
+    )
+
+    from pa_agent.ai.decision_continuity import (
+        audit_relation_fields,
+        load_last_trade_csv_row,
+    )
+
+    prev_csv_row = load_last_trade_csv_row(meta_symbol, meta_timeframe)
+    audit = audit_relation_fields(
+        prev_csv_row,
+        dec,
+        frame=frame,
+        cooldown_bars=structure_flip_cooldown_bars,
     )
 
     # ── Build CSV row ─────────────────────────────────────────────────────────
@@ -575,15 +596,31 @@ def _save_trade_record_impl(
 
         "decision_trace_summary": trace_summary,
 
+        "prev_plan_relation": audit.get("prev_plan_relation", ""),
+        "prev_plan_invalidated": audit.get("prev_plan_invalidated", ""),
+        "prev_plan_entry": audit.get("prev_plan_entry", ""),
+        "bars_since_prev_plan": audit.get("bars_since_prev_plan", ""),
+
         "chart_image": image_filename if chart_written else "",
     }
 
-    # ── Write CSV (create with header if new) ─────────────────────────────────
-    write_header = not csv_path.exists()
-    with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
+    # ── Write CSV (rewrite with unified header for schema migrations) ─────────
+    existing_rows: list[dict[str, str]] = []
+    if csv_path.exists():
+        try:
+            with open(csv_path, encoding="utf-8-sig", newline="") as f:
+                existing_rows = list(csv.DictReader(f))
+        except OSError:
+            existing_rows = []
+    merged_row = {k: str(row.get(k, "")) for k in _CSV_FIELDNAMES}
+    for k, v in row.items():
+        if k in _CSV_FIELDNAMES:
+            merged_row[k] = "" if v is None else str(v)
+    existing_rows.append(merged_row)
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=_CSV_FIELDNAMES, extrasaction="ignore")
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+        writer.writeheader()
+        for r in existing_rows:
+            writer.writerow({k: r.get(k, "") for k in _CSV_FIELDNAMES})
 
     logger.info("Trade record appended: %s", csv_path)
