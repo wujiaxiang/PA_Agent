@@ -1,0 +1,226 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #131722;
+  --bg-panel: #1e222d;
+  --bg-input: #2a2e39;
+  --border: #363c4e;
+  --text: #d1d4dc;
+  --text-dim: #787b86;
+  --accent: #2962ff;
+  --accent-hover: #1e4bd2;
+  --green: #26a69a;
+  --red: #ef5350;
+  --gold: #f0b90b;
+}
+
+body {
+  font: 13px/1.5 -apple-system, "Helvetica Neue", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── Toolbar ───────────────────────────── */
+#toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  gap: 8px;
+  flex-shrink: 0;
+}
+.toolbar-group { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.toolbar-group label { color: var(--text-dim); font-size: 11px; }
+.toolbar-group select,
+.toolbar-group input {
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+.toolbar-group select { min-width: 80px; }
+
+button {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  background: var(--bg-input);
+  color: var(--text);
+}
+button:hover { background: var(--border); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover { background: var(--accent-hover); }
+
+/* ── Main layout ─────────────────────── */
+#main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+#chart-container {
+  flex: 1;
+  min-width: 0;
+}
+#sidebar {
+  width: 460px;
+  min-width: 340px;
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+}
+
+/* ── Sidebar tabs ────────────────────── */
+.sidebar-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.sidebar-tabs .tab {
+  flex: 1;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  padding: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 0;
+}
+.sidebar-tabs .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-panel { display: none; flex: 1; overflow-y: auto; padding: 10px; min-height: 0; }
+.tab-panel.active { display: flex; flex-direction: column; }
+
+/* ── Stream panel ────────────────────── */
+#stage-badge {
+  font-size: 13px;
+  font-weight: 600;
+  padding: 4px 0;
+  color: var(--accent);
+}
+#stream-reasoning {
+  color: var(--text-dim);
+  font-size: 11px;
+  max-height: 150px;
+  overflow-y: auto;
+  margin-bottom: 6px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+#stream-content {
+  flex: 1;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 13px;
+  line-height: 1.7;
+}
+#stream-usage {
+  color: var(--text-dim);
+  font-size: 11px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+  margin-top: 6px;
+}
+
+/* ── Decision panel ──────────────────── */
+#decision-content { font-size: 13px; line-height: 1.8; }
+.decision-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  margin-bottom: 10px;
+}
+.decision-card h3 { font-size: 14px; margin-bottom: 6px; }
+.decision-card .order-type { font-size: 18px; font-weight: 700; }
+.decision-card .buy .order-type { color: var(--green); }
+.decision-card .sell .order-type { color: var(--red); }
+.decision-card .field { display: flex; justify-content: space-between; margin: 2px 0; }
+.decision-card .field .key { color: var(--text-dim); }
+.decision-card .field .val { font-weight: 600; }
+
+/* ── Chat panel ──────────────────────── */
+#chat-history { flex: 1; overflow-y: auto; }
+.chat-msg { margin-bottom: 10px; }
+.chat-msg.user { text-align: right; }
+.chat-msg.user .bubble { background: var(--accent); display: inline-block; padding: 6px 10px; border-radius: 10px; font-size: 13px; max-width: 85%; text-align: left; }
+.chat-msg.assistant .bubble { background: var(--bg); display: inline-block; padding: 6px 10px; border-radius: 10px; font-size: 13px; max-width: 85%; }
+.chat-msg .reasoning { color: var(--text-dim); font-size: 10px; margin-bottom: 2px; }
+.chat-input-row { display: flex; gap: 6px; border-top: 1px solid var(--border); padding-top: 8px; margin-top: 8px; }
+.chat-input-row input { flex: 1; background: var(--bg-input); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; font-size: 13px; }
+
+/* ── Modal ───────────────────────────── */
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.modal.hidden { display: none; }
+.modal-content {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  width: 500px;
+  max-width: 90vw;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+.modal-content h2 { margin-bottom: 14px; font-size: 16px; }
+.modal-close { float: right; font-size: 20px; cursor: pointer; color: var(--text-dim); }
+.modal-close:hover { color: var(--text); }
+
+.settings-tabs { display: flex; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
+.settings-tabs .stab {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  padding: 6px 14px;
+  font-size: 12px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+}
+.settings-tabs .stab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.stab-panel { display: none; }
+.stab-panel.active { display: block; }
+
+#settings-form label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+#settings-form label input,
+#settings-form label select {
+  width: 280px;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-size: 13px;
+}
+#settings-form label input[type="checkbox"] { width: auto; }
+
+.form-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+/* ── Status colors ──────────────────── */
+.status-ok { color: var(--green); }
+.status-err { color: var(--red); }
+.status-warn { color: var(--gold); }

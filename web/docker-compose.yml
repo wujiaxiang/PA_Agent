@@ -1,0 +1,16 @@
+services:
+  pa-agent-web:
+    build:
+      context: ..
+      dockerfile: web/Dockerfile
+    ports:
+      - "8005:8000"
+    volumes:
+      - ../config:/app/config
+      - ../records:/app/records
+      - ../logs:/app/logs
+    environment:
+      - QT_QPA_PLATFORM=offscreen
+    security_opt:
+      - apparmor=unconfined
+    restart: unless-stopped
