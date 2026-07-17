@@ -76,6 +76,8 @@ tools/_pending_order_report.txt
 tools/stage2_raw_sample.txt
 tools/_tools_catalog.json
 tools/_diag_*.txt
+# 根目录探针产物：tools/probe_thinking_routes.py 的运行输出（一次性诊断，不入库）
+/thinking_route_probe_result.json
 
 # ── 个人开发笔记（非对外文档）────────────────────────────────────────────────
 docs/changelog/
