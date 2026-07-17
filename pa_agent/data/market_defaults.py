@@ -32,6 +32,7 @@ _CRYPTO_HINTS = ("BTC", "ETH", "USDT", "SOL", "DOGE", "BNB", "XRP", "CRYPTO")
 
 # Crypto exchanges on TradingView (tvDatafeed exchange ids)
 TV_CRYPTO_EXCHANGES: tuple[str, ...] = (
+    "GATEIO",
     "BINANCE",
     "BITSTAMP",
     "COINBASE",
@@ -43,14 +44,14 @@ TV_CRYPTO_EXCHANGES: tuple[str, ...] = (
 
 # Common crypto pairs and their likely exchange on TradingView
 _CRYPTO_SYMBOL_EXCHANGE_HINTS: dict[str, str] = {
-    "BTCUSDT": "BINANCE",
-    "ETHUSDT": "BINANCE",
+    "BTCUSDT": "GATEIO",
+    "ETHUSDT": "GATEIO",
     "BTCUSD": "BITSTAMP",
     "ETHUSD": "BITSTAMP",
-    "SOLUSDT": "BINANCE",
+    "SOLUSDT": "GATEIO",
     "BNBUSDT": "BINANCE",
-    "XRPUSDT": "BINANCE",
-    "DOGEUSDT": "BINANCE",
+    "XRPUSDT": "GATEIO",
+    "DOGEUSDT": "GATEIO",
 }
 
 # Major index tickers on TradingView — (exchange, probe_order)
@@ -113,8 +114,13 @@ def normalize_gold_symbol_for_kind(kind: str, symbol: str) -> str:
         hk = normalize_hk_tv_code(sym)
         if _is_hk_tv_code(hk):
             return hk
-    if not sym or is_likely_crypto_symbol(sym):
+    if not sym:
         return GOLD_TV_SYMBOL if kind == "tradingview" else GOLD_MT5_SYMBOL
+    # Crypto symbols (BTCUSDT, ETHUSDT, ...) are valid TradingView tickers —
+    # keep as-is.  Previously this branch forced them to GOLD_TV_SYMBOL, which
+    # made it impossible to analyze crypto pairs via TradingView.
+    if is_likely_crypto_symbol(sym):
+        return sym
     if kind == "tradingview" and sym.lower().endswith("m") and len(sym) > 2:
         return GOLD_TV_SYMBOL
     return sym

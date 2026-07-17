@@ -58,6 +58,12 @@ class AppContext:
         sync_workbuddy_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
         sync_cursor_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
 
+        # Apply .env / process env overrides (TODO P1.2). Web mode typically
+        # uses .env for secrets; GUI mode leaves .env absent and this is no-op.
+        from pa_agent.config.env_loader import apply_env_overrides
+
+        apply_env_overrides(settings)
+
         # ── Logging (with API key masking) ────────────────────────────────────
         configure_logging(api_key=settings.provider.api_key)
 

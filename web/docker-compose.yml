@@ -9,8 +9,4 @@ services:
       - ../config:/app/config
       - ../records:/app/records
       - ../logs:/app/logs
-    environment:
-      - QT_QPA_PLATFORM=offscreen
-    security_opt:
-      - apparmor=unconfined
     restart: unless-stopped

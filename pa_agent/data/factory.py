@@ -68,7 +68,6 @@ def data_source_label(kind: str | None) -> str:
         return "YFinance"
     return "MT5"
 
-
 def default_symbol_for_kind(kind: str | None) -> str:
     return _DEFAULT_SYMBOLS[normalize_data_source_kind(kind)]
 
@@ -77,9 +76,11 @@ def create_data_source(kind: str | None) -> DataSource:
     """Instantiate a fresh data source for *kind* (not connected)."""
     normalized = normalize_data_source_kind(kind)
     if normalized == "tradingview":
+        from pa_agent.config.env_loader import get_tv_credentials
         from pa_agent.data.tradingview import TradingViewSource
 
-        return TradingViewSource()
+        username, password = get_tv_credentials()
+        return TradingViewSource(username=username, password=password)
     if normalized == "eastmoney":
         from pa_agent.data.eastmoney_source import EastMoneySource
 

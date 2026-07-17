@@ -5,12 +5,13 @@ the Qt EventBus with an asyncio pub/sub for WebSocket / SSE streaming.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -24,6 +25,17 @@ logger = logging.getLogger("pa_agent.web")
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
+# Re-exported for trace_id_middleware — imported lazily to avoid circular import.
+def get_trace_id() -> str:
+    from pa_agent.util.logging import get_trace_id as _gti
+    return _gti()
+
+
+# Heartbeat interval (seconds). Trade-off: too short burns tokens, too long
+# delays detection. 5 min matches typical monitoring expectations.
+_HEALTH_HEARTBEAT_INTERVAL_S = 300.0
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Bootstrap AppContext on startup, tear down on shutdown."""
@@ -34,13 +46,65 @@ async def lifespan(app: FastAPI):
     # Replace Qt EventBus with async stub so core emits don't crash
     ctx.event_bus = AsyncEventBus()
     app.state.ctx = ctx
+    # Last cached health report (updated by heartbeat task). None = no check yet.
+    app.state.last_health_report = None
     logger.info("PA Agent Web backend bootstrapped (data_source=%s)", type(ctx.data_source).__name__)
+
+    # Start background heartbeat task (TODO P1.3)
+    heartbeat_task = asyncio.create_task(_health_heartbeat(app))
+
     yield
     # shutdown
+    heartbeat_task.cancel()
+    try:
+        await heartbeat_task
+    except asyncio.CancelledError:
+        pass
     try:
         ctx.data_source.disconnect()
     except Exception:
         pass
+
+
+async def _health_heartbeat(app: FastAPI) -> None:
+    """Background task: ping model API + data source every 5 min.
+
+    Caches the result in ``app.state.last_health_report`` so ``/api/health``
+    can return the cached status without re-running the check on every call.
+    Cancels cleanly on shutdown.
+
+    The first check runs in the background (not awaited at startup) so it
+    doesn't block lifespan from completing — a slow model API ping should
+    not delay server readiness.  /api/health returns "starting" until the
+    first check completes.
+    """
+    while True:
+        try:
+            await _run_and_cache_health(app)
+            await asyncio.sleep(_HEALTH_HEARTBEAT_INTERVAL_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.warning("Health heartbeat iteration failed", exc_info=True)
+            # On failure, wait the full interval before retrying to avoid
+            # hammering a broken upstream.
+            await asyncio.sleep(_HEALTH_HEARTBEAT_INTERVAL_S)
+
+
+async def _run_and_cache_health(app: FastAPI) -> None:
+    """Run full health check in a thread (blocking I/O) and cache result."""
+    from pa_agent.util.startup_health_check import run_full_check
+
+    ctx = app.state.ctx
+    # Run blocking check in threadpool to avoid blocking event loop
+    report = await asyncio.to_thread(run_full_check, ctx)
+    app.state.last_health_report = report.to_dict()
+    if report.status != "ok":
+        logger.warning(
+            "Health check status=%s: %s",
+            report.status,
+            report.to_dict(),
+        )
 
 
 app = FastAPI(
@@ -56,6 +120,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def trace_id_middleware(request: Request, call_next):
+    """Assign trace_id to every request for structured log correlation (TODO P2.4).
+
+    Reads ``X-Trace-Id`` header if present (for upstream propagation),
+    otherwise generates a 12-char hex id.  The id is exposed in the response
+    header so clients can reference it when reporting issues.
+    """
+    from pa_agent.util.logging import set_trace_id
+
+    tid = request.headers.get("X-Trace-Id") or None
+    set_trace_id(tid)
+    response = await call_next(request)
+    response.headers["X-Trace-Id"] = get_trace_id()
+    return response
+
 from web.api.routes_settings import router as settings_router
 from web.api.routes_data import router as data_router
 from web.api.routes_analyze import router as analyze_router
@@ -69,7 +150,33 @@ app.include_router(chat_router, prefix="/api")
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    """Lightweight liveness probe.
+
+    Returns cached health status from the background heartbeat task.  If no
+    heartbeat has run yet, returns ``"starting"`` so callers can retry.
+    """
+    report = getattr(app.state, "last_health_report", None)
+    if report is None:
+        return {"status": "starting"}
+    return {"status": report["status"]}
+
+
+@app.get("/api/health/check")
+async def health_check():
+    """Full health check (runs synchronously, may take a few seconds).
+
+    Pings the model API (1-token chat completion) and data source
+    (latest_snapshot(2)).  Returns per-component details with latency.
+
+    Use this for diagnostics; use ``/api/health`` for fast liveness probes.
+    """
+    from pa_agent.util.startup_health_check import run_full_check
+
+    ctx = app.state.ctx
+    report = await asyncio.to_thread(run_full_check, ctx)
+    # Also update the cached report
+    app.state.last_health_report = report.to_dict()
+    return report.to_dict()
 
 
 # Serve static frontend at /

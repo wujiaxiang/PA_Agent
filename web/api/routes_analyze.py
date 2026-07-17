@@ -37,7 +37,7 @@ def _run_analysis(ctx, bar_count: int, event_queue: asyncio.Queue, loop):
         bars_raw, bar_count,
         ctx.settings.general.last_symbol,
         ctx.settings.general.last_timeframe,
-        now_ms,
+        now_ms=now_ms,
     )
 
     # Build orchestrator (replicating main_window._build_orchestrator logic)
@@ -93,6 +93,27 @@ def _run_analysis(ctx, bar_count: int, event_queue: asyncio.Queue, loop):
         )
 
         # Serialize the final record for the frontend
+        s1_diag = record.stage1_diagnosis or {}
+        s2_resp = record.stage2_response or {}
+        # 决策树 trace：stage1_diagnosis.gate_trace + stage2_response.decision_trace/terminal/gate_shortcircuited
+        decision_tree_payload = {
+            "gate_trace": s1_diag.get("gate_trace"),
+            "decision_trace": s2_resp.get("decision_trace"),
+            "terminal": s2_resp.get("terminal"),
+            "gate_result": s1_diag.get("gate_result"),
+            "gate_shortcircuited": bool(s2_resp.get("gate_shortcircuited")),
+        }
+        # 决策叠加层用价格字段（供前端 chart.js 绘制 entry/TP/SL 横线）
+        s2_dec = record.stage2_decision or {}
+        decision_overlay = {
+            "order_type": s2_dec.get("order_type"),
+            "order_direction": s2_dec.get("order_direction"),
+            "chart_overlay_active": bool(s2_dec.get("chart_overlay_active", True)),
+            "entry_price": s2_dec.get("entry_price"),
+            "stop_loss_price": s2_dec.get("stop_loss_price"),
+            "take_profit_price": s2_dec.get("take_profit_price"),
+            "take_profit_price_2": s2_dec.get("take_profit_price_2"),
+        }
         result = {
             "type": "done",
             "record": {
@@ -103,6 +124,8 @@ def _run_analysis(ctx, bar_count: int, event_queue: asyncio.Queue, loop):
                 "strategy_files_used": record.strategy_files_used,
                 "usage_total": record.usage_total,
                 "exception": record.exception,
+                "decision_tree": decision_tree_payload,
+                "decision_overlay": decision_overlay,
             },
         }
         loop.call_soon_threadsafe(event_queue.put_nowait, result)

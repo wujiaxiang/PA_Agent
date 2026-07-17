@@ -20,6 +20,9 @@ class AIProviderSettings(BaseModel):
     thinking: bool = True
     reasoning_effort: Literal["low", "medium", "high", "max"] = "high"
     context_window: int = 2_000_000
+    #: Optional explicit override for max_tokens sent to provider. 0/None = auto
+    #: (use per-provider default, see _provider_max_output_tokens). TODO P2.3.
+    max_output_tokens: int | None = None
 
 
 class PromptSettings(BaseModel):

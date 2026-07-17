@@ -104,6 +104,7 @@ async def get_bars(request: Request, count: int = 100):
             "low": b.low,
             "close": b.close,
             "volume": b.volume,
+            "closed": bool(b.closed),
         })
     return {
         "symbol": ctx.settings.general.last_symbol,

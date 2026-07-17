@@ -5,13 +5,20 @@ Public API
 configure_logging(api_key: str = "") -> None
 update_api_key(new_key: str) -> None
 verify_logging_handlers() -> bool
+set_trace_id(trace_id: str | None = None) -> str
+get_trace_id() -> str
 """
 from __future__ import annotations
 
+import contextvars
+import json
 import logging
 import logging.handlers
+import os
+import time
+import uuid
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
 from pa_agent.config.paths import LOG_FILE_PATH
 from pa_agent.util.mask_secret import mask_secret
@@ -20,6 +27,28 @@ from pa_agent.util.mask_secret import mask_secret
 
 _active_formatters: List["MaskingFormatter"] = []
 _configured: bool = False
+
+# trace_id contextvar — per-request correlation id (TODO P2.4)
+# Set by FastAPI middleware / orchestrator entry; emitted in JSON logs.
+_trace_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "pa_agent_trace_id", default=""
+)
+
+
+def set_trace_id(trace_id: str | None = None) -> str:
+    """Set the current request's trace_id; auto-generates if None.
+
+    Returns the trace_id that was set (useful for callers that need to log it).
+    """
+    tid = trace_id or uuid.uuid4().hex[:12]
+    _trace_id_ctx.set(tid)
+    return tid
+
+
+def get_trace_id() -> str:
+    """Return the current trace_id (empty string if not in a request scope)."""
+    return _trace_id_ctx.get()
+
 
 # ── MaskingFormatter ──────────────────────────────────────────────────────────
 
@@ -36,6 +65,56 @@ class MaskingFormatter(logging.Formatter):
         if self._api_key:
             message = message.replace(self._api_key, mask_secret(self._api_key))
         return message
+
+    def set_api_key(self, new_key: str) -> None:
+        self._api_key = new_key
+
+
+class JsonlFormatter(logging.Formatter):
+    """Structured JSON-lines formatter (TODO P2.4).
+
+    Emits one JSON object per log record with: ts, level, logger, msg,
+    trace_id, and any extra fields attached via ``logger.info(..., extra=...)``.
+    API key masking is applied to the message string.
+    """
+
+    def __init__(self, api_key: str = "") -> None:
+        super().__init__()
+        self._api_key = api_key
+
+    def format(self, record: logging.LogRecord) -> str:  # noqa: A003
+        # Build base payload
+        payload: dict[str, Any] = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(record.created))
+            + f".{int(record.msecs):03d}",
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+            "trace_id": get_trace_id(),
+        }
+        # Attach any caller-supplied extras (skip private LogRecord attrs)
+        std_attrs = set(vars(record).keys()) | {
+            "message", "asctime", "name", "msg", "args", "levelname", "levelno",
+            "pathname", "filename", "module", "exc_info", "exc_text", "stack_info",
+            "lineno", "funcName", "created", "msecs", "relativeCreated", "thread",
+            "threadName", "processName", "process", "taskName",
+        }
+        for k, v in vars(record).items():
+            if k not in std_attrs and not k.startswith("_"):
+                try:
+                    json.dumps(v)  # ensure serializable
+                    payload[k] = v
+                except (TypeError, ValueError):
+                    payload[k] = repr(v)
+        # Exception info
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        # Mask api_key in message
+        if self._api_key and self._api_key in payload["msg"]:
+            payload["msg"] = payload["msg"].replace(
+                self._api_key, mask_secret(self._api_key)
+            )
+        return json.dumps(payload, ensure_ascii=False)
 
     def set_api_key(self, new_key: str) -> None:
         self._api_key = new_key
@@ -59,6 +138,13 @@ _QUIET_LOGGER_NAMES = (
 )
 
 
+def _json_logging_enabled() -> bool:
+    """True if PA_AGENT_LOG_JSON env var is set to a truthy value (TODO P2.4)."""
+    return os.environ.get("PA_AGENT_LOG_JSON", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def verify_logging_handlers() -> bool:
     """Return True when the expected rotating file handler is attached to root."""
     expected = str(LOG_FILE_PATH.resolve())
@@ -77,6 +163,10 @@ def configure_logging(api_key: str = "") -> None:
     Third-party loggers (urllib3, openai, httpx) are also attached to the same handlers.
 
     If handlers were removed after a prior configure_logging call, re-attaches them.
+
+    If env var ``PA_AGENT_LOG_JSON=true`` is set, an additional JSON-lines
+    handler is attached to write structured logs to ``logs/pa_agent.jsonl``
+    (TODO P2.4).  The text log is kept for backward compatibility.
     """
     global _configured  # noqa: PLW0603
 
@@ -114,6 +204,20 @@ def configure_logging(api_key: str = "") -> None:
 
     handlers: list[logging.Handler] = [file_handler, console_handler]
 
+    # Optional JSON-lines handler (TODO P2.4)
+    if _json_logging_enabled():
+        jsonl_path = LOG_FILE_PATH.parent / "pa_agent.jsonl"
+        jsonl_formatter = JsonlFormatter(api_key=api_key)
+        _active_formatters.append(jsonl_formatter)
+        jsonl_handler = logging.handlers.RotatingFileHandler(
+            jsonl_path,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        jsonl_handler.setFormatter(jsonl_formatter)
+        handlers.append(jsonl_handler)
+
     # Configure root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
@@ -137,7 +241,9 @@ def configure_logging(api_key: str = "") -> None:
 
     _configured = True
     logging.getLogger("pa_agent.diagnostics").info(
-        "configure_logging: handlers attached (log_file=%s)", LOG_FILE_PATH
+        "configure_logging: handlers attached (log_file=%s, json=%s)",
+        LOG_FILE_PATH,
+        _json_logging_enabled(),
     )
 
 

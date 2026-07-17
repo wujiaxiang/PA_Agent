@@ -297,3 +297,164 @@ button.danger:disabled { background: var(--bg-input); border-color: var(--border
 .status-ok { color: var(--green); }
 .status-err { color: var(--red); }
 .status-warn { color: var(--gold); }
+
+/* ── Utility ────────────────────────── */
+.hidden { display: none !important; }
+.muted-text { color: var(--text-dim); font-size: 11px; }
+
+/* ── Toolbar toggles ─────────────────── */
+.toggle-label {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-dim) !important;
+  font-size: 11px !important;
+  cursor: pointer;
+}
+.toggle-label input { width: auto !important; }
+
+/* ── Token progress bar ──────────────── */
+.token-progress {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+.token-progress-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.token-progress-bar {
+  height: 8px;
+  background: var(--bg-input);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.token-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 4px;
+  transition: width 0.3s ease, background-color 0.3s ease;
+  width: 0%;
+}
+/* 阈值样式：>=80% 黄，>=95% 红 */
+.token-progress.warn .token-progress-fill { background: var(--gold); }
+.token-progress.danger .token-progress-fill { background: var(--red); }
+.token-progress.warn .token-progress-label span:last-child { color: var(--gold); }
+.token-progress.danger .token-progress-label span:last-child { color: var(--red); }
+
+/* ── Future trend panel ──────────────── */
+#future-content { font-size: 13px; line-height: 1.7; }
+.future-section {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  margin-bottom: 10px;
+}
+.future-section h3 { font-size: 14px; margin-bottom: 8px; }
+.future-section .future-empty { color: var(--text-dim); font-style: italic; }
+.future-dir {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.future-dir.bullish { background: rgba(38,166,154,0.2); color: var(--green); }
+.future-dir.bearish { background: rgba(239,83,80,0.2); color: var(--red); }
+.future-dir.neutral { background: rgba(240,185,11,0.2); color: var(--gold); }
+.future-dir.unknown { background: var(--bg-input); color: var(--text-dim); }
+.future-probs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0;
+}
+.future-prob-chip {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 2px 10px;
+  font-size: 11px;
+}
+.future-prob-chip.top { background: rgba(41,98,255,0.15); border-color: var(--accent); color: var(--text); }
+.future-reasoning {
+  margin-top: 6px;
+  color: var(--text);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--bg-input);
+  padding: 6px 8px;
+  border-radius: 4px;
+}
+
+/* ── Decision tree panel ─────────────── */
+#tree-content { font-size: 12px; }
+.tree-terminal-banner {
+  padding: 8px 12px;
+  border-radius: 6px;
+  margin-bottom: 8px;
+  font-weight: 600;
+  font-size: 13px;
+}
+.tree-terminal-banner.trade { background: rgba(38,166,154,0.18); color: var(--green); }
+.tree-terminal-banner.wait  { background: rgba(240,185,11,0.18); color: var(--gold); }
+.tree-terminal-banner.reject{ background: rgba(239,83,80,0.18); color: var(--red); }
+.tree-terminal-banner.proceed { background: rgba(41,98,255,0.18); color: var(--accent); }
+.tree-table-wrap {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: auto;
+  max-height: 360px;
+}
+.tree-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+.tree-table th, .tree-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+.tree-table th {
+  background: var(--bg-input);
+  color: var(--text-dim);
+  position: sticky;
+  top: 0;
+  font-weight: 600;
+}
+.tree-table tr.skipped td { color: var(--text-dim); font-style: italic; }
+.tree-table .ans-yes { color: var(--green); }
+.tree-table .ans-no { color: var(--red); }
+.tree-table .ans-neutral { color: var(--gold); }
+.tree-table .ans-na { color: var(--text-dim); }
+.tree-table .reason-cell { color: var(--text); max-width: 160px; word-break: break-word; }
+.tree-empty { color: var(--text-dim); font-style: italic; padding: 12px; }
+
+/* ── Settings modal additions ─────────── */
+#settings-form label.checkbox-label {
+  justify-content: flex-start;
+  gap: 6px;
+}
+.form-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0;
+}
+button.secondary {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+button.secondary:hover { background: var(--border); }

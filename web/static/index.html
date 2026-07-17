@@ -22,6 +22,10 @@
     <button id="btn-analyze" class="primary">分析</button>
     <button id="btn-cancel" class="danger" disabled>取消</button>
     <button id="btn-refresh">刷新K线</button>
+    <label class="toggle-label">
+      <input id="cb-live-refresh" type="checkbox"> 实时刷新
+    </label>
+    <span id="live-refresh-status" class="muted-text"></span>
   </div>
   <div class="toolbar-right">
     <button id="btn-settings">⚙ 设置</button>
@@ -34,11 +38,21 @@
     <div class="sidebar-tabs">
       <button class="tab active" data-tab="stream">实时分析</button>
       <button class="tab" data-tab="decision">决策</button>
+      <button class="tab" data-tab="future">未来</button>
+      <button class="tab" data-tab="tree">决策树</button>
       <button class="tab" data-tab="chat">追问</button>
     </div>
 
     <div id="tab-stream" class="tab-panel active">
       <div id="stage-badge"></div>
+      <div id="token-progress-wrap" class="token-progress hidden">
+        <div class="token-progress-label">
+          <span>Token 上下文占用</span>
+          <span id="token-progress-pct">0%</span>
+        </div>
+        <div class="token-progress-bar"><div id="token-progress-fill"></div></div>
+        <div id="token-progress-detail" class="muted-text"></div>
+      </div>
       <div id="stream-reasoning"></div>
       <div id="stream-content"></div>
       <div id="stream-usage"></div>
@@ -47,6 +61,14 @@
 
     <div id="tab-decision" class="tab-panel">
       <div id="decision-content">尚未进行交易分析</div>
+    </div>
+
+    <div id="tab-future" class="tab-panel">
+      <div id="future-content">尚未进行交易分析</div>
+    </div>
+
+    <div id="tab-tree" class="tab-panel">
+      <div id="tree-content">尚未进行交易分析</div>
     </div>
 
     <div id="tab-chat" class="tab-panel">
@@ -67,6 +89,7 @@
     <div class="settings-tabs">
       <button class="stab active" data-stab="s-provider">AI 服务</button>
       <button class="stab" data-stab="s-general">通用</button>
+      <button class="stab" data-stab="s-feishu">飞书通知</button>
     </div>
     <form id="settings-form">
       <div id="stab-s-provider" class="stab-panel active">
@@ -94,6 +117,22 @@
           </select>
         </label>
         <label>上下文警告阈值(%) <input id="s-ctx-warn" type="number" value="80"></label>
+      </div>
+      <div id="stab-s-feishu" class="stab-panel">
+        <label class="checkbox-label">
+          <input id="s-feishu-enabled" type="checkbox"> 启用飞书通知
+        </label>
+        <label>Webhook URL <input id="s-feishu-webhook" type="text" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."></label>
+        <label>签名校验 Secret <input id="s-feishu-secret" type="password" placeholder="（可留空）"></label>
+        <label>App ID <input id="s-feishu-app-id" type="text" placeholder="cli_xxx"></label>
+        <label>App Secret <input id="s-feishu-app-secret" type="password"></label>
+        <label class="checkbox-label">
+          <input id="s-feishu-order-only" type="checkbox"> 仅在有下单机会时通知
+        </label>
+        <div class="form-row">
+          <button type="button" id="btn-feishu-test" class="secondary">测试发送</button>
+          <span id="feishu-test-result" class="muted-text"></span>
+        </div>
       </div>
       <div class="form-actions">
         <button type="submit" class="primary">保存</button>

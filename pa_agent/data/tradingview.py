@@ -38,6 +38,50 @@ _TV_WS_TIMEOUT_S = 10.0
 # Name-mangled attribute tvDatafeed uses internally for its socket timeout.
 _TV_WS_TIMEOUT_ATTR = "_TvDatafeed__ws_timeout"
 
+# Name-mangled attribute tvDatafeed uses for its WebSocket handshake headers.
+# tvdatafeed 2.1.0 ships `__ws_headers = json.dumps({"Origin": ...})` which
+# serialises the dict to a JSON string; websocket-client then treats each
+# character as a header key and the handshake fails. We patch it back to a
+# real dict before any TvDatafeed instance is constructed.
+_TV_WS_HEADERS_ATTR = "_TvDatafeed__ws_headers"
+_tv_ws_headers_patched = False
+
+
+def _patch_tvdatafeed_ws_headers() -> None:
+    """Monkey-patch tvdatafeed's WebSocket headers from JSON string to dict.
+
+    Idempotent: subsequent calls are no-ops. See TODO.md §1.3 / P0.3 for
+    background. Implemented as runtime patch (not source fork) so we don't
+    have to maintain a tvdatafeed fork.
+    """
+    global _tv_ws_headers_patched
+    if _tv_ws_headers_patched:
+        return
+    try:
+        from tvDatafeed import TvDatafeed  # type: ignore[import]
+
+        cur = getattr(TvDatafeed, _TV_WS_HEADERS_ATTR, None)
+        if isinstance(cur, str):
+            import json
+
+            try:
+                setattr(TvDatafeed, _TV_WS_HEADERS_ATTR, json.loads(cur))
+                logger.info("Patched tvDatafeed __ws_headers (str → dict)")
+            except json.JSONDecodeError:
+                # Already a dict-like string we can't parse — force the canonical value.
+                setattr(
+                    TvDatafeed,
+                    _TV_WS_HEADERS_ATTR,
+                    {"Origin": "https://data.tradingview.com"},
+                )
+                logger.warning(
+                    "tvDatafeed __ws_headers unparseable, set to canonical Origin dict"
+                )
+    except Exception:  # noqa: BLE001
+        logger.debug("tvDatafeed ws headers patch skipped", exc_info=True)
+    finally:
+        _tv_ws_headers_patched = True
+
 # Map our timeframe strings to tvDatafeed Interval enum names
 _TF_MAP: dict[str, str] = {
     "1m":  "in_1_minute",
@@ -106,6 +150,7 @@ class TradingViewSource(DataSource):
     def connect(self) -> None:
         try:
             from tvDatafeed import TvDatafeed  # type: ignore[import]
+            _patch_tvdatafeed_ws_headers()
             if self._username and self._password:
                 self._tv = TvDatafeed(self._username, self._password)
             else:
@@ -337,7 +382,7 @@ class TradingViewSource(DataSource):
                     symbol=user_symbol,
                     plan=probe_plan,
                     interval=interval,
-                    n_bars=n + 1,
+                    n_bars=n + 2,
                 )
             else:
                 try:
@@ -350,7 +395,7 @@ class TradingViewSource(DataSource):
                     symbol=fetch_symbol,
                     exchange=exchange,
                     interval=interval,
-                    n_bars=n + 1,
+                    n_bars=n + 2,
                 )
         except DataSourceTransientError:
             raise
@@ -377,23 +422,8 @@ class TradingViewSource(DataSource):
         bars: list[KlineBar] = []
         for i, row in enumerate(df.itertuples(index=False)):
             ts_ms = _row_ts_ms(row)
-            bar = KlineBar(
-                seq=i + 1,
-                ts_open=ts_ms,
-                open=float(row.open),
-                high=float(row.high),
-                low=float(row.low),
-                close=float(row.close),
-                volume=float(getattr(row, "volume", 0.0)),
-                closed=True,
-            )
             if i == 0:
-                # Determine whether the newest bar is still forming.
-                # We must NOT pass bar.closed=True into is_bar_still_forming because
-                # that function short-circuits on bar.closed and would always return
-                # False — defeating the purpose of the check entirely.
-                # Instead, use seconds_until_bar_closes which only looks at the
-                # timestamp, and is robust to constant broker-time offsets.
+                # Forming bar (seq=0 per DataSource contract).
                 from pa_agent.data.bar_close_wait import seconds_until_bar_closes
 
                 secs_left = seconds_until_bar_closes(
@@ -401,20 +431,32 @@ class TradingViewSource(DataSource):
                 )
                 still_forming = secs_left is not None and secs_left > 0
                 bar = KlineBar(
-                    seq=bar.seq,
-                    ts_open=bar.ts_open,
-                    open=bar.open,
-                    high=bar.high,
-                    low=bar.low,
-                    close=bar.close,
-                    volume=bar.volume,
+                    seq=0,
+                    ts_open=ts_ms,
+                    open=float(row.open),
+                    high=float(row.high),
+                    low=float(row.low),
+                    close=float(row.close),
+                    volume=float(getattr(row, "volume", 0.0)),
                     closed=not still_forming,
                 )
+            else:
+                # Closed bar: seq=1..n (per DataSource contract).
+                bar = KlineBar(
+                    seq=i,
+                    ts_open=ts_ms,
+                    open=float(row.open),
+                    high=float(row.high),
+                    low=float(row.low),
+                    close=float(row.close),
+                    volume=float(getattr(row, "volume", 0.0)),
+                    closed=True,
+                )
             bars.append(normalize_kline_bar(bar))
-            if len(bars) >= n:
+            if len(bars) >= n + 1:
                 break
 
-        return bars
+        return self._validate_snapshot(n, bars)
 
 
 def _row_ts_ms(row) -> int:

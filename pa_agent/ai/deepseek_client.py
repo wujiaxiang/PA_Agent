@@ -288,7 +288,15 @@ def _prepare_api_messages(
 
 
 def _provider_max_output_tokens(settings: AIProviderSettings) -> int:
-    """Per-gateway completion cap (max_tokens); avoids 400 from provider limits."""
+    """Per-gateway completion cap (max_tokens); avoids 400 from provider limits.
+
+    If ``settings.max_output_tokens`` is set (>0), it takes precedence over the
+    per-provider defaults (TODO P2.3 — lets users override via settings.json or
+    .env instead of editing this constant).
+    """
+    explicit = getattr(settings, "max_output_tokens", None)
+    if explicit and explicit > 0:
+        return explicit
     model = (settings.model or "").lower()
     if _is_packyapi(settings.base_url) and "claude" in model:
         return _PACKY_CLAUDE_MAX_OUTPUT_TOKENS

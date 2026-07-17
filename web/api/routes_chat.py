@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Query, Request
@@ -17,8 +18,46 @@ router = APIRouter(tags=["chat"])
 
 _executor = ThreadPoolExecutor(max_workers=2)
 
-# In-memory session cache: keyed by (analysis record basename)
-_chat_sessions: dict[str, FreeChatSession] = {}
+# In-memory session cache: keyed by session_key -> {"session": FreeChatSession, "last_touch": ts}
+# 通过 TTL 机制（默认 30 分钟无活动）自动清理，避免内存泄漏
+_CHAT_SESSION_TTL_SEC = 30 * 60
+_chat_sessions: dict[str, dict] = {}
+
+# 后台清理 task 句柄，避免重复启动
+_chat_cleanup_task: asyncio.Task | None = None
+
+
+async def _chat_cleanup_loop():
+    """周期清理过期 chat session。"""
+    while True:
+        await asyncio.sleep(60)
+        now = time.time()
+        expired = [
+            k for k, v in _chat_sessions.items()
+            if now - v.get("last_touch", 0) > _CHAT_SESSION_TTL_SEC
+        ]
+        for k in expired:
+            _chat_sessions.pop(k, None)
+            logger.info("chat session expired, key=%s", k)
+
+
+@router.on_event("startup")
+async def _ensure_chat_cleanup():
+    global _chat_cleanup_task
+    if _chat_cleanup_task is None or _chat_cleanup_task.done():
+        _chat_cleanup_task = asyncio.create_task(_chat_cleanup_loop())
+
+
+def _touch_session(key: str, session: FreeChatSession) -> None:
+    _chat_sessions[key] = {"session": session, "last_touch": time.time()}
+
+
+def _get_session(key: str) -> FreeChatSession | None:
+    entry = _chat_sessions.get(key)
+    if entry is None:
+        return None
+    entry["last_touch"] = time.time()
+    return entry["session"]
 
 
 def _kline_snapshot_fn(ctx):
@@ -69,8 +108,9 @@ async def chat_stream(
 
     session_key = record_id or getattr(record, "_basename", "latest")
 
-    if session_key not in _chat_sessions:
-        _chat_sessions[session_key] = FreeChatSession(
+    session = _get_session(session_key)
+    if session is None:
+        session = FreeChatSession(
             base_record=record,
             client=ctx.client,
             assembler=ctx.assembler,
@@ -79,8 +119,7 @@ async def chat_stream(
             settings=ctx.settings,
             kline_snapshot_fn=_kline_snapshot_fn(ctx),
         )
-
-    session = _chat_sessions[session_key]
+        _touch_session(session_key, session)
 
     def on_reasoning(c: str) -> None:
         loop.call_soon_threadsafe(event_queue.put_nowait, {
