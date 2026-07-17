@@ -1,67 +1,74 @@
-# PA Agent — AI K线分析辅助工具（桌面端）
+# PA Agent（二次开发版）— AI K线分析辅助工具
 
-**交流 QQ 群：975328619**
-
----
-
-面向主观交易者的 **价格行为（Price Action）** AI 辅助决策工具。从 **MT5 / TradingView / yfinance / AkShare** 读取 K 线，将结构化 K 线数据与预计算特征送入大模型做**两阶段分析**（市场诊断 → 交易决策），**不是**截图识图，**不连接券商、不执行下单**。
+> 本仓库是在 [原项目 `rosemarycox5334-debug/PA_Agent`](https://github.com/rosemarycox5334-debug/PA_Agent)（作者 qq564020069）基础上的 **二次开发版本**，由 [wujiaxiang](https://github.com/wujiaxiang) 维护。
+>
+> 本仓库**不提供原项目的用户支持、交流群与打赏入口**；如需了解原项目完整功能或支持原作者，请访问上游仓库。
 
 ---
 
-## 主要功能
+## 本仓库相对原项目的二次开发改动
 
-- 📈 **多数据源**：MT5（Windows）、TradingView（全平台）、yfinance（期货/加密货币）、AkShare（A 股）
-- 🧠 **两阶段 AI 分析**：市场诊断 → 策略路由 → 交易决策（限价/突破/市价或不下单）
-- 🔄 **增量分析与持续跟踪**：新增 K 线时复用上次结论；开启 `keep_analysis` 后新 K 线收盘自动触发新一轮分析
-- 🌳 **决策树可视化**：赛博科幻风格可交互流程图，自动播放闸门→策略路径动画
-- 🔮 **未来走势预期**：AI 预测下一根 K 线方向和下一个市场周期位置
-- 💬 **分析后自由追问**：完整对话会话管理器，实时推理流 + Token 进度条，对话历史持久化
-- 📚 **经验库**：按周期位置检索历史案例供分析参考
-- 📝 **完整落盘**：Prompt、原始响应、诊断/决策 JSON、Token 用量、追问记录
-- 🛡️ **可配置校验体系**：JSON 校验、一致性检查、语义校验、截断修复、失败自动重试
-- 🔒 **API Key** 本地加密存储
+- 🌐 **新增 Web 后端**（[web/server.py](web/server.py)）：FastAPI + SSE，支持云端 / 无 GUI 环境运行，前端 100% 走后端代理
+- 🔧 **`.env` 环境变量系统**：三层覆盖优先级（shell env > `.env` > `config/settings.json`），启动即可用，无需前端录入配置
+- 🩺 **启动健康检查**：服务启动自动验证模型 API 与 TradingView 账号连通性，不通即明确报错
+- 🎭 **Mock 数据源**：云端沙箱无可用金融数据源时（TV/yfinance/akshare 被防火墙拦截），用模拟 K 线让前后端流程跑通
+- 🛡️ **SSE 稳定性修复**：分析路由强制 clamp `bar_count`，异常必推 error 事件，避免 `ERR_INCOMPLETE_CHUNKED_ENCODING`
+
+详细改动见 [CHANGELOG](#与上游的同步策略)。
 
 ---
 
-## 环境要求
+## 功能概览
 
-| 项目     | 要求                                                                    |
-| -------- | ----------------------------------------------------------------------- |
-| 操作系统 | Windows 10 / 11（主支持）、macOS 12+（TradingView 数据源）              |
-| Python   | 3.11+                                                                    |
-| 数据源   | MT5 / TradingView / yfinance / AkShare **至少配置一种**                  |
-| 网络     | 可访问所配置的 AI API（如 DeepSeek、PackyAPI 等）                        |
+面向主观交易者的 **价格行为（Price Action）** AI 辅助决策工具。从 **MT5 / TradingView / yfinance / AkShare** 读取 K 线，将结构化 K 线数据与预计算特征送入大模型做**两阶段分析**（市场诊断 → 交易决策），**不连接券商、不执行下单**。
+
+- 📈 多数据源：MT5 / TradingView / yfinance / AkShare / Mock
+- 🧠 两阶段 AI 分析：市场诊断 → 策略路由 → 交易决策（限价/突破/市价或不下单）
+- 🔄 增量分析与持续跟踪；决策树可视化；未来走势预期；分析后自由追问
+- 📝 完整落盘：Prompt、原始响应、诊断/决策 JSON、Token 用量、追问记录
+- 🛡️ 可配置校验体系：JSON 校验、一致性检查、语义校验、截断修复、失败自动重试
+
+完整功能说明见原项目文档 [`PA_Agent使用文档.md`](PA_Agent使用文档.md)，配置字段说明见 [`config/README.md`](config/README.md)。
 
 ---
 
 ## 快速开始
 
-直接在系统中安装（推荐部署在本机）：
+### 桌面 GUI（原项目主入口）
 
-```cmd
+```bash
 pip install -e .
 python -m pa_agent.main
 ```
 
 首次启动后在**设置**中填写 **Base URL**、**模型名** 与 **API Key**。
 
-> 如需隔离环境也可创建虚拟环境：`python -m venv .venv` 后激活再 `pip install -e .`。
+### Web 后端（本仓库二次开发新增，云端调试主入口）
 
-**安装内容**：PyQt6（GUI 框架）+ pyqtgraph（K 线图表绘图）+ numpy/pandas（数据处理）+ openai（AI API 客户端）+ **akshare/baostock（A 股数据源）** + json 校验、模型定义等全套依赖。
+```bash
+# 1. 配置环境变量（复制模板并填值）
+cp .env.example .env
+# 编辑 .env：填入 PA_AGENT_PROVIDER_API_KEY 等
 
-> 若需运行测试（pytest）或代码格式化（ruff/black），额外安装：`pip install -e ".[dev]"`。
+# 2. 安装依赖
+pip install -e .
+pip install openai  # 若报 RuntimeError: openai package is not installed
 
----
+# 3. 启动
+python -m uvicorn web.server:app --host 0.0.0.0 --port 8000
 
-## 详细说明
+# 4. 验证（启动健康检查 + 配置）
+curl http://localhost:8000/api/health/check
+curl http://localhost:8000/api/settings
+```
 
-完整操作界面说明见 [`PA_Agent使用文档.md`](PA_Agent使用文档.md)，配置字段说明见 [`config/README.md`](config/README.md)。
+环境要求：Python 3.11+；Windows/macOS/Linux。`.env` 模板与三层覆盖优先级说明见 [`.env.example`](.env.example)。
 
 ---
 
 ## 开发者指南
 
-> 本节面向继续开发与调试的 agent / 贡献者。终端用户可忽略。
+> 面向继续开发与调试的 agent / 贡献者。
 
 ### 架构概览
 
@@ -87,7 +94,7 @@ python -m pa_agent.main
 ```
 
 - **桌面 GUI**（`pa_agent/main.py` → `pa_agent.gui.main_window`）：PyQt6，本地使用，可直连 MT5。
-- **Web 后端**（`web/server.py`）：FastAPI + SSE，**云端调试主入口**。前端 100% 走后端代理（`/api/bars`、`/api/analyze/stream`），不直连 TradingView。
+- **Web 后端**（[web/server.py](web/server.py)）：FastAPI + SSE，**云端调试主入口**。前端 100% 走后端代理（`/api/bars`、`/api/analyze/stream`），不直连 TradingView。
 
 ### 环境与配置
 
@@ -109,21 +116,6 @@ python -m pa_agent.main
 - 智能降级：当前数据源不是 `tradingview` 时，TV 失败降级为 `warning`，不阻塞启动
 - 代码：[pa_agent/util/startup_health_check.py](pa_agent/util/startup_health_check.py)
 - **坑**：健康检查拼接 URL 时会智能识别 `base_url` 是否已带 `/v1`，避免 `/v1/v1/` 重复
-
-### 启动 Web 后端（云端调试）
-
-```bash
-# 安装依赖（含 web 额外依赖）
-pip install -e .
-pip install openai  # 若报 RuntimeError: openai package is not installed
-
-# 启动
-python -m uvicorn web.server:app --host 0.0.0.0 --port 8000
-
-# 验证
-curl http://localhost:8000/api/health/check
-curl http://localhost:8000/api/settings   # 确认 analysis_bar_count / data_source
-```
 
 ### 关键 API 端点
 
@@ -161,21 +153,19 @@ curl http://localhost:8000/api/settings   # 确认 analysis_bar_count / data_sou
 - AI 客户端：[pa_agent/ai/deepseek_client.py](pa_agent/ai/deepseek_client.py)（OpenAI 兼容）+ [pa_agent/ai/client_factory.py](pa_agent/ai/client_factory.py)
 - 提示词工程：[prompt_engineering/](prompt_engineering/)（Brooks 价格行为决策树）
 
-### 测试
+### 测试与代码风格
 
 ```bash
 pytest -q                    # 全量
 pytest tests/unit -q         # 仅单元测试（快）
 pytest -m "not live" -q      # 跳过需要真实 API key 的 live 测试
 pip install -e ".[dev]"      # 安装 pytest/ruff/black/hypothesis
+
+ruff check . && black --check .   # line-length 100, py311
+make lint / make test / make run
 ```
 
 测试分层：`tests/unit` / `tests/property`（hypothesis）/ `tests/integration` / `tests/e2e`。`live` 标记的测试必须通过环境变量配置 API key，**绝不读取** `config/settings.json`。
-
-### 代码风格
-
-- `ruff check . && black --check .`（line-length 100, py311）
-- `make lint` / `make test` / `make run`
 
 ### 已知坑与修复记录（重要）
 
@@ -217,82 +207,66 @@ tests/         unit / property / integration / e2e
 
 ---
 
+## 与上游的同步策略
+
+本仓库 fork 自 [rosemarycox5334-debug/PA_Agent](https://github.com/rosemarycox5334-debug/PA_Agent)。为持续获得上游 bug 修复与新功能，建议定期同步：
+
+### 配置 upstream 远程
+
+```bash
+# 一次性配置：添加上游远程
+git remote add upstream https://github.com/rosemarycox5334-debug/PA_Agent.git
+git remote -v   # 确认 origin + upstream 都在
+```
+
+### 同步上游改动的工作流
+
+```bash
+# 1. 拉取上游最新提交（不影响本地工作区）
+git fetch upstream
+
+# 2. 切到 main 并确保干净
+git checkout main
+git status
+
+# 3. 合并上游 main（保留本仓库的二次开发提交）
+git merge upstream/main
+# 若冲突：优先保留本仓库 web/、.env.example、pa_agent/config/env_loader.py、
+#         pa_agent/util/startup_health_check.py 等二次开发新增文件；
+#         核心层 pa_agent/ai、pa_agent/data、prompt_engineering 等以上游为准。
+
+# 4. 推送到自己的 origin
+git push origin main
+```
+
+### 同步注意事项
+
+- **二次开发独有文件**（避免被上游覆盖）：
+  - `web/` 整个目录（Web 后端 + 前端）
+  - `.env` / `.env.example`（环境变量系统）
+  - `pa_agent/config/env_loader.py`（轻量 .env 解析器）
+  - `pa_agent/util/startup_health_check.py`（启动健康检查）
+  - `pa_agent/data/mock_source.py`（Mock 数据源）
+- **核心层以上游为准**：`pa_agent/ai/`、`pa_agent/orchestrator/`、`prompt_engineering/`、`pa_agent/data/base.py` 等跟随上游更新，本仓库只做最小必要补丁。
+- **冲突高发点**：`pa_agent/data/factory.py`（新增了 mock 注册）、`pa_agent/config/settings.py`（新增了 `_apply_env_overrides`）、`web/api/routes_analyze.py`（bar_count clamp）。
+- **推荐用 PR 而非直接 merge 到 main**：重大上游更新可先建分支 `sync/upstream-YYYYMMDD`，提 PR review 后再合并，避免直接污染 main。
+
+### 也可用 GitHub 官方同步
+
+如果本仓库与上游无复杂冲突，可直接在 GitHub 网页点 "Sync fork" 按钮，或：
+
+```bash
+gh repo sync wujiaxiang/PA_Agent --source rosemarycox5334-debug/PA_Agent
+```
+
+> ⚠️ `gh repo sync` 会快进合并，若本仓库有与上游冲突的提交会失败，此时需走上面的手动 merge 流程。
+
+---
+
+## 致谢
+
+本项目基于 [rosemarycox5334-debug/PA_Agent](https://github.com/rosemarycox5334-debug/PA_Agent)（原作者 qq564020069）二次开发，遵循其 [AGPL-3.0](LICENSE) 协议。感谢原作者的开源贡献。
+
+---
+
 **免责声明**：本工具仅供学习与研究，不构成投资建议。交易有风险，决策后果自负。
-
-本项目采用 [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE) 发布。
-
----
-
-## 群友反馈榜单
-
-感谢群友的使用反馈与鼓励，以下为群友评价截图（按时间从早到晚排列）：
-
-<p align="center">
-  <img src="qunyou/BD58CB2D6E4F45CC17CF832C506A982C.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/653EC872A0D6883A34B7B37B692C8B1D.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/QQ20260619-205140.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/QQ20260619-235505.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/QQ20260620-150714.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/QQ20260620-150833.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/QQ20260620-220824.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/QQ20260623-125929.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/91003065F07407E92B50964AE7F8A944.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/QQ20260624-191001.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/QQ20260628-014043.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/QQ20260628-213700.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/QQ20260629-163821.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/QQ20260701-212522.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/BB4AE8110A7011426BD29D5CE8B5F73B.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/F383D366F2254692418DB18AAA617ACE.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/AD48DF6289CB6A9D51FE0B8EE2EC38C2.jpg" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/F61C8DCDB67924B64B33403D20047E0B.png" alt="群友反馈" width="480" />
-</p>
-<p align="center">
-  <img src="qunyou/QQ_1783089951396.png" alt="群友反馈" width="480" />
-</p>
-
----
-
-## 打赏与支持
-
-如果你觉得这个程序对你有帮助的话，可以打赏激励作者继续优化程序，感谢你的支持和鼓励！
-
-（作者会优先解决打赏人的问题，因为人太多了！回复不过来！）
-
-<p align="center">
-  <img src="赞助码.jpeg" alt="打赏二维码" width="420" />
-</p>
