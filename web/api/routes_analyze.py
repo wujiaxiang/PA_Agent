@@ -67,9 +67,11 @@ def _run_analysis(ctx, bar_count: int, event_queue: asyncio.Queue, loop):
             "type": "content_token", "stage": stage, "chunk": chunk,
         })
 
-    def on_prompt(stage: str, _system: str, _user: str) -> None:
+    def on_prompt(stage: str, system: str, user: str) -> None:
+        # 传递 prompt 全文到前端，供可折叠区域展示
         loop.call_soon_threadsafe(event_queue.put_nowait, {
             "type": "stage_prompt", "stage": stage,
+            "system": system, "user": user,
         })
 
     def on_stage2_files(files: list[str]) -> None:

@@ -60,6 +60,9 @@ button {
 button:hover { background: var(--border); }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.primary:hover { background: var(--accent-hover); }
+button.danger { background: var(--red); border-color: var(--red); color: #fff; }
+button.danger:hover { background: #d84a49; }
+button.danger:disabled { background: var(--bg-input); border-color: var(--border); color: var(--text-dim); cursor: not-allowed; }
 
 /* ── Main layout ─────────────────────── */
 #main {
@@ -149,6 +152,76 @@ button.primary:hover { background: var(--accent-hover); }
 .decision-card .field { display: flex; justify-content: space-between; margin: 2px 0; }
 .decision-card .field .key { color: var(--text-dim); }
 .decision-card .field .val { font-weight: 600; }
+
+/* 置信度进度条 */
+.decision-card .confidence-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0;
+}
+.decision-card .confidence-row .key { color: var(--text-dim); min-width: 80px; flex-shrink: 0; }
+.decision-card .confidence-bar {
+  flex: 1;
+  height: 8px;
+  background: var(--bg-input);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.decision-card .confidence-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}
+.decision-card .confidence-row .val { font-weight: 600; min-width: 36px; text-align: right; }
+
+/* 列表型字段（关键因素 / 关注点） */
+.decision-card .list-field { margin: 4px 0; }
+.decision-card .list-field .key { color: var(--text-dim); display: block; margin-bottom: 2px; }
+.decision-card .list-field ul { margin: 0; padding-left: 20px; }
+.decision-card .list-field li { margin: 1px 0; line-height: 1.6; }
+
+/* Prompt 展示区（可折叠） */
+#prompt-display {
+  margin-top: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+.prompt-block {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin-bottom: 6px;
+  padding: 6px 8px;
+}
+.prompt-block summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 12px;
+  user-select: none;
+}
+.prompt-block summary:hover { color: var(--text); }
+.prompt-section { margin-top: 6px; }
+.prompt-section-title {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+.prompt-text {
+  background: var(--bg-input);
+  color: var(--text);
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+  margin: 0;
+}
 
 /* ── Chat panel ──────────────────────── */
 #chat-history { flex: 1; overflow-y: auto; }

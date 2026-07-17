@@ -82,6 +82,12 @@ let currentAnalysisStream = null;
 function bindEvents() {
   $('#btn-refresh').addEventListener('click', loadBars);
   $('#btn-analyze').addEventListener('click', startAnalysis);
+  // 取消按钮：中止当前分析 SSE 流
+  $('#btn-cancel').addEventListener('click', () => {
+    if (currentAnalysisStream) {
+      currentAnalysisStream.abort();
+    }
+  });
   $('#btn-settings').addEventListener('click', () => $('#settings-modal').classList.remove('hidden'));
   $('.modal-close').addEventListener('click', () => $('#settings-modal').classList.add('hidden'));
   $('#btn-modal-close').addEventListener('click', () => $('#settings-modal').classList.add('hidden'));
@@ -149,8 +155,11 @@ async function saveSettingsHandler() {
 // ── Analysis ───────────────────────────────────────────────────────────
 async function startAnalysis() {
   const btn = $('#btn-analyze');
+  const btnCancel = $('#btn-cancel');
   btn.disabled = true;
   btn.textContent = '分析中…';
+  // 启用取消按钮
+  btnCancel.disabled = false;
 
   // Clear panels
   $('#stream-reasoning').textContent = '';
@@ -158,6 +167,9 @@ async function startAnalysis() {
   $('#stream-usage').textContent = '';
   $('#stage-badge').textContent = '';
   $('#decision-content').innerHTML = '';
+  // 清空 prompt 展示区
+  const promptDisp = $('#prompt-display');
+  if (promptDisp) promptDisp.innerHTML = '';
 
   const barCount = parseInt($('#ds-bar-count').value) || 100;
 
@@ -169,11 +181,51 @@ async function startAnalysis() {
     for await (const evt of source) {
       switch (evt.type) {
         case 'orchestrator_event':
-          if (evt.event === 'Stage1Started') stage = '🔍 阶段一：市场诊断';
-          else if (evt.event === 'Stage1Done') stage = '⏳ 构建阶段二…';
-          else if (evt.event === 'Stage2Started') stage = '🎯 阶段二：交易决策';
-          else if (evt.event === 'Stage2Done') stage = '✅ 分析完成';
-          else if (evt.event === 'Cancelled') stage = '⚠️ 已取消';
+          // 处理 orchestrator 全部 11 个事件
+          switch (evt.event) {
+            case 'Stage1Started':
+              stage = '🔍 阶段一：市场诊断';
+              break;
+            case 'Stage1Retry':
+              // 若后端附带 attempt 字段则显示重试次数，否则通用提示
+              stage = evt.attempt != null
+                ? `🔄 阶段一第 ${evt.attempt} 次重试…`
+                : '🔄 阶段一重试中…';
+              break;
+            case 'Stage1Done':
+              stage = '⏳ 构建阶段二…';
+              break;
+            case 'Stage1Failed':
+              stage = '❌ 阶段一失败';
+              break;
+            case 'Stage2Started':
+              stage = '🎯 阶段二：交易决策';
+              break;
+            case 'Stage2Retry':
+              stage = evt.attempt != null
+                ? `🔄 阶段二第 ${evt.attempt} 次重试…`
+                : '🔄 阶段二重试中…';
+              break;
+            case 'Stage2Done':
+              stage = '✅ 分析完成';
+              break;
+            case 'Stage2Failed':
+              stage = '❌ 阶段二失败';
+              break;
+            case 'InsufficientData':
+              stage = '⚠️ 数据不足，无法分析';
+              break;
+            case 'RecordSaved':
+              // 不阻塞流程，仅在内容区追加提示
+              $('#stream-content').textContent += '\n💾 记录已保存';
+              break;
+            case 'Cancelled':
+              stage = '⚠️ 已取消';
+              break;
+            default:
+              // 未知事件保持当前阶段
+              break;
+          }
           $('#stage-badge').textContent = stage;
           break;
         case 'reasoning_token':
@@ -183,6 +235,10 @@ async function startAnalysis() {
         case 'content_token':
           $('#stream-content').textContent += evt.chunk;
           $('#stream-content').scrollTop = $('#stream-content').scrollHeight;
+          break;
+        case 'stage_prompt':
+          // 阶段 prompt 全文展示到可折叠区域
+          appendPromptBlock(evt.stage, evt.system, evt.user);
           break;
         case 'done':
           lastRecord = evt.record;
@@ -203,42 +259,145 @@ async function startAnalysis() {
   } finally {
     btn.disabled = false;
     btn.textContent = '分析';
+    // 禁用取消按钮
+    btnCancel.disabled = true;
     currentAnalysisStream = null;
   }
 }
 
 function renderDecision(record) {
-  const d = record.stage2_decision?.decision || {};
+  // orchestrator 输出的 stage2_decision 本身即为决策对象（normalizer 已展平）
+  const d = record.stage2_decision || {};
   const s1 = record.stage1_diagnosis || {};
   const orderType = d.order_type || '不下单';
   const direction = d.order_direction || '';
   const cls = direction === '做多' || direction === 'buy' ? 'buy' :
               direction === '做空' || direction === 'sell' ? 'sell' : '';
 
+  // 不下单分支：隐藏全部价格字段，仅显示状态与 reasoning
+  const isNoOrder = orderType === '不下单';
+
   let html = `<div class="decision-card ${cls}">`;
   html += `<h3>📊 交易决策</h3>`;
-  html += `<div class="order-type">${orderType}${direction ? '（' + direction + '）' : ''}</div>`;
-  if (d.entry_price) html += `<div class="field"><span class="key">入场价</span><span class="val">${d.entry_price}</span></div>`;
-  if (d.stop_loss) html += `<div class="field"><span class="key">止损</span><span class="val">${d.stop_loss}</span></div>`;
-  if (d.take_profit) html += `<div class="field"><span class="key">止盈</span><span class="val">${d.take_profit}</span></div>`;
-  if (d.confidence != null) html += `<div class="field"><span class="key">置信度</span><span class="val">${d.confidence}</span></div>`;
-  if (d.reasoning) html += `<div class="field"><span class="key">逻辑</span><span class="val">${d.reasoning}</span></div>`;
+  html += `<div class="order-type">${escapeHtml(orderType)}${direction ? '（' + escapeHtml(direction) + '）' : ''}</div>`;
+
+  if (isNoOrder) {
+    // 本轮不下单：仅显示 reasoning
+    if (d.reasoning) {
+      html += `<div class="field"><span class="key">理由</span><span class="val">${escapeHtml(String(d.reasoning))}</span></div>`;
+    }
+  } else {
+    // 价格相关字段
+    if (d.entry_price != null) html += `<div class="field"><span class="key">入场价</span><span class="val">${escapeHtml(String(d.entry_price))}</span></div>`;
+    if (d.stop_loss_price != null) html += `<div class="field"><span class="key">止损</span><span class="val">${escapeHtml(String(d.stop_loss_price))}</span></div>`;
+    if (d.take_profit_price != null) html += `<div class="field"><span class="key">止盈 TP1</span><span class="val">${escapeHtml(String(d.take_profit_price))}</span></div>`;
+    if (d.take_profit_price_2 != null) html += `<div class="field"><span class="key">止盈 TP2</span><span class="val">${escapeHtml(String(d.take_profit_price_2))}</span></div>`;
+    if (d.entry_rule) html += `<div class="field"><span class="key">入场规则</span><span class="val">${escapeHtml(String(d.entry_rule))}</span></div>`;
+    if (d.entry_basis_bar != null) html += `<div class="field"><span class="key">入场基准K线</span><span class="val">${escapeHtml(String(d.entry_basis_bar))}</span></div>`;
+    if (d.entry_basis_extreme != null) html += `<div class="field"><span class="key">入场基准极值</span><span class="val">${escapeHtml(String(d.entry_basis_extreme))}</span></div>`;
+
+    // 置信度与胜率进度条（0-100 整数）
+    if (d.diagnosis_confidence != null) {
+      html += renderConfidenceBar('诊断置信度', d.diagnosis_confidence);
+    }
+    if (d.trade_confidence != null) {
+      html += renderConfidenceBar('交易置信度', d.trade_confidence);
+    }
+    if (d.estimated_win_rate != null) {
+      html += renderConfidenceBar('预估胜率', d.estimated_win_rate);
+    }
+
+    // 风险评估、无效条件
+    if (d.risk_assessment) html += `<div class="field"><span class="key">风险评估</span><span class="val">${escapeHtml(String(d.risk_assessment))}</span></div>`;
+    if (d.invalidation_condition) html += `<div class="field"><span class="key">无效条件</span><span class="val">${escapeHtml(String(d.invalidation_condition))}</span></div>`;
+
+    // 关键因素 / 关注点列表
+    if (Array.isArray(d.key_factors) && d.key_factors.length) {
+      html += renderListField('关键因素', d.key_factors);
+    }
+    if (Array.isArray(d.watch_points) && d.watch_points.length) {
+      html += renderListField('关注点', d.watch_points);
+    }
+
+    // 决策逻辑
+    if (d.reasoning) {
+      html += `<div class="field"><span class="key">逻辑</span><span class="val">${escapeHtml(String(d.reasoning))}</span></div>`;
+    }
+
+    // 置信度/胜率说明文本
+    if (d.diagnosis_confidence_reasoning) {
+      html += `<div class="field"><span class="key">诊断置信度说明</span><span class="val">${escapeHtml(String(d.diagnosis_confidence_reasoning))}</span></div>`;
+    }
+    if (d.trade_confidence_reasoning) {
+      html += `<div class="field"><span class="key">交易置信度说明</span><span class="val">${escapeHtml(String(d.trade_confidence_reasoning))}</span></div>`;
+    }
+    if (d.estimated_win_rate_reasoning) {
+      html += `<div class="field"><span class="key">胜率说明</span><span class="val">${escapeHtml(String(d.estimated_win_rate_reasoning))}</span></div>`;
+    }
+  }
   html += `</div>`;
 
+  // 阶段一诊断卡片（保留原有结构）
   if (s1.direction || s1.cycle_position) {
     html += `<div class="decision-card">`;
     html += `<h3>🔬 阶段一诊断</h3>`;
-    if (s1.direction) html += `<div class="field"><span class="key">方向</span><span class="val">${s1.direction}</span></div>`;
-    if (s1.cycle_position) html += `<div class="field"><span class="key">周期位置</span><span class="val">${s1.cycle_position}</span></div>`;
-    if (s1.volatility_regime) html += `<div class="field"><span class="key">波动率</span><span class="val">${s1.volatility_regime}</span></div>`;
+    if (s1.direction) html += `<div class="field"><span class="key">方向</span><span class="val">${escapeHtml(String(s1.direction))}</span></div>`;
+    if (s1.cycle_position) html += `<div class="field"><span class="key">周期位置</span><span class="val">${escapeHtml(String(s1.cycle_position))}</span></div>`;
+    if (s1.volatility_regime) html += `<div class="field"><span class="key">波动率</span><span class="val">${escapeHtml(String(s1.volatility_regime))}</span></div>`;
     html += `</div>`;
   }
 
   if (record.exception) {
-    html += `<div class="decision-card status-err"><h3>⚠️ 异常</h3><pre>${JSON.stringify(record.exception, null, 2)}</pre></div>`;
+    html += `<div class="decision-card status-err"><h3>⚠️ 异常</h3><pre>${escapeHtml(JSON.stringify(record.exception, null, 2))}</pre></div>`;
   }
 
   $('#decision-content').innerHTML = html;
+}
+
+// 渲染 0-100 置信度进度条
+function renderConfidenceBar(label, value) {
+  const v = Math.max(0, Math.min(100, parseInt(value, 10) || 0));
+  return `<div class="confidence-row">
+    <span class="key">${escapeHtml(label)}</span>
+    <div class="confidence-bar"><div class="confidence-fill" style="width:${v}%"></div></div>
+    <span class="val">${v}%</span>
+  </div>`;
+}
+
+// 渲染列表型字段（关键因素 / 关注点）
+function renderListField(label, items) {
+  const lis = items.map(it => `<li>${escapeHtml(String(it))}</li>`).join('');
+  return `<div class="list-field"><span class="key">${escapeHtml(label)}</span><ul>${lis}</ul></div>`;
+}
+
+// 追加一个可折叠的 prompt 展示块（system / user）到 #prompt-display
+function appendPromptBlock(stage, system, user) {
+  const container = $('#prompt-display');
+  if (!container) return;
+  const stageLabel = stage === 'stage2' ? '阶段二' : '阶段一';
+
+  // 使用 <details> 实现原生可折叠，默认折叠
+  const details = document.createElement('details');
+  details.className = 'prompt-block';
+
+  const summary = document.createElement('summary');
+  summary.textContent = `📝 ${stageLabel} Prompt`;
+  details.appendChild(summary);
+
+  if (system) {
+    const sysDiv = document.createElement('div');
+    sysDiv.className = 'prompt-section';
+    sysDiv.innerHTML = `<div class="prompt-section-title">System</div><pre class="prompt-text">${escapeHtml(system)}</pre>`;
+    details.appendChild(sysDiv);
+  }
+  if (user) {
+    const userDiv = document.createElement('div');
+    userDiv.className = 'prompt-section';
+    userDiv.innerHTML = `<div class="prompt-section-title">User</div><pre class="prompt-text">${escapeHtml(user)}</pre>`;
+    details.appendChild(userDiv);
+  }
+
+  container.appendChild(details);
 }
 
 function renderTokenUsage(usage) {
