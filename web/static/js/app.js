@@ -907,6 +907,9 @@ async function applySubscribe() {
     });
     // 切换成功后重新拉 K 线（loadBars 内部会通知指标库重新计算）
     await loadBars();
+    // 刷新 currentSettings（后端 /api/subscribe 已更新 last_symbol/last_timeframe 等）
+    // 避免后续依赖 currentSettings 的逻辑（如 SSE 倒计时 sanity check）拿到旧值
+    await loadSettings();
     // 切换 symbol/timeframe 后，历史记录列表也要刷新
     loadHistoryList();
     // 切换品种/周期时自动取消持续跟踪
@@ -1273,7 +1276,10 @@ function updateSSEStatusWithExpiry() {
   const elapsed = sseLastBarUpdateTs ? Math.max(0, (Date.now() - sseLastBarUpdateTs) / 1000) : 0;
   // sanity check：remaining 不能超过当前 timeframe 的 duration
   // 防止 next_close_ts 过期、时区偏移或跨周期残留导致显示异常大的倒计时
-  const tfSecs = timeframeToSeconds(currentSettings?.general?.last_timeframe || '');
+  // 优先从 #ds-timeframe 读用户实际选择的值（applySubscribe 切换后 currentSettings 可能未同步），
+  // fallback 到 currentSettings.general.last_timeframe
+  const dsTf = $('#ds-timeframe')?.value || '';
+  const tfSecs = timeframeToSeconds(dsTf || currentSettings?.general?.last_timeframe || '');
   let remaining = 0;
   let closeText = '';
   if (sseNextCloseTs > 0 && tfSecs > 0) {
