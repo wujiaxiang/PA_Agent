@@ -147,7 +147,7 @@ curl http://localhost:8000/api/health/check    # 完整健康检查（模型 API
 
 以下为非紧急、可按需推进的优化点：
 
-1. **前端数据源切换 UI 完善**：当前前端 `#ds-kind` / `#ds-symbol` / `#ds-timeframe` 仅加载列表，未回填 `last_data_source`/`last_symbol`/`last_tradingview_exchange`；需要添加"应用"按钮调用 `/api/subscribe`，并新增"交易所"输入框（TradingView 模式可见）。
+1. ~~**前端数据源切换 UI 完善**~~ ✅ 已完成（Web GUI 阶段 5）：toolbar 完整 ds/exchange/symbol/timeframe 选择器 + 历史记录下拉，切换时自动调用 `/api/subscribe`。
 2. **前端顶部健康状态指示**：轮询 `/api/health`，`degraded`/`error` 时顶部红条提示。
 3. **`_PRACTICAL_UNLIMITED_MAX_TOKENS` 按 provider 动态读模型上限**：当前用静态默认值，DeepSeek 原生 393216、OpenRouter free 32768、其他 128000。
 4. **`_validate_snapshot` 性能优化**：大 n（>1000）时 list 遍历可优化。
@@ -155,7 +155,59 @@ curl http://localhost:8000/api/health/check    # 完整健康检查（模型 API
 
 ---
 
-## 四、建议执行顺序
+## 四、Web GUI 阶段 5 完成记录（决策 tab 重设计）
+
+> 本轮（2026-07-19）针对用户反馈"决策 tab 不好理解、字段缺失、需要折叠"做的完整重设计，采用 frontend-design skill 方法论。
+
+### 4.1 决策 tab 三段式视觉架构 ✅
+
+- **VERDICT（决策结论 / 蓝 / 常显）**：结论横幅（订单类型 + 方向 + 置信度）+ 派生字段（趋势/周期/阶段）+ 价格栅格（入场/SL/TP1·TP2）+ 盈亏比 + 三条置信度进度条（诊断/交易/胜率）
+- **VITALS（市场状态 / 青 / 常显）**：4 子区
+  - 2.1 趋势结构：direction / cycle_position / alternative_cycle_position
+  - 2.2 市场阶段：market_phase / transition_risk / volatility_regime / spike_stage / climax_risk
+  - 2.3 关键价位：support_levels（绿）vs resistance_levels（红）并排
+  - 2.4 形态与信号：detected_patterns / key_signals
+- **EVIDENCE（详细依据 / 紫 / 折叠）**：7 个独立 `<details>` 子区 + 主控按钮
+  - 3.1 决策理由（默认展开）/ 3.2 入场规则 / 3.3 K线分析 / 3.4 趋势上下文 / 3.5 风险评估 / 3.6 关键因素与关注点 / 3.7 置信度说明
+
+### 4.2 Stage2 嵌套 schema bug 修复 ✅（缺失字段根因）
+
+- **根因**：Stage2 实际存储为 `{decision: {order_type, diagnosis_confidence, ...}, diagnosis_summary, ...}`，但前端期望扁平字段在顶层 → 直接读 `stage2_decision.order_type` 得到 undefined
+- **修复**：[web/api/routes_analyze.py](web/api/routes_analyze.py) 的 `_serialize_record` 将内层 `decision` 字典扁平化到顶层；[web/api/routes_records.py](web/api/routes_records.py) 列表端点同步从 `.decision` 子对象读取
+- **验证**：API 现返回 `order_type: 限价单 / 不下单`、`diagnosis_confidence: 75`、`trade_confidence: 60`、`support_levels: [62532.9, ...]` 等此前 undefined 的字段
+
+### 4.3 长文字字段截断修复 ✅
+
+- **根因**：[web/static/css/style.css](web/static/css/style.css) 的 `.field-grid .field-val` 设了 `max-width: 60% / overflow: hidden / text-overflow: ellipsis / white-space: nowrap`，强制单行+省略号
+- **修复**：移除截断规则，改为 `white-space: normal + word-break: break-word + overflow-wrap: anywhere`；`.field-key` 改为 `flex: 0 0 auto + nowrap` 保持标签紧凑
+
+### 4.4 所有 tab 的 tip / help 文案重新设计 ✅
+
+- **统一格式**：是什么 → 结构 → 视觉/操作 → 使用建议
+- **决策 tab help** 重写为新三段式架构说明（VERDICT/VITALS/EVIDENCE）
+- **stream / future / tree / tree-viz / raw / debug** 同步更新
+- **CSS 增强**：嵌套 ul 添加虚线左边框 + 缩进；`code` 添加背景样式
+
+### 4.5 Web GUI 对齐原 GUI（前序阶段）✅
+
+- 新增 `routes_bars_stream.py`：K 线 SSE 实时流端点
+- 新增 `routes_records.py`：历史记录列表 / 详情 / 删除 API
+- 新增 `indicators.js`：自建指标管理器（TradingView 完整版需商业授权）
+- 侧边栏可拖拽调宽 + 可折叠 + 历史记录下拉
+- 决策树 tab 拆分 + 可视化 tab 流程图 + 原始 tab 4 折叠区
+- 未来 tab 添加【程序补全】前缀标记
+- TradingView 时区修复（`_row_ts_ms` naive Timestamp 先本地化再转 UTC）
+
+### 4.6 新增单元测试 ✅
+
+- `tests/unit/test_routes_analyze_incremental.py` — 增量分析路由
+- `tests/unit/test_routes_bars_stream.py` — K 线 SSE 流
+- `tests/unit/test_routes_records.py` — 历史记录 API
+- `tests/unit/test_tradingview_cache.py` — TradingView 缓存
+
+---
+
+## 五、建议执行顺序
 
 ```
 阶段 1：本机跑通真实 TV 数据 ✅
@@ -174,19 +226,42 @@ curl http://localhost:8000/api/health/check    # 完整健康检查（模型 API
   ├─ P2.4 日志结构化
   └─ P2.5 上游同步自动化
 
-阶段 4：前端体验完善（待推进）
+阶段 4：Web GUI 对齐原 GUI ✅
+  ├─ K 线 SSE 实时流 + 历史记录 API
+  ├─ 侧边栏可拖拽调宽 + 可折叠 + 历史记录下拉
+  ├─ 决策树 tab 拆分 + 可视化 tab 流程图
+  └─ 自建指标管理器（indicators.js）
+
+阶段 5：决策 tab 三段式重设计 ✅
+  ├─ VERDICT / VITALS / EVIDENCE 三段式架构
+  ├─ Stage2 嵌套 schema bug 修复（缺失字段根因）
+  ├─ 长文字字段截断修复
+  ├─ 所有 tab 的 tip / help 文案重新设计
+  └─ 4 个新单元测试
+
+阶段 6：前端体验完善（待推进）
   └─ 见第三节"后续可推进的优化"
 ```
 
 ---
 
-## 五、关键文件索引
+## 六、关键文件索引
 
 | 模块 | 文件 |
 | --- | --- |
 | Web 入口 | [web/server.py](web/server.py) |
 | SSE 分析路由 | [web/api/routes_analyze.py](web/api/routes_analyze.py) |
+| K 线 SSE 流路由 | [web/api/routes_bars_stream.py](web/api/routes_bars_stream.py) |
+| 历史记录 API | [web/api/routes_records.py](web/api/routes_records.py) |
+| 自由对话路由 | [web/api/routes_chat.py](web/api/routes_chat.py) |
 | 数据源路由 | [web/api/routes_data.py](web/api/routes_data.py) |
+| 配置路由 | [web/api/routes_settings.py](web/api/routes_settings.py) |
+| 前端入口 | [web/static/index.html](web/static/index.html) |
+| 前端主逻辑 | [web/static/js/app.js](web/static/js/app.js) |
+| 前端 API 封装 | [web/static/js/api.js](web/static/js/api.js) |
+| 前端图表 | [web/static/js/chart.js](web/static/js/chart.js) |
+| 自建指标管理器 | [web/static/js/indicators.js](web/static/js/indicators.js) |
+| 前端样式 | [web/static/css/style.css](web/static/css/style.css) |
 | 配置加载 | [pa_agent/config/settings.py](pa_agent/config/settings.py) |
 | .env 解析 | [pa_agent/config/env_loader.py](pa_agent/config/env_loader.py) |
 | 健康检查 | [pa_agent/util/startup_health_check.py](pa_agent/util/startup_health_check.py) |
@@ -197,12 +272,13 @@ curl http://localhost:8000/api/health/check    # 完整健康检查（模型 API
 | 市场默认值 | [pa_agent/data/market_defaults.py](pa_agent/data/market_defaults.py) |
 | K 线快照 | [pa_agent/data/snapshot.py](pa_agent/data/snapshot.py) |
 | TV 数据源 | [pa_agent/data/tradingview.py](pa_agent/data/tradingview.py) |
+| 记录 schema | [pa_agent/records/schema.py](pa_agent/records/schema.py) |
 | Docker | [web/Dockerfile](web/Dockerfile) / [web/docker-compose.yml](web/docker-compose.yml) |
 | 上游同步 | [.github/workflows/sync-upstream.yml](.github/workflows/sync-upstream.yml) |
 
 ---
 
-## 六、参考文档
+## 七、参考文档
 
 - [README.md](README.md) — 项目总览 + 开发者指南
-- [PA_Agent使用文档.md](PA_Agent使用文档.md) — 原项目完整功能说明
+- [PA_Agent使用文档.md](PA_Agent使用文档.md) — 原项目完整功能说明（PyQt6 桌面 GUI）

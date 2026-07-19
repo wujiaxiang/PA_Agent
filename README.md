@@ -9,12 +9,17 @@
 ## 本仓库相对原项目的二次开发改动
 
 - 🌐 **新增 Web 后端**（[web/server.py](web/server.py)）：FastAPI + SSE，支持云端 / 无 GUI 环境运行，前端 100% 走后端代理
+- 🎨 **决策 tab 三段式重设计**（frontend-design 方法论）：VERDICT（决策结论/蓝）+ VITALS（市场状态/青）+ EVIDENCE（详细依据/紫），补齐置信度/支撑位/阻力位等缺失字段，EVIDENCE 含 7 个独立折叠子区 + 主控按钮
 - 🔧 **`.env` 环境变量系统**：三层覆盖优先级（shell env > `.env` > `config/settings.json`），启动即可用，无需前端录入配置
 - 🩺 **启动健康检查 + 运行时心跳**：服务启动自动验证模型 API 与 TradingView 账号连通性；后台每 5 分钟 ping 模型 API，`/api/health` 返回 `ok`/`degraded`/`error` 状态
 - 🪙 **加密货币数据源**：TradingView 直连 Gate.io 交易所，匿名模式即可拉取 BTCUSDT/ETHUSDT 等现货 K 线（无需 API key）
 - 🛡️ **SSE 稳定性修复**：分析路由强制 clamp `bar_count`，异常必推 error 事件，避免 `ERR_INCOMPLETE_CHUNKED_ENCODING`
 - 🔍 **结构化日志 + trace_id**：JSONL 格式日志，每条带 `trace_id`，响应头回传 `X-Trace-Id` 便于链路追踪
 - 📋 **DataSource 契约校验**：`latest_snapshot(n)` 必须返回 n+1 根（1 forming + n closed），基类 `_validate_snapshot()` 强制校验
+- 📡 **K 线 SSE 实时流**（[web/api/routes_bars_stream.py](web/api/routes_bars_stream.py)）：`/api/bars/stream` 推送实时 K 线更新，前端无需轮询
+- 🗂️ **历史记录 API**（[web/api/routes_records.py](web/api/routes_records.py)）：`/api/records` 列表 / `/api/records/{id}` 详情 / `DELETE` 删除，支持分区布局和旧平铺布局
+- 🐛 **Stage2 嵌套 schema 修复**：`_serialize_record` 将内层 `decision` 字典扁平化到顶层，解决前端"缺失字段"投诉的根因
+- 📊 **自建指标管理器**（[web/static/js/indicators.js](web/static/js/indicators.js)）：TradingView 完整版需商业授权，自建 EMA 等指标管理
 
 详细改动见 [CHANGELOG](#与上游的同步策略)。
 
@@ -131,9 +136,14 @@ curl http://localhost:8000/api/settings
 | GET | `/api/timeframes` | 当前数据源支持的周期 |
 | POST | `/api/subscribe` | 切换品种/周期/数据源（TradingView 可带 `exchange` 字段，如 `GATEIO`） |
 | GET | `/api/bars?count=N` | 拉取最新 N 根 K 线（前端图表用） |
+| GET | `/api/bars/stream` | **SSE 实时 K 线流**（K 线收盘/新 K 线形成时推送，前端无需轮询） |
 | GET | `/api/analyze/stream?bar_count=N` | **SSE 两阶段分析**（见下方注意） |
+| GET | `/api/records?exchange=&symbol=&timeframe=&limit=` | 列出指定 (exchange, symbol, timeframe) 下的历史分析记录摘要 |
+| GET | `/api/records/{record_id}` | 获取单条记录详情（与 SSE done 事件字段一致） |
+| DELETE | `/api/records/{record_id}` | 删除单条记录 |
+| POST | `/api/chat/stream` | SSE 自由对话（基于最近一次分析上下文继续提问） |
 
-路由定义在 [web/api/](web/api/)：`routes_settings.py` / `routes_data.py` / `routes_analyze.py` / `routes_chat.py`。
+路由定义在 [web/api/](web/api/)：`routes_settings.py` / `routes_data.py` / `routes_analyze.py` / `routes_chat.py` / `routes_bars_stream.py` / `routes_records.py`。
 
 ### 数据源系统
 
@@ -200,9 +210,11 @@ pa_agent/
 ├── util/      startup_health_check / logging / threading / mask_secret
 web/
 ├── server.py  FastAPI 入口
-├── api/       routes_{settings,data,analyze,chat}.py
+├── api/       routes_{settings,data,analyze,chat,bars_stream,records}.py
 ├── static/    前端（index.html / js / css）
-└── bridge/    AsyncEventBus（替代 Qt EventBus）
+│   └── js/    app.js / api.js / chart.js / indicators.js（自建指标管理器）
+├── bridge/    AsyncEventBus（替代 Qt EventBus）
+├── Dockerfile / docker-compose.yml  Web 后端容器化
 prompt_engineering/  Brooks 价格行为提示词库（市场诊断/决策树/各形态策略）
 tests/         unit / property / integration / e2e
 ```
