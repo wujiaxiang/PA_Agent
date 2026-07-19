@@ -1365,9 +1365,22 @@ function setFlowBarStep(step) {
   if (!bar) return;
   bar.querySelectorAll('.flow-step').forEach(el => {
     const s = parseInt(el.dataset.step);
-    el.classList.remove('active', 'done');
+    el.classList.remove('active', 'done', 'failed', 'skipped');
     if (s < step) el.classList.add('done');
     else if (s === step) el.classList.add('active');
+  });
+}
+
+// 标记失败步：failedStep 及之后的所有步骤标记为 failed，之前的标记为 done
+// 用于 Stage1Failed / Stage2Failed 事件，避免 done 事件错误地推进到完成步
+function setFlowBarFailed(failedStep) {
+  const bar = $('#flow-bar');
+  if (!bar) return;
+  bar.querySelectorAll('.flow-step').forEach(el => {
+    const s = parseInt(el.dataset.step);
+    el.classList.remove('active', 'done', 'failed', 'skipped');
+    if (s < failedStep) el.classList.add('done');
+    else el.classList.add('failed');
   });
 }
 
@@ -1480,6 +1493,8 @@ async function startAnalysis() {
               stage = '❌ 阶段一失败';
               if (evt.reason) stage += `：${evt.reason}`;
               setStageStatus(1, '✗ 失败' + (evt.reason ? `：${evt.reason}` : ''), 'failed');
+              // FlowBar：标记阶段一推理步及之后所有步为失败，避免 done 事件错误推进
+              setFlowBarFailed(2);
               break;
             case 'Stage2Started':
               stage = '🎯 阶段二：交易决策';
@@ -1503,10 +1518,14 @@ async function startAnalysis() {
               stage = '❌ 阶段二失败';
               if (evt.reason) stage += `：${evt.reason}`;
               setStageStatus(2, '✗ 失败' + (evt.reason ? `：${evt.reason}` : ''), 'failed');
+              // FlowBar：标记阶段二推理步及之后所有步为失败
+              setFlowBarFailed(4);
               break;
             case 'InsufficientData':
               stage = '⚠️ 数据不足，无法分析';
               if (evt.reason) stage += `：${evt.reason}`;
+              // FlowBar：数据不足在阶段一推理之前，标记第 1 步之后全部失败
+              setFlowBarFailed(2);
               break;
             case 'RecordSaved':
               appendStageContent(currentStage, '\n💾 记录已保存');
@@ -1567,9 +1586,16 @@ async function startAnalysis() {
           // 触发条件：order_type ∈ [limit, market, stop] 且 trade_confidence >= 阈值
           // 受 settings.general.alert_on_order_opportunity 开关控制（默认 true，!== false 才触发）
           triggerOrderAlertIfNeeded(evt.record);
-          // FlowBar：标记完成步，5 秒后隐藏进度条
-          setFlowBarStep(6);
-          setTimeout(hideFlowBar, 5000);
+          // FlowBar：仅在无异常时标记完成步；异常时保留失败状态（由 Stage1Failed/Stage2Failed 设置）
+          // 后端在阶段一/二失败时仍会推 done 事件（record.exception 非空），不能盲目推进到完成步
+          const hasException = evt.record && evt.record.exception;
+          if (!hasException) {
+            setFlowBarStep(6);
+            setTimeout(hideFlowBar, 5000);
+          } else {
+            // 异常时进度条保留失败状态更久（10s），让用户看清失败位置
+            setTimeout(hideFlowBar, 10000);
+          }
           break;
         }
         case 'error':
@@ -1710,6 +1736,7 @@ async function startIncrementalAnalysis() {
               stage = '❌ 阶段一失败';
               if (evt.reason) stage += `：${evt.reason}`;
               setStageStatus(1, '✗ 失败' + (evt.reason ? `：${evt.reason}` : ''), 'failed');
+              setFlowBarFailed(2);
               break;
             case 'Stage2Started':
               stage = '🎯 阶段二：交易决策';
@@ -1730,10 +1757,12 @@ async function startIncrementalAnalysis() {
               stage = '❌ 阶段二失败';
               if (evt.reason) stage += `：${evt.reason}`;
               setStageStatus(2, '✗ 失败' + (evt.reason ? `：${evt.reason}` : ''), 'failed');
+              setFlowBarFailed(4);
               break;
             case 'InsufficientData':
               stage = '⚠️ 数据不足，无法分析';
               if (evt.reason) stage += `：${evt.reason}`;
+              setFlowBarFailed(2);
               break;
             case 'RecordSaved':
               appendStageContent(currentStage, '\n💾 记录已保存');
@@ -1786,9 +1815,14 @@ async function startIncrementalAnalysis() {
           refreshIncrementalButtonState();
           // 下单机会提醒（Phase E Task 12）
           triggerOrderAlertIfNeeded(evt.record);
-          // FlowBar：标记完成步，5 秒后隐藏进度条
-          setFlowBarStep(6);
-          setTimeout(hideFlowBar, 5000);
+          // FlowBar：仅在无异常时标记完成步；异常时保留失败状态
+          const hasException = evt.record && evt.record.exception;
+          if (!hasException) {
+            setFlowBarStep(6);
+            setTimeout(hideFlowBar, 5000);
+          } else {
+            setTimeout(hideFlowBar, 10000);
+          }
           break;
         }
         case 'error':

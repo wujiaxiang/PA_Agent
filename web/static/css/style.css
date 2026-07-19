@@ -2592,6 +2592,28 @@ button.secondary:hover { background: var(--border); }
 .flow-step.done .flow-step-num {
   font-size: 0;
 }
+.flow-step.failed {
+  background: rgba(239, 83, 80, 0.12);
+  color: #ef5350;
+  border-color: rgba(239, 83, 80, 0.3);
+}
+.flow-step.failed .flow-step-num {
+  background: #ef5350;
+  color: #fff;
+}
+.flow-step.failed .flow-step-num::after {
+  content: '✗';
+  font-size: 11px;
+}
+.flow-step.failed .flow-step-num {
+  font-size: 0;
+}
+.flow-step.skipped {
+  opacity: 0.35;
+  background: rgba(120, 123, 134, 0.06);
+  color: var(--text-dim);
+  border-color: rgba(120, 123, 134, 0.15);
+}
 
 /* Mermaid 决策树流程图 (Phase K Task 21) */
 .tree-flowchart-wrap {
