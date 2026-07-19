@@ -2,7 +2,7 @@
 
 > 本机部署测试 + 后续优化路线图。已脱敏：不含任何 API Key、账号密码、个人凭证。
 >
-> 历史已完成项（SSE 流式改造、tvDatafeed bug 修复、Web 后端测试、session_ledger no-Qt stub、TradingView 数据源切换）已从本文件移除。
+> Spec 阶段一至四的 15 个 Task 与本文件历史上的 P0/P1/P2 共 8 项已全部交付，仅保留"已完成项的验收要点"供回归参考。
 
 ---
 
@@ -19,12 +19,14 @@ cd PA_Agent
 pip install -e .
 pip install openai  # 若启动报 "openai package is not installed" 时单独装
 
-# 配置文件（本机用真实数据源，不用 mock）
+# 配置文件（本机用真实数据源）
 cp config/settings.example.json config/settings.json
 # 编辑 config/settings.json 填入实际值（见下方 1.2）
 ```
 
 ### 1.2 `config/settings.json` 关键配置项
+
+默认示例（TradingView + Gate.io 加密货币）：
 
 ```json
 {
@@ -34,11 +36,13 @@ cp config/settings.example.json config/settings.json
     "api_key": "<your-api-key>",
     "thinking": true,
     "reasoning_effort": "high",
-    "context_window": 128000
+    "context_window": 128000,
+    "max_output_tokens": 0
   },
   "general": {
     "last_data_source": "tradingview",
-    "last_symbol": "XAUUSD",
+    "last_tradingview_exchange": "GATEIO",
+    "last_symbol": "BTCUSDT",
     "last_timeframe": "15m",
     "analysis_bar_count": 50
   }
@@ -48,8 +52,10 @@ cp config/settings.example.json config/settings.json
 **关键坑**：
 - `base_url` 必须带 `/v1`（如 `https://openrouter.ai/api/v1`），SDK 内部自动拼 `/chat/completions`
 - TradingView 匿名访问可用（`TradingViewSource()` 空参）；填账号密码需通过 `env_loader.py`（见 P1.2）
+- 加密货币：`last_tradingview_exchange=GATEIO` + `last_symbol=BTCUSDT` 即可，匿名模式无需 API key
+- `max_output_tokens`：`0` 或留空 = 按 provider 默认值；填正整数则覆盖（free 模型建议 32768）
 
-### 1.3 TradingView 数据源适配（若用 TV）
+### 1.3 TradingView 数据源适配
 
 ```bash
 # 装 tvDatafeed
@@ -66,153 +72,137 @@ pip install git+https://github.com/rongardF/tvdatafeed.git
 python -m uvicorn web.server:app --host 0.0.0.0 --port 8000
 
 # 验证
-curl http://localhost:8000/api/health         # 存活探针
-curl http://localhost:8000/api/health/check    # 启动健康检查（模型+TV） — 待实现，见 P1.3
+curl http://localhost:8000/api/health         # 存活探针（返回缓存状态）
+curl http://localhost:8000/api/health/check    # 完整健康检查（模型 API + 数据源）
 # 浏览器打开 http://localhost:8000 测试前端
 ```
 
-### 1.5 本机 vs 云端关键差异
+---
 
-| 项 | 云端沙箱 | 本机 |
-| --- | --- | --- |
-| 外网访问 | 受限（TV/yfinance/akshare 被拦） | 正常 |
-| 数据源 | 用 `mock` | 用 `tradingview` 真实数据 |
-| 健康检查 TV 项 | warning（SSL 失败降级） | ok |
-| SSE 超时 | TRAE 网关有超时限制 | 本机无网关，可放宽 bar_count |
+## 二、已完成优化项（按优先级）
+
+### P0 — 影响可用性
+
+#### P0.2 前端 bar_count 同步 ✅
+
+- `/api/settings` GET 响应已加 `Cache-Control: no-store`，避免中间层缓存旧值。
+- 代码：[web/api/routes_settings.py](web/api/routes_settings.py)
 
 ---
 
-## 二、优化点（按优先级）
+### P1 — 工程质量
 
-### P0 — 影响可用性，必须根治
+#### P1.2 `.env` 环境变量系统 ✅
 
-#### P0.2 前端 bar_count 同步问题
+- 新建 [pa_agent/config/env_loader.py](pa_agent/config/env_loader.py)：`apply_env_overrides()` / `get_env_str/int/bool` / `get_tv_credentials()`，手动 dotenv 解析（不依赖 python-dotenv）。
+- 新建 [.env.example](.env.example) 模板，含 `PA_AGENT_PROVIDER_*` / `PA_AGENT_GENERAL_*` / `PA_AGENT_TRADINGVIEW_USERNAME/PASSWORD` / `PA_AGENT_PUSHPLUS_TOKEN`。
+- 应用入口：[pa_agent/app_context.py](pa_agent/app_context.py) 的 `bootstrap()` 在 `load_settings()` 之后调用 `apply_env_overrides(settings)`。
+- 三层覆盖优先级：shell env > `.env` > `config/settings.json`。
 
-**现状**：前端启动时已强制读 `/api/settings` 渲染 `#ds-bar-count`，但后端 `/api/settings` 响应未设 `Cache-Control: no-store`，浏览器/中间层可能缓存旧值。
+#### P1.3 启动健康检查 + 运行时心跳 ✅
 
-**剩余方案**：
-- 后端 `/api/settings` GET 响应加 `Cache-Control: no-store`
-- 或加版本号 cache-busting
-
----
-
-### P1 — 工程质量，建议补齐
-
-#### P1.2 配置双轨冲突
-
-**现状**：目前只有 `config/settings.json` 单轨配置。`.env` 机制（`env_loader.py`、`.env.example`）尚未实现，TODO 早期描述的"双轨冲突"暂不存在。
-
-**方案**：
-- 建 `pa_agent/config/env_loader.py`，提供 `get_env_str` / `get_env_int` / `get_env_bool` 工具
-- 建 `.env.example` 模板（含 `PA_AGENT_PROVIDER_*`、`PA_AGENT_GENERAL_*`、`PA_AGENT_TRADINGVIEW_USERNAME/PASSWORD`）
-- Web 模式启动时优先读 .env 覆盖 settings.json（明确分层：Web 模式 .env 优先，GUI 模式只信 settings.json）
-- 检测 .env 与 settings.json 的 provider/general 字段冲突时 warn 提示
-
-#### P1.3 健康检查运行时无监控
-
-**现状**：`/api/health` 只返回 `{"status":"ok"}`，不检查模型 API。模型挂了无感知。`startup_health_check.py` 不存在，`/api/health/check` 不存在。
-
-**方案**：
-- 新建 `pa_agent/util/startup_health_check.py`，提供 `check_model_api()` / `check_data_source()` 函数
-- 加 `/api/health/check` 端点：启动时跑一次完整检查（模型 ping + TV 连接），返回各项 ok/warning/error
-- 加**定时心跳**：后台 task 每 5 分钟 ping 一次模型 API（最小 chat completion）
-- 失败时 `/api/health` 返回 `degraded` 状态
-- 前端轮询 `/api/health`，degraded 时顶部提示"模型 API 异常"
+- 新建 [pa_agent/util/startup_health_check.py](pa_agent/util/startup_health_check.py)：`check_model_api()`（`client.chat("ping")`）/ `check_data_source()`（`latest_snapshot(2)`）/ `run_full_check()` 返回 `HealthReport`。
+- 新增 `GET /api/health`：返回缓存状态（`starting`/`ok`/`degraded`/`error`），不触发真实检查。
+- 新增 `GET /api/health/check`：同步执行完整检查，返回各项详情与延迟。
+- 后台心跳任务：[web/server.py](web/server.py) 的 `_health_heartbeat()` 每 300s 跑一次，结果缓存到 `app.state.last_health_report`。
+- **坑**：`check_model_api` 必须用 `client.chat()`，不能用 `stream_chat()`（返回 `AIReply` 不可迭代）。
 
 ---
 
-### P2 — 长期演进，按需推进
+### P2 — 长期演进
 
-#### P2.1 Docker 化（待清理）
+#### P2.1 Docker 化清理 ✅
 
-**现状**：`web/Dockerfile` 和 `web/docker-compose.yml` 已存在，但 Dockerfile 仍装了一堆 Qt/X11 库（`libxcb-*` / `libegl1` / `libgl1`）并设 `QT_QPA_PLATFORM=offscreen`。在 `session_ledger.py` 改为 no-Qt stub 后这些已不再需要。
+- [web/Dockerfile](web/Dockerfile) 删除所有 Qt/X11 库安装行 + `QT_QPA_PLATFORM=offscreen`。
+- [web/docker-compose.yml](web/docker-compose.yml) 删除 `QT_QPA_PLATFORM=offscreen` 环境变量。
+- 新建 [.dockerignore](.dockerignore)：排除 `.git`、`logs/`、`__pycache__`、`tests/`。
 
-**剩余方案**：
-- 删除 Dockerfile 中 Qt/X11 库安装行
-- 删除 `ENV QT_QPA_PLATFORM=offscreen`
-- 删除 docker-compose.yml 中 `QT_QPA_PLATFORM=offscreen` 环境变量
-- 新建 `.dockerignore`：排除 `.git`、`logs/`、`__pycache__`、`tests/`
+#### P2.2 DataSource 契约校验 ✅
 
-#### P2.2 MockSource 的 n+1 约束显式化
+- [pa_agent/data/base.py](pa_agent/data/base.py) 新增 `_validate_snapshot(n, bars)` 方法：校验恰好 n+1 根、bars[0] 为 forming（closed=False, seq=0）、bars[1:] 为 closed（seq=1..n）。
+- `latest_snapshot(n)` 文档化契约：必须返回 n+1 根（1 forming + n closed）。
+- [pa_agent/data/tradingview.py](pa_agent/data/tradingview.py) 的 `latest_snapshot` 已修复为返回 n+1 根并在末尾调用 `_validate_snapshot()`。
 
-**现状**：`build_analysis_frame` 丢 forming 后要 n 根 closed，这个约束只在 `pa_agent/data/base.py` 的 `latest_snapshot` 文档注释里说明，无自动校验。新数据源容易踩。
+#### P2.3 max_tokens 可配置化 ✅
 
-**方案**：
-- 在 `DataSource` 基类加 `_validate_snapshot(n, bars)` 方法
-- `latest_snapshot(n)` 的契约文档化：必须返回 n+1 根（含 1 根 forming）
-- 不满足抛 `ValueError` 带清晰提示
-- `mock_source.py`（若实现，见 P1.2 依赖）需遵守此契约
+- [pa_agent/config/settings.py](pa_agent/config/settings.py) 新增 `provider.max_output_tokens: int | None` 字段。
+- [pa_agent/ai/deepseek_client.py](pa_agent/ai/deepseek_client.py) 的 `_provider_max_output_tokens()` 优先读 `settings.max_output_tokens`（>0 时覆盖 per-provider 默认值）。
+- `.env` 支持 `PA_AGENT_PROVIDER_MAX_OUTPUT_TOKENS`。
 
-#### P2.3 AI max_tokens 硬编码可配置化
+#### P2.4 日志结构化 ✅
 
-**现状**：`pa_agent/ai/deepseek_client.py` 的 `_PRACTICAL_UNLIMITED_MAX_TOKENS = 524288`（已从旧值 32768 提升），但仍硬编码，未走配置。
+- [pa_agent/util/logging.py](pa_agent/util/logging.py) 新增 `JsonlFormatter`（JSON-lines 格式）。
+- 新增 `set_trace_id()` / `get_trace_id()` contextvar，每条日志带 `trace_id` 字段。
+- 通过 `PA_AGENT_LOG_JSON=1` 环境变量启用 JSON 输出（默认仍为文本，向后兼容）。
+- [web/server.py](web/server.py) 的 `trace_id_middleware`：从 `X-Trace-Id` 请求头读或生成 12 位 hex，响应头回传。
 
-**方案**：
-- 改为 settings.json 可配置：`provider.max_output_tokens`
-- 或按 provider 动态读模型上限：DeepSeek 原生用 393216，OpenRouter free 用 32768，其他用 128000
-- 依赖 P1.2 的 `env_loader.py` 支持 `get_env_int`
+#### P2.5 上游同步自动化 ✅
 
-#### P2.4 日志结构化
-
-**现状**：`logs/pa_agent.log` 是纯文本，难以查询。
-
-**方案**：
-- 改 structured logging（jsonl 格式）
-- 每条日志带 `trace_id`、`stage`、`event_type` 字段
-- 方便后续接 ELK / Loki 做分析链路追踪
-- 复用 `pa_agent/util/logging.py` 的 handler 配置
-
-#### P2.5 上游同步自动化
-
-**现状**：README 写了手动 `git merge upstream/main` 流程，依赖人工。
-
-**方案**：
-- 配 GitHub Actions 定期（每周）检查上游 `rosemarycox5334-debug/PA_Agent` 是否有新提交
-- 有新提交时自动开 PR 到本仓库，标题 `chore: sync upstream YYYYMMDD`
-- PR 描述列出冲突文件清单 + 建议处理方式
-- 降低长期维护成本
+- 新建 [.github/workflows/sync-upstream.yml](.github/workflows/sync-upstream.yml)：每周一 09:00 UTC 检查上游 `rosemarycox5334-debug/PA_Agent` 是否有新提交。
+- 有新提交时自动开 PR，标题 `chore: sync upstream YYYYMMDD`，PR 描述列出冲突文件清单 + 建议处理方式。
 
 ---
 
-## 三、建议执行顺序
+## 三、后续可推进的优化（非阻塞）
+
+以下为非紧急、可按需推进的优化点：
+
+1. **前端数据源切换 UI 完善**：当前前端 `#ds-kind` / `#ds-symbol` / `#ds-timeframe` 仅加载列表，未回填 `last_data_source`/`last_symbol`/`last_tradingview_exchange`；需要添加"应用"按钮调用 `/api/subscribe`，并新增"交易所"输入框（TradingView 模式可见）。
+2. **前端顶部健康状态指示**：轮询 `/api/health`，`degraded`/`error` 时顶部红条提示。
+3. **`_PRACTICAL_UNLIMITED_MAX_TOKENS` 按 provider 动态读模型上限**：当前用静态默认值，DeepSeek 原生 393216、OpenRouter free 32768、其他 128000。
+4. **`_validate_snapshot` 性能优化**：大 n（>1000）时 list 遍历可优化。
+5. **`max_output_tokens` 前端可配**：当前只能在 `settings.json` / `.env` 配置，前端设置面板未暴露。
+
+---
+
+## 四、建议执行顺序
 
 ```
 阶段 1：本机跑通真实 TV 数据 ✅
-  └─ 按 1.1-1.5 部署，确认 TV 登录和拉数据正常
-  └─ 健康检查 TV 项应为 ok（待 P1.3 实现后）
+  └─ 按 1.1-1.4 部署，确认 TV 登录和拉数据正常
+  └─ 健康检查 /api/health/check 返回 ok
 
-阶段 2：P0/P1 根治
+阶段 2：P0/P1 根治 ✅
   ├─ P0.2 Cache-Control: no-store
   ├─ P1.2 .env 机制（env_loader + .env.example）
   └─ P1.3 运行时健康监控
 
-阶段 3：P2 工程质量
+阶段 3：P2 工程质量 ✅
   ├─ P2.1 Dockerfile 清理
   ├─ P2.2 n+1 约束校验
   ├─ P2.3 max_tokens 可配置化
   ├─ P2.4 日志结构化
   └─ P2.5 上游同步自动化
+
+阶段 4：前端体验完善（待推进）
+  └─ 见第三节"后续可推进的优化"
 ```
 
 ---
 
-## 四、关键文件索引
+## 五、关键文件索引
 
 | 模块 | 文件 |
 | --- | --- |
 | Web 入口 | [web/server.py](web/server.py) |
 | SSE 分析路由 | [web/api/routes_analyze.py](web/api/routes_analyze.py) |
+| 数据源路由 | [web/api/routes_data.py](web/api/routes_data.py) |
 | 配置加载 | [pa_agent/config/settings.py](pa_agent/config/settings.py) |
+| .env 解析 | [pa_agent/config/env_loader.py](pa_agent/config/env_loader.py) |
+| 健康检查 | [pa_agent/util/startup_health_check.py](pa_agent/util/startup_health_check.py) |
+| 结构化日志 | [pa_agent/util/logging.py](pa_agent/util/logging.py) |
 | AI 客户端 | [pa_agent/ai/deepseek_client.py](pa_agent/ai/deepseek_client.py) |
 | 两阶段编排 | [pa_agent/orchestrator/two_stage.py](pa_agent/orchestrator/two_stage.py) |
 | 数据源工厂 | [pa_agent/data/factory.py](pa_agent/data/factory.py) |
+| 市场默认值 | [pa_agent/data/market_defaults.py](pa_agent/data/market_defaults.py) |
 | K 线快照 | [pa_agent/data/snapshot.py](pa_agent/data/snapshot.py) |
 | TV 数据源 | [pa_agent/data/tradingview.py](pa_agent/data/tradingview.py) |
 | Docker | [web/Dockerfile](web/Dockerfile) / [web/docker-compose.yml](web/docker-compose.yml) |
+| 上游同步 | [.github/workflows/sync-upstream.yml](.github/workflows/sync-upstream.yml) |
 
 ---
 
-## 五、参考文档
+## 六、参考文档
 
 - [README.md](README.md) — 项目总览 + 开发者指南
 - [PA_Agent使用文档.md](PA_Agent使用文档.md) — 原项目完整功能说明

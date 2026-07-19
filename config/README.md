@@ -32,21 +32,24 @@
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `provider.model` | string | `"deepseek-v4-flash"` | 模型名称（须与网关支持的名称一致） |
+| `provider.model` | string | `"deepseek-chat"` | 模型名称（须与网关支持的名称一致） |
 | `provider.base_url` | string | `"https://api.deepseek.com"` | OpenAI 兼容 API 根地址。DeepSeek：`https://api.deepseek.com`；MiMo：`https://api.xiaomimimo.com/v1`（程序自动处理 `enable_thinking` 与 `reasoning_content` 回放） |
 | `provider.api_key` | string | `""` | API Key（明文，内存中临时使用；不持久化到文件） |
 | `provider.api_key_encrypted` | string | `""` | 加密后的 Key；留空表示未配置（通过 GUI 保存时自动加密写入） |
 | `provider.thinking` | bool | `true` | 是否启用思考/推理类扩展参数（依模型与网关而定）。关闭可 3–5 倍提速但分析质量下降 |
 | `provider.reasoning_effort` | string | `"high"` | 推理深度：`low` / `medium` / `high` / `max` |
-| `provider.context_window` | int | `2000000` | 用于上下文占用提示的窗口大小（tokens） |
+| `provider.context_window` | int | `128000` | 用于上下文占用提示的窗口大小（tokens） |
+| `provider.max_output_tokens` | int | `0` | 覆盖单次响应最大 tokens。`0` 或留空 = 按 provider 默认值（DeepSeek 原生 393216、OpenRouter free 32768、其他 128000）；free 模型建议设 32768 避免被拒 |
+| `provider.seed` | int | `null` | 随机性控制种子。同一输入+同一 seed 理论上返回相同结果（DeepSeek 官方不保证 100% 复现，thinking 模式下效果更弱，但能显著降低波动）。`null` = 不发送 |
+| `provider.top_p` | float | `null` | 核采样阈值 0~1。`0.1` = 近似贪心（仅最高概率 token），`1.0` = 完全随机。与 `temperature` 不同，`top_p` 在 thinking 模式下仍可使用。`null` = 不发送（用 provider 默认 1.0）。**推荐 0.1** |
 
 ### general — 通用设置
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `general.last_data_source` | string | `"mt5"` | K 线数据来源：`mt5` / `tradingview`（GUI 下拉选项）；`akshare` / `yfinance`（仅代码支持） |
-| `general.last_tradingview_exchange` | string | `""` | TradingView 交易所。空字符串 =（自动）依次探测预设列表。如 `OANDA`、`SSE`、`HKEX` 等 |
-| `general.last_symbol` | string | `"XAUUSDm"` | 默认品种。MT5 需含后缀（如 `m`），TradingView 用标准名（如 `XAUUSD`） |
+| `general.last_data_source` | string | `"tradingview"` | K 线数据来源。UI 仅展示 `tradingview`；`mt5` / `akshare` / `eastmoney` / `tushare` / `yfinance` 仍代码支持 |
+| `general.last_tradingview_exchange` | string | `"GATEIO"` | TradingView 交易所。空字符串 = 自动探测。加密货币常用：`GATEIO` / `BINANCE` / `BYBIT` / `OKX`；外汇黄金：`OANDA` / `PEPPERSTONE`；A股：`SSE` / `SZSE` |
+| `general.last_symbol` | string | `"BTCUSDT"` | 默认品种。TradingView 用标准名：加密 `BTCUSDT`、黄金 `XAUUSD`、A股 `600519`、港股 `0700`。MT5 需含后缀（如 `XAUUSDm`） |
 | `general.last_timeframe` | string | `"15m"` | 默认周期，如 `1m`、`5m`、`15m`、`1h`、`4h`、`1d` |
 | `general.analysis_bar_count` | int | `100` | 提交分析时使用的 K 线数量（2–5000） |
 | `general.refresh_interval_ms` | int | `1000` | 图表自动刷新间隔（毫秒） |

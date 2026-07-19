@@ -17,10 +17,13 @@ Supported env vars (all prefixed ``PA_AGENT_``):
 - ``PA_AGENT_PROVIDER_REASONING_EFFORT``  → provider.reasoning_effort
 - ``PA_AGENT_PROVIDER_CONTEXT_WINDOW``    → provider.context_window (int)
 - ``PA_AGENT_PROVIDER_MAX_OUTPUT_TOKENS`` → provider.max_output_tokens (int)
-- ``PA_AGENT_GENERAL_LAST_DATA_SOURCE``   → general.last_data_source
-- ``PA_AGENT_GENERAL_LAST_SYMBOL``        → general.last_symbol
-- ``PA_AGENT_GENERAL_LAST_TIMEFRAME``     → general.last_timeframe
-- ``PA_AGENT_GENERAL_ANALYSIS_BAR_COUNT`` → general.analysis_bar_count (int)
+- ``PA_AGENT_PROVIDER_SEED``              → provider.seed (int, 随机性控制)
+- ``PA_AGENT_PROVIDER_TOP_P``             → provider.top_p (float, 核采样阈值 0~1)
+- ``PA_AGENT_GENERAL_LAST_DATA_SOURCE``          → general.last_data_source
+- ``PA_AGENT_GENERAL_LAST_TRADINGVIEW_EXCHANGE`` → general.last_tradingview_exchange
+- ``PA_AGENT_GENERAL_LAST_SYMBOL``               → general.last_symbol
+- ``PA_AGENT_GENERAL_LAST_TIMEFRAME``            → general.last_timeframe
+- ``PA_AGENT_GENERAL_ANALYSIS_BAR_COUNT``        → general.analysis_bar_count (int)
 - ``PA_AGENT_TRADINGVIEW_USERNAME``       → (read by TradingViewSource factory)
 - ``PA_AGENT_TRADINGVIEW_PASSWORD``       → (read by TradingViewSource factory)
 - ``PA_AGENT_PUSHPLUS_TOKEN``             → pushplus.token
@@ -54,7 +57,10 @@ _ENV_MAPPING: dict[str, tuple[str, str, str | None]] = {
     "PA_AGENT_PROVIDER_REASONING_EFFORT": ("provider", "reasoning_effort", None),
     "PA_AGENT_PROVIDER_CONTEXT_WINDOW": ("provider", "context_window", "int"),
     "PA_AGENT_PROVIDER_MAX_OUTPUT_TOKENS": ("provider", "max_output_tokens", "int"),
+    "PA_AGENT_PROVIDER_SEED": ("provider", "seed", "int"),
+    "PA_AGENT_PROVIDER_TOP_P": ("provider", "top_p", "float"),
     "PA_AGENT_GENERAL_LAST_DATA_SOURCE": ("general", "last_data_source", None),
+    "PA_AGENT_GENERAL_LAST_TRADINGVIEW_EXCHANGE": ("general", "last_tradingview_exchange", None),
     "PA_AGENT_GENERAL_LAST_SYMBOL": ("general", "last_symbol", None),
     "PA_AGENT_GENERAL_LAST_TIMEFRAME": ("general", "last_timeframe", None),
     "PA_AGENT_GENERAL_ANALYSIS_BAR_COUNT": ("general", "analysis_bar_count", "int"),

@@ -41,3 +41,20 @@ def zombie_join_timeout_ms(kind: str) -> int:
     if kind in HTTP_POLL_SOURCES:
         return HTTP_ZOMBIE_JOIN_MS
     return DEFAULT_ZOMBIE_JOIN_MS
+
+
+def tv_cache_ttl_seconds(timeframe: str) -> int:
+    """TradingView 源 latest_snapshot 的 TTL 缓存时长（秒），按周期分级。
+
+    1m=4s，5m/15m/30m=8s，1h/4h=15s，1d/1w=60s，其他=8s。
+    """
+    tf = (timeframe or "").lower()
+    if tf == "1m":
+        return 4
+    if tf in ("5m", "15m", "30m"):
+        return 8
+    if tf in ("1h", "4h"):
+        return 15
+    if tf in ("1d", "1w"):
+        return 60
+    return 8

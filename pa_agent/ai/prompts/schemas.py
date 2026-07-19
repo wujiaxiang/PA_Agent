@@ -210,6 +210,11 @@ STAGE1_SCHEMA: dict = {
             "type": ["string", "null"],
             "enum": ["none", "warning", "triggered", None],
         },
+        "volatility_regime": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "extreme"],
+            "description": "当前波动率状态分级（用于风险等级与仓位策略）"
+        },
         "market_phase": {"type": "string", "enum": ["stable", "transitioning"]},
         "support_levels": {"type": "array", "items": {"type": "string"}},
         "resistance_levels": {"type": "array", "items": {"type": "string"}},

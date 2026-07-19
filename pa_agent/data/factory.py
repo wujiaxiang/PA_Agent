@@ -20,8 +20,9 @@ DataSourceKind = Literal[
 ]
 
 # UI-visible sources only — ``eastmoney`` is config/programmatic, not listed here.
+# Note: 项目目前只用 TradingView（含 Gate.io 等加密交易所）。MT5 保留代码支持，
+# 但 UI 不展示，避免用户误选后因 MT5 未安装而崩溃。
 DATA_SOURCE_CHOICES: tuple[tuple[DataSourceKind, str], ...] = (
-    ("mt5", "MT5"),
     ("tradingview", "TradingView"),
 )
 

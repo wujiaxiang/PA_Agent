@@ -17,6 +17,7 @@ from pa_agent.data.market_defaults import (
     resolve_tv_fetch_pair,
     tv_auto_probe_plan,
 )
+from pa_agent.data.refresh_policy import tv_cache_ttl_seconds
 from pa_agent.data.tv_symbol_lookup import TvSymbolNotFoundError, is_tv_name_input
 from pa_agent.data.tradingview_errors import format_tradingview_fetch_error
 
@@ -101,10 +102,15 @@ _TF_MAP: dict[str, str] = {
 
 # Forex / spot gold and China A-share (tvDatafeed exchange ids)
 TV_EXCHANGE_PRESETS: tuple[str, ...] = (
+    "GATEIO",
+    "BINANCE",
+    "BYBIT",
+    "OKX",
+    "BITSTAMP",
+    "COINBASE",
     "OANDA",
     "PEPPERSTONE",
     "FOREXCOM",
-    "FX",
     "TVC",
     "CAPITALCOM",
     "SSE",
@@ -117,6 +123,45 @@ TV_EXCHANGE_PRESETS: tuple[str, ...] = (
     "CME_MINI",
     "",
 )
+
+# Common symbols per exchange — TradingView has no public "list all symbols" API,
+# so we provide a curated preset per exchange.  Users can still type any symbol
+# manually in the frontend (the symbol input is a combobox, not a strict select).
+TV_SYMBOL_PRESETS: dict[str, list[str]] = {
+    "GATEIO": [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+        "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "TONUSDT",
+        "LTCUSDT", "TRXUSDT", "DOTUSDT", "BCHUSDT", "ATOMUSDT",
+    ],
+    "BINANCE": [
+        "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+        "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+    ],
+    "BYBIT": [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+        "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "TONUSDT",
+    ],
+    "OKX": [
+        "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
+        "DOGE-USDT", "ADA-USDT", "AVAX-USDT", "LINK-USDT", "TON-USDT",
+    ],
+    "BITSTAMP": ["BTCUSD", "ETHUSD", "LTCUSD", "XRPUSD", "BCHUSD"],
+    "COINBASE": ["BTCUSD", "ETHUSD", "SOLUSD", "ADAUSD", "XRPUSD"],
+    "OANDA": ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD"],
+    "PEPPERSTONE": ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD"],
+    "FOREXCOM": ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD"],
+    "TVC": ["XAUUSD", "GOLD", "EURUSD", "GBPUSD", "USDJPY"],
+    "CAPITALCOM": ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "BTCUSD"],
+    "SSE": ["600519", "601318", "600036", "601398", "600276"],
+    "SZSE": ["000001", "000333", "000651", "002594", "300750"],
+    "HKEX": ["0700", "1810", "9988", "3690", "1299"],
+    "SP": ["SPX", "SPX500", "NDX", "VIX"],
+    "NYSE": ["AAPL", "MSFT", "AMZN", "TSLA", "JPM"],
+    "NASDAQ": ["AAPL", "MSFT", "GOOGL", "META", "NVDA"],
+    "CBOT": ["ZC", "ZS", "ZW", "ZL"],
+    "CME_MINI": ["ES", "NQ", "YM", "RTY"],
+    "": ["XAUUSD", "BTCUSDT", "ETHUSDT", "EURUSD", "GOLD"],
+}
 
 
 class TradingViewSource(DataSource):
@@ -134,6 +179,11 @@ class TradingViewSource(DataSource):
         # WebSocket and stores it on self.ws; concurrent calls clobber the
         # same socket and cause C++ segfaults.
         self._snapshot_lock = threading.Lock()
+        # TTL cache for latest_snapshot(): avoids opening a fresh WebSocket
+        # on every call. Mirrors EastMoneySource's _snap_cache_* pattern.
+        self._snap_cache_bars: list | None = None
+        self._snap_cache_n: int = 0
+        self._snap_cache_ts: float = 0.0
         # Callback for status updates during auto-probe: fn(symbol, exchange, label)
         self.on_probe_status = None
 
@@ -208,19 +258,16 @@ class TradingViewSource(DataSource):
 
     # ── Discovery ─────────────────────────────────────────────────────────────
 
-    def list_symbols(self) -> list[str]:
-        return [
-            "XAUUSD",
-            "GOLD",
-            "600519",
-            "000001",
-            "1810",
-            "700",
-            "小米集团",
-            "腾讯控股",
-            "EURUSD",
-            "GBPUSD",
-        ]
+    def list_exchanges(self) -> list[str]:
+        """Return curated TradingView exchange ids (empty string = auto)."""
+        return [e for e in TV_EXCHANGE_PRESETS]
+
+    def list_symbols(self, exchange: str = "") -> list[str]:
+        """Return curated symbols for *exchange* (empty = generic list)."""
+        ex = (exchange or "").strip().upper()
+        if ex and ex in TV_SYMBOL_PRESETS:
+            return list(TV_SYMBOL_PRESETS[ex])
+        return list(TV_SYMBOL_PRESETS.get("", ["XAUUSD", "BTCUSDT", "ETHUSDT"]))
 
     def supported_timeframes(self) -> list[str]:
         return list(_TF_MAP.keys())
@@ -230,6 +277,12 @@ class TradingViewSource(DataSource):
     def subscribe(self, symbol: str, timeframe: str) -> None:
         if timeframe not in _TF_MAP:
             raise ValueError(f"Unsupported timeframe: {timeframe!r}. Use one of {list(_TF_MAP)}")
+        if symbol.strip() != self._symbol or timeframe != self._timeframe:
+            # Invalidate snapshot cache so the next latest_snapshot() doesn't
+            # return bars for the previous symbol/timeframe.
+            self._snap_cache_bars = None
+            self._snap_cache_n = 0
+            self._snap_cache_ts = 0.0
         self._timeframe = timeframe
         self._symbol = symbol.strip()
         # Abort any in-flight get_hist() blocked on a stalled connection so the
@@ -247,6 +300,9 @@ class TradingViewSource(DataSource):
     def unsubscribe(self) -> None:
         self._symbol = ""
         self._timeframe = ""
+        self._snap_cache_bars = None
+        self._snap_cache_n = 0
+        self._snap_cache_ts = 0.0
         logger.info("TradingViewSource unsubscribed")
 
     # ── Data fetch ────────────────────────────────────────────────────────────
@@ -357,9 +413,25 @@ class TradingViewSource(DataSource):
         ``TvDatafeed.get_hist()`` is NOT thread-safe — it writes to
         ``self.ws`` on each call, and concurrent access clobbers the
         WebSocket, causing C++ segfaults.
+
+        A TTL cache (``_snap_cache_*``) short-circuits repeated calls within
+        ``tv_cache_ttl_seconds(self._timeframe)`` so we don't open a fresh
+        WebSocket on every poll. Cache read AND write happen inside the lock
+        to prevent races with concurrent callers and with ``subscribe()``.
         """
         with self._snapshot_lock:
-            return self._latest_snapshot_inner(n)
+            ttl = tv_cache_ttl_seconds(self._timeframe)
+            if (
+                self._snap_cache_bars is not None
+                and self._snap_cache_n == n
+                and (time.time() - self._snap_cache_ts) < ttl
+            ):
+                return list(self._snap_cache_bars)
+            bars = self._latest_snapshot_inner(n)
+            self._snap_cache_bars = list(bars)
+            self._snap_cache_n = n
+            self._snap_cache_ts = time.time()
+            return bars
 
     def _latest_snapshot_inner(self, n: int) -> list[KlineBar]:
         """Actual snapshot logic — caller holds ``_snapshot_lock``."""
@@ -460,5 +532,33 @@ class TradingViewSource(DataSource):
 
 
 def _row_ts_ms(row) -> int:
-    """Extract bar open time in milliseconds from a tvDatafeed DataFrame row."""
-    return datetime_to_ts_ms(getattr(row, "datetime", None))
+    """Extract bar open time in milliseconds from a tvDatafeed DataFrame row.
+
+    tvDatafeed returns a naive DatetimeIndex (tz=None) whose wall-clock values
+    are in the exchange's local time (typically the host server timezone, e.g.
+    UTC+8 for a Shanghai server). The generic ``datetime_to_ts_ms`` treats
+    naive values as UTC, which would shift the epoch by the local offset
+    (8h for UTC+8) and make bars appear in the future on the chart.
+
+    Fix: localize naive Timestamps to the host timezone, then convert to UTC
+    before computing the epoch milliseconds. Timezone-aware values pass through
+    unchanged.
+    """
+    import time as _time
+    from datetime import timezone as _tz, timedelta as _td
+
+    dt = getattr(row, "datetime", None)
+    if dt is None:
+        return int(_time.time() * 1000)
+    try:
+        import pandas as pd
+
+        if isinstance(dt, pd.Timestamp):
+            if dt.tz is None:
+                # Naive → assume host local time (matches tvDatafeed behavior)
+                local_offset = _tz(_td(seconds=-_time.timezone))
+                dt = dt.tz_localize(local_offset).tz_convert("UTC")
+            return int(dt.timestamp() * 1000)
+    except ImportError:
+        pass
+    return datetime_to_ts_ms(dt)

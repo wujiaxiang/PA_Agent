@@ -23,6 +23,13 @@ class AIProviderSettings(BaseModel):
     #: Optional explicit override for max_tokens sent to provider. 0/None = auto
     #: (use per-provider default, see _provider_max_output_tokens). TODO P2.3.
     max_output_tokens: int | None = None
+    #: 随机性控制（让 LLM 返回更稳定）：
+    #:  - seed：同一输入+同一 seed 理论上返回相同结果（DeepSeek 官方不保证 100% 复现，
+    #:    thinking 模式下效果更弱，但能显著降低波动）。None=不发送。
+    #:  - top_p：核采样阈值，0~1。0.1=近似贪心（仅最高概率 token），1.0=完全随机。
+    #:    thinking 模式下仍可使用（与 temperature 不同）。None=不发送（用 provider 默认 1.0）。
+    seed: int | None = None
+    top_p: float | None = None
 
 
 class PromptSettings(BaseModel):
@@ -72,6 +79,8 @@ class GeneralSettings(BaseModel):
     last_tradingview_exchange: str = ""
     last_symbol: str = "XAUUSDm"
     last_timeframe: str = "15m"
+    #: K 线图显示所用时区（IANA 名称，如 Asia/Shanghai）
+    display_timezone: str = "Asia/Shanghai"
     decision_flow_auto_play: bool = True
     decision_flow_play_seconds: int = 50
     #: 阶段二给出限价/突破/市价单时：警报音、弹窗，并自动切到「决策」页（跳过决策树可视化演示）

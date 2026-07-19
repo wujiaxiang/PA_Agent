@@ -487,6 +487,15 @@ class DeepSeekClient:
             create_kwargs["extra_body"] = extra_body
         if _effort is not None:
             create_kwargs["reasoning_effort"] = _effort
+        # ── 随机性控制（让返回更稳定）──────────────────────────────────
+        # seed：同一输入+同一 seed 理论上返回相同结果。thinking 模式下效果更弱
+        # 但仍能显著降低波动。
+        if self._settings.seed is not None:
+            create_kwargs["seed"] = self._settings.seed
+        # top_p：核采样阈值。0.1=近似贪心（仅最高概率 token）。
+        # 与 temperature 不同，top_p 在 thinking 模式下仍可使用。
+        if self._settings.top_p is not None:
+            create_kwargs["top_p"] = self._settings.top_p
         # When thinking mode is OFF, set temperature=0 for maximum instruction-following
         # fidelity and JSON format compliance.  Thinking mode is incompatible with
         # temperature (DeepSeek/Anthropic spec), so we only inject it when safe.
@@ -497,6 +506,7 @@ class DeepSeekClient:
                 **create_kwargs,
                 # IMPORTANT: do NOT add temperature, top_p, presence_penalty,
                 # frequency_penalty — they are incompatible with thinking mode.
+                # （top_p 例外：thinking 模式下允许，已上方注入）
             )
         except Exception as exc:
             latency_ms = (time.monotonic() - t0) * 1000
@@ -676,6 +686,11 @@ class DeepSeekClient:
                 stream_kwargs["extra_body"] = extra_body
             if _effort is not None:
                 stream_kwargs["reasoning_effort"] = _effort
+            # ── 随机性控制（与 chat() 保持一致）─────────────────────────
+            if self._settings.seed is not None:
+                stream_kwargs["seed"] = self._settings.seed
+            if self._settings.top_p is not None:
+                stream_kwargs["top_p"] = self._settings.top_p
 
             try:
                 stream = client.chat.completions.create(**stream_kwargs)

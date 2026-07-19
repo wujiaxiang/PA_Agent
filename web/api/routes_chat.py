@@ -79,6 +79,7 @@ async def chat_stream(
     request: Request,
     text: str = Query(..., description="User question text"),
     record_id: str = Query(default="", description="Sidecar basename for followups"),
+    attach_kline_snapshot: bool = Query(default=False, description="附加最新 K 线快照到追问 prompt"),
 ):
     """SSE endpoint for post-analysis free-chat."""
     ctx = request.app.state.ctx
@@ -110,6 +111,8 @@ async def chat_stream(
 
     session = _get_session(session_key)
     if session is None:
+        # 仅当 attach_kline_snapshot=true 时附加最新 K 线快照（Phase C Task 3 SubTask 3.8）
+        kline_fn = _kline_snapshot_fn(ctx) if attach_kline_snapshot else None
         session = FreeChatSession(
             base_record=record,
             client=ctx.client,
@@ -117,7 +120,7 @@ async def chat_stream(
             pending_writer=ctx.pending_writer,
             ledger=ctx.ledger,
             settings=ctx.settings,
-            kline_snapshot_fn=_kline_snapshot_fn(ctx),
+            kline_snapshot_fn=kline_fn,
         )
         _touch_session(session_key, session)
 

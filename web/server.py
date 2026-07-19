@@ -53,6 +53,10 @@ async def lifespan(app: FastAPI):
     # Start background heartbeat task (TODO P1.3)
     heartbeat_task = asyncio.create_task(_health_heartbeat(app))
 
+    # Start background bars-stream task (SSE /api/bars/stream)
+    from web.api import routes_bars_stream
+    await routes_bars_stream.start_background_task(app)
+
     yield
     # shutdown
     heartbeat_task.cancel()
@@ -60,6 +64,7 @@ async def lifespan(app: FastAPI):
         await heartbeat_task
     except asyncio.CancelledError:
         pass
+    await routes_bars_stream.stop_background_task()
     try:
         ctx.data_source.disconnect()
     except Exception:
@@ -141,11 +146,15 @@ from web.api.routes_settings import router as settings_router
 from web.api.routes_data import router as data_router
 from web.api.routes_analyze import router as analyze_router
 from web.api.routes_chat import router as chat_router
+from web.api.routes_records import router as records_router
+from web.api.routes_bars_stream import router as bars_stream_router
 
 app.include_router(settings_router, prefix="/api")
 app.include_router(data_router, prefix="/api")
 app.include_router(analyze_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
+app.include_router(records_router, prefix="/api")
+app.include_router(bars_stream_router, prefix="/api")
 
 
 @app.get("/api/health")

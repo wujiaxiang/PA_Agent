@@ -232,14 +232,33 @@ def _build_empty_record(
             getattr(settings.general, "decision_stance", "conservative")
         )
 
+    exchange = ""
+    if settings is not None:
+        exchange = str(getattr(settings.general, "last_tradingview_exchange", "") or "")
+
+    # Derive last_close_bar_iso from the last kline bar's `time` (ms timestamp).
+    # Mirrors timestamp_local_iso generation: local ISO via datetime.fromtimestamp.
+    last_close_bar_iso = ""
+    if kline_data:
+        try:
+            ts_close_ms = int(kline_data[-1].get("time", 0))
+            if ts_close_ms > 0:
+                last_close_bar_iso = datetime.fromtimestamp(
+                    ts_close_ms / 1000
+                ).isoformat(timespec="milliseconds")
+        except (TypeError, ValueError, AttributeError):
+            last_close_bar_iso = ""
+
     meta = RecordMeta(
         timestamp_local_iso=ts_iso,
         timestamp_local_ms=ts_ms,
         symbol=frame.symbol,
         timeframe=frame.timeframe,
+        exchange=exchange,
         bar_count=len(frame.bars),
         ai_provider=ai_provider,
         decision_stance=decision_stance,
+        last_close_bar_iso=last_close_bar_iso,
     )
 
     return AnalysisRecord(

@@ -27,6 +27,16 @@ const API = {
     return r.json();
   },
 
+  async delete(endpoint) {
+    const r = await fetch(endpoint, { method: 'DELETE' });
+    if (!r.ok) {
+      const err = new Error(await r.text());
+      err.status = r.status;
+      throw err;
+    }
+    return r.json();
+  },
+
   // SSE helper: returns an AbortController + async generator
   sse(endpoint) {
     const controller = new AbortController();

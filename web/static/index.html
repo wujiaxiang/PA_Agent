@@ -5,45 +5,129 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PA Agent Web</title>
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
 
+<div id="api-key-alert" class="api-key-alert" hidden>⚠️ 未配置 API Key，<a href="#" id="api-key-alert-open">点击设置</a></div>
+
 <header id="toolbar">
-  <div class="toolbar-group">
-    <label>数据源</label>
-    <select id="ds-kind"></select>
-    <label>品种</label>
-    <input id="ds-symbol" type="text" value="XAUUSD" size="10">
-    <label>周期</label>
-    <select id="ds-timeframe"></select>
-    <label>K线数</label>
-    <input id="ds-bar-count" type="number" value="100" min="2" max="5000" size="5">
-    <button id="btn-analyze" class="primary">分析</button>
-    <button id="btn-cancel" class="danger" disabled>取消</button>
-    <button id="btn-refresh">刷新K线</button>
-    <label class="toggle-label">
-      <input id="cb-live-refresh" type="checkbox"> 实时刷新
+  <!-- 数据源段 -->
+  <div class="toolbar-segment">
+    <select id="ds-exchange" class="seg-select" title="交易所"></select>
+    <div class="symbol-picker">
+      <select id="ds-symbol-select" class="seg-select" title="品种"></select>
+      <input id="ds-symbol" type="text" value="BTCUSDT" size="10" autocomplete="off" placeholder="自定义..." class="hidden seg-input">
+      <button id="btn-symbol-toggle" type="button" class="icon-btn symbol-toggle-btn" title="切换下拉/自定义输入">✏️</button>
+      <div id="symbol-alert" class="symbol-alert" hidden></div>
+    </div>
+    <datalist id="ds-symbol-options"></datalist>
+    <select id="ds-timeframe" class="seg-select" title="周期"></select>
+    <input id="ds-bar-count" type="number" value="100" min="2" max="5000" size="4" class="seg-input" title="K线数量">
+    <button id="btn-apply-subscribe" class="compact-btn" title="应用数据源切换">应用</button>
+  </div>
+  <div class="toolbar-divider"></div>
+  <!-- 图表操作段（分析按钮已移入侧边栏） -->
+  <div class="toolbar-segment">
+    <button id="btn-refresh" class="icon-btn" title="刷新K线">🔄</button>
+    <label class="toggle-label" title="实时刷新">
+      <input id="cb-live-refresh" type="checkbox"> 实时
+    </label>
+    <label class="toggle-label" title="勾选后提交分析时会等待当前 K 线收盘再发请求">
+      <input id="cb-wait-close" type="checkbox"> 等待收盘
+    </label>
+    <span id="wait-close-countdown" class="wait-close-countdown" hidden></span>
+    <label class="toggle-label" title="持续跟踪：每根 K 线收盘后自动触发新一轮分析">
+      <input id="cb-keep-analysis" type="checkbox"> 持续跟踪
     </label>
     <span id="live-refresh-status" class="muted-text"></span>
   </div>
   <div class="toolbar-right">
-    <button id="btn-settings">⚙ 设置</button>
+    <button id="btn-indicators" class="icon-btn" title="指标管理">📐</button>
+    <button id="btn-settings" class="icon-btn" title="系统设置">⚙</button>
+    <button id="btn-sidebar-toggle" class="icon-btn" title="显示/隐藏侧边栏">📊</button>
   </div>
 </header>
 
 <div id="main">
-  <div id="chart-container"></div>
+  <div id="chart-wrap">
+    <div id="chart-container"></div>
+    <div id="chart-osc-wrap"></div>
+    <div id="tz-label">⏰ 浏览器本地时区</div>
+  </div>
   <div id="sidebar">
+    <!-- 拖拽分隔条：拖拽调整侧边栏宽度（Phase A Task 1） -->
+    <div class="sidebar-resizer" id="sidebar-resizer" title="拖拽调整宽度"></div>
+    <!-- 侧边栏头部：历史按钮 + 分析按钮（状态切换）+ 返回实时 + 折叠按钮 -->
+    <div class="sidebar-header">
+      <button id="btn-history" class="icon-btn" title="历史分析记录">🕐</button>
+      <div id="history-popover" class="history-popover hidden">
+        <div class="history-popover-header">
+          <span>历史分析记录</span>
+          <button id="btn-history-refresh" class="icon-btn" title="刷新">🔄</button>
+        </div>
+        <div id="history-list" class="history-list">
+          <div class="history-empty muted-text">暂无历史记录</div>
+        </div>
+      </div>
+      <button id="btn-analyze-toggle" class="btn-analyze" data-state="idle" title="开始 AI 分析">
+        <span class="btn-analyze-icon">▶</span>
+        <span class="btn-analyze-text">分析</span>
+      </button>
+      <button id="btn-incremental" class="compact-btn" title="基于上次成功记录做增量分析" disabled>增量</button>
+      <button id="btn-back-to-live" class="icon-btn hidden" title="返回实时">⚡</button>
+      <button id="btn-sidebar-collapse" class="icon-btn" title="隐藏侧边栏">📍</button>
+    </div>
+    <div id="flow-bar" class="flow-bar" hidden>
+      <div class="flow-step" data-step="1"><span class="flow-step-num">1</span><span class="flow-step-label">等待数据</span></div>
+      <div class="flow-step" data-step="2"><span class="flow-step-num">2</span><span class="flow-step-label">阶段一推理</span></div>
+      <div class="flow-step" data-step="3"><span class="flow-step-num">3</span><span class="flow-step-label">阶段一验证</span></div>
+      <div class="flow-step" data-step="4"><span class="flow-step-num">4</span><span class="flow-step-label">阶段二推理</span></div>
+      <div class="flow-step" data-step="5"><span class="flow-step-num">5</span><span class="flow-step-label">阶段二验证</span></div>
+      <div class="flow-step" data-step="6"><span class="flow-step-num">6</span><span class="flow-step-label">完成</span></div>
+    </div>
     <div class="sidebar-tabs">
-      <button class="tab active" data-tab="stream">实时分析</button>
-      <button class="tab" data-tab="decision">决策</button>
-      <button class="tab" data-tab="future">未来</button>
-      <button class="tab" data-tab="tree">决策树</button>
-      <button class="tab" data-tab="chat">追问</button>
+      <button class="tab active" data-tab="stream" data-tip="流式观看两阶段 AI 分析的推理与输出过程">实时分析</button>
+      <button class="tab" data-tab="decision" data-tip="AI 最终决策：结论 / 市场状态 / 详细依据（三段式）">决策</button>
+      <button class="tab" data-tab="future" data-tip="下一根 K 线与下一市场周期的概率预测">未来</button>
+      <button class="tab" data-tab="tree" data-tip="阶段一闸门 + 阶段二策略的逐步问答回放">决策树</button>
+      <button class="tab" data-tab="tree-viz" data-tip="决策树流程图可视化（可播放逐步高亮）">可视化</button>
+      <button class="tab" data-tab="raw" data-tip="查看 AI 请求/响应原始数据（调试用）">原始</button>
+      <button class="tab" data-tab="debug" data-tip="查看本次分析加载的策略文件与经验库">调试</button>
     </div>
 
     <div id="tab-stream" class="tab-panel active">
+      <div id="replay-badge" class="replay-badge hidden">
+        <span class="replay-badge-icon">📜</span>
+        <span class="replay-badge-text">回看历史记录</span>
+        <span class="replay-badge-time" id="replay-time"></span>
+      </div>
+      <details class="tab-help" data-help-key="stream">
+        <summary>❓ 这个 tab 是什么？怎么用？</summary>
+        <div class="tab-help-content">
+          <p><strong>实时分析 (Live Analysis)</strong> — 流式展示两阶段 AI 分析的完整推理过程，是观看 AI 思考过程的主入口。</p>
+          <p><strong>两阶段结构：</strong></p>
+          <ul>
+            <li>🔍 <strong>阶段一：市场诊断 (Stage 1)</strong> — AI 识别当前 K 线的市场结构（方向/周期位置/支撑阻力/闸门检查）</li>
+            <li>🎯 <strong>阶段二：交易决策 (Stage 2)</strong> — AI 基于阶段一诊断，输出具体交易方案（订单类型/方向/入场价/止损止盈）</li>
+          </ul>
+          <p><strong>每阶段含 2 个折叠块：</strong></p>
+          <ul>
+            <li>📝 <strong>提示词 Prompt</strong> — System + User 消息（看 AI 收到了什么）</li>
+            <li>💡 <strong>回答 Answer</strong> — 分两个子区：
+              <ul>
+                <li>🧠 <strong>推理思考 (Reasoning)</strong> — 模型内心独白（thinking 模式可见）</li>
+                <li>💬 <strong>回答输出 (Output)</strong> — 模型正式回答（含结构化 JSON）</li>
+              </ul>
+            </li>
+          </ul>
+          <p><strong>顶部状态：</strong>阶段进度徽章（进行中/✓完成/✗失败/重试中）+ Token 上下文占用条</p>
+          <p><strong>底部追问：</strong>分析完成后可在输入框继续提问，AI 基于本次分析上下文回答</p>
+          <p><strong>使用建议：</strong>分析过程中实时滚动查看推理；分析完成后想看结构化结论去【决策】，想看决策路径去【决策树】</p>
+        </div>
+      </details>
+      <div id="stream-stats" class="stream-stats muted-text" hidden></div>
       <div id="stage-badge"></div>
       <div id="token-progress-wrap" class="token-progress hidden">
         <div class="token-progress-label">
@@ -53,30 +137,236 @@
         <div class="token-progress-bar"><div id="token-progress-fill"></div></div>
         <div id="token-progress-detail" class="muted-text"></div>
       </div>
-      <div id="stream-reasoning"></div>
-      <div id="stream-content"></div>
+
+      <div id="stage-1-block" class="stage-block">
+        <div class="stage-block-header">
+          <span class="stage-icon">🔍</span>
+          <span class="stage-title">阶段一：市场诊断 (Stage 1 — Diagnosis)</span>
+          <span class="stage-status" id="stage1-status"></span>
+        </div>
+        <details class="prompt-block" open>
+          <summary>📝 提示词 Prompt</summary>
+          <div class="prompt-section">
+            <div class="prompt-section-title">System</div>
+            <pre class="prompt-text" id="stage1-system"></pre>
+          </div>
+          <div class="prompt-section">
+            <div class="prompt-section-title">User</div>
+            <pre class="prompt-text" id="stage1-user"></pre>
+          </div>
+        </details>
+        <details class="answer-block" open>
+          <summary>💡 回答 Answer</summary>
+          <div class="answer-subsection">
+            <div class="answer-subsection-label reasoning-label">🧠 推理思考 (Reasoning)</div>
+            <div class="answer-reasoning" id="stage1-reasoning"></div>
+          </div>
+          <div class="answer-subsection">
+            <div class="answer-subsection-label output-label">💬 回答输出 (Output)</div>
+            <div class="answer-content" id="stage1-content"></div>
+          </div>
+        </details>
+      </div>
+
+      <div id="stage-2-block" class="stage-block">
+        <div class="stage-block-header">
+          <span class="stage-icon">🎯</span>
+          <span class="stage-title">阶段二：交易决策 (Stage 2 — Decision)</span>
+          <span class="stage-status" id="stage2-status"></span>
+        </div>
+        <details class="prompt-block" open>
+          <summary>📝 提示词 Prompt</summary>
+          <div class="prompt-section">
+            <div class="prompt-section-title">System</div>
+            <pre class="prompt-text" id="stage2-system"></pre>
+          </div>
+          <div class="prompt-section">
+            <div class="prompt-section-title">User</div>
+            <pre class="prompt-text" id="stage2-user"></pre>
+          </div>
+        </details>
+        <details class="answer-block" open>
+          <summary>💡 回答 Answer</summary>
+          <div class="answer-subsection">
+            <div class="answer-subsection-label reasoning-label">🧠 推理思考 (Reasoning)</div>
+            <div class="answer-reasoning" id="stage2-reasoning"></div>
+          </div>
+          <div class="answer-subsection">
+            <div class="answer-subsection-label output-label">💬 回答输出 (Output)</div>
+            <div class="answer-content" id="stage2-content"></div>
+          </div>
+        </details>
+      </div>
+
       <div id="stream-usage"></div>
-      <div id="prompt-display"></div>
+      <div class="disclaimer">⚠️ AI 分析仅供参考，不构成投资建议</div>
+      <div class="chat-input-row">
+        <input id="chat-input" type="text" placeholder="分析完成后可继续追问…" disabled>
+        <button id="btn-chat-send" class="compact-btn" disabled>发送</button>
+        <button id="btn-chat-clear" class="compact-btn" title="清空追问消息">清空</button>
+      </div>
     </div>
 
     <div id="tab-decision" class="tab-panel">
+      <details class="tab-help" data-help-key="decision">
+        <summary>❓ 这个 tab 是什么？怎么用？</summary>
+        <div class="tab-help-content">
+          <p><strong>决策 (Decision)</strong> — 本次分析最终交易决策的结构化报告，采用三段式视觉层次。</p>
+          <p><strong>三段结构（颜色编码）：</strong></p>
+          <ul>
+            <li>🎯 <strong>VERDICT 决策结论</strong>（蓝色 / 常显）— "做什么"
+              <ul>
+                <li>结论横幅：订单类型 + 方向 + 交易置信度（不下单时显示"观望"）</li>
+                <li>派生字段：趋势 / 周期 / 阶段（含过渡风险）</li>
+                <li>价格栅格：入场价 / 止损 / 止盈 TP1·TP2 + 盈亏比（交易员方程）</li>
+                <li>三条置信度进度条：诊断置信度 / 交易决策置信度 / 预估胜率</li>
+              </ul>
+            </li>
+            <li>🔬 <strong>VITALS 市场状态</strong>（青色 / 常显）— "为什么"
+              <ul>
+                <li>2.1 趋势结构：方向 / 周期位置 / 备选周期 / 趋势标签</li>
+                <li>2.2 市场阶段：market_phase / 过渡风险 / 波动率 / Spike 阶段 / 高潮风险</li>
+                <li>2.3 关键价位：支撑位（绿）/ 阻力位（红）并排显示</li>
+                <li>2.4 形态与信号：识别形态 + 关键信号</li>
+              </ul>
+            </li>
+            <li>📚 <strong>EVIDENCE 详细依据</strong>（紫色 / 折叠）— "证据链"
+              <ul>
+                <li>7 个独立子折叠区：3.1 决策理由（默认展开）/ 3.2 入场规则 / 3.3 K线分析 / 3.4 趋势上下文 / 3.5 风险评估 / 3.6 关键因素与关注点 / 3.7 置信度说明</li>
+                <li>顶部"全部展开/全部折叠"主控按钮一键切换</li>
+              </ul>
+            </li>
+          </ul>
+          <p><strong>颜色含义：</strong>绿色 = 做多 / 支撑 / 通过，红色 = 做空 / 阻力 / 失败，蓝色 = 不下单 / 中性，黄色 = 等待 / 警告</p>
+          <p><strong>使用建议：</strong>这是看"AI 给出什么交易方案"的主入口；想看推理过程去【实时分析】，想看决策路径去【决策树】，想看完整 JSON 去【原始】</p>
+        </div>
+      </details>
       <div id="decision-content">尚未进行交易分析</div>
     </div>
 
     <div id="tab-future" class="tab-panel">
+      <details class="tab-help" data-help-key="future">
+        <summary>❓ 这个 tab 是什么？怎么用？</summary>
+        <div class="tab-help-content">
+          <p><strong>未来 (Future)</strong> — AI 对未来走势的概率性预测，含两个时间维度，辅助判断进场后的胜率。</p>
+          <p><strong>两块内容：</strong></p>
+          <ul>
+            <li>📊 <strong>下一根 K 线预期</strong> — 下根 K 线是阳线/阴线/中性的概率 + 理由
+              <ul><li>"不可预测"标签表示市场处于不确定状态，此时概率分布无意义</li></ul>
+            </li>
+            <li>🔄 <strong>下一个市场周期预期</strong> — 8 种 Cycle 类型按概率排序，Top-3 蓝色高亮
+              <ul>
+                <li>极速趋势 / 微通道 / 紧通道 / 正常通道 / 宽通道 / 趋势中震荡 / 震荡区间 / 极端震荡</li>
+                <li>方向标签：看涨 / 看跌 / 中性</li>
+              </ul>
+            </li>
+          </ul>
+          <p><strong>程序补全标记：</strong>若 AI 未输出但程序根据规则补全，会显示【程序补全】前缀</p>
+          <p><strong>使用建议：</strong>用于判断"现在进场后未来 N 根 K 线胜率如何"；市场不可预测时优先看【决策】tab 的置信度</p>
+        </div>
+      </details>
       <div id="future-content">尚未进行交易分析</div>
     </div>
 
     <div id="tab-tree" class="tab-panel">
+      <details class="tab-help" data-help-key="tree">
+        <summary>❓ 这个 tab 是什么？怎么用？</summary>
+        <div class="tab-help-content">
+          <p><strong>决策树 (Decision Tree)</strong> — 决策路径的逐步问答回放，看 AI 是如何一步步得出结论的。</p>
+          <p><strong>顶部 banner：</strong>终点结果（交易 / 等待 / 放弃 / 继续评估）</p>
+          <p><strong>6 列表格：</strong></p>
+          <ul>
+            <li><strong>步 Step</strong> — 序号</li>
+            <li><strong>阶段 Phase</strong> — "一·闸门" = 阶段一闸门检查（筛选是否适合交易），"二·策略" = 阶段二策略决策（具体怎么做）</li>
+            <li><strong>节点 Node</strong> — 决策树节点 ID（如 1.1 / 2.3 / 10.3）</li>
+            <li><strong>回答 Answer</strong> — 绿色=是/通过，红色=否/失败，黄色=中性/等待，灰色=不适用</li>
+            <li><strong>K线依据 Bar Range</strong> — 该判断基于哪几根 K 线（如 K50-K1 = 最近 50 根到最近 1 根）</li>
+            <li><strong>理由 Reason</strong> — AI 给出的判断理由</li>
+          </ul>
+          <p><strong>使用建议：</strong>用于复盘 AI 决策逻辑；阶段一闸门未通过会"短路"（不进入阶段二）；想看完整数据去【原始】tab</p>
+        </div>
+      </details>
       <div id="tree-content">尚未进行交易分析</div>
     </div>
 
-    <div id="tab-chat" class="tab-panel">
-      <div id="chat-history"></div>
-      <div class="chat-input-row">
-        <input id="chat-input" type="text" placeholder="输入追问…" disabled>
-        <button id="btn-chat-send" disabled>发送</button>
+    <div id="tab-tree-viz" class="tab-panel">
+      <details class="tab-help" data-help-key="tree-viz">
+        <summary>❓ 这个 tab 是什么？怎么用？</summary>
+        <div class="tab-help-content">
+          <p><strong>可视化 (Tree Visualization)</strong> — 以流程图形式可视化 AI 决策路径，直观查看决策走向。</p>
+          <p><strong>视觉元素：</strong></p>
+          <ul>
+            <li>实线框 = 实际走过的节点；虚线框 = 未走分支</li>
+            <li>节点颜色对应回答（绿=通过 / 红=失败 / 黄=等待 / 灰=不适用）</li>
+            <li>点击「▶ 播放」可沿路径逐步高亮，配合「⏸ 暂停」「⟲ 重置」控制</li>
+          </ul>
+          <p><strong>缩放与平移：</strong></p>
+          <ul>
+            <li>点击 ➕/➖ 按钮，或按 <code>Ctrl+滚轮</code> 缩放</li>
+            <li><code>⤢ 适配</code> 自动适配窗口</li>
+            <li>按住鼠标拖拽平移视图</li>
+          </ul>
+          <p><strong>使用建议：</strong>直观查看决策走向；详细节点数据和理由去【决策树】tab</p>
+        </div>
+      </details>
+      <div class="tree-viz-controls">
+        <button id="btn-tree-viz-play" class="compact-btn">▶ 播放</button>
+        <button id="btn-tree-viz-pause" class="compact-btn" disabled>⏸ 暂停</button>
+        <button id="btn-tree-viz-reset" class="compact-btn">⟲ 重置</button>
+        <span class="tree-viz-divider" aria-hidden="true">|</span>
+        <button id="btn-tree-viz-zoom-out" class="compact-btn" title="缩小 (Ctrl+滚轮下)">➖</button>
+        <span id="tree-viz-zoom-pct" class="tree-viz-zoom-pct">100%</span>
+        <button id="btn-tree-viz-zoom-in" class="compact-btn" title="放大 (Ctrl+滚轮上)">➕</button>
+        <button id="btn-tree-viz-zoom-fit" class="compact-btn" title="适配窗口">⤢ 适配</button>
+        <span id="tree-viz-progress" class="tree-viz-progress">未播放</span>
       </div>
+      <div id="tree-viz-content">尚未进行交易分析</div>
+    </div>
+
+    <div id="tab-raw" class="tab-panel">
+      <details class="tab-help" data-help-key="raw">
+        <summary>❓ 这个 tab 是什么？怎么用？</summary>
+        <div class="tab-help-content">
+          <p><strong>原始 (Raw)</strong> — 展示本次分析两阶段的 AI 请求/响应原始数据，是调试与问题排查的主入口。</p>
+          <p><strong>顶部切换：</strong>阶段一诊断 / 阶段二决策 / ⚠ 异常（仅失败时显示）</p>
+          <p><strong>每阶段含 4 个折叠区：</strong></p>
+          <ul>
+            <li>📝 <strong>System Prompt</strong> — 系统提示词（含策略文件内容）</li>
+            <li>📝 <strong>User Prompt</strong> — 用户消息（含 K 线数据 / 阶段一诊断结果）</li>
+            <li>💡 <strong>AI 响应</strong> — 模型原始返回，含 reasoning_content 思考过程 + content 正文</li>
+            <li>⚙️ <strong>验证 + 缓存命中</strong> — stage1/stage2 是否通过校验、缺失/无效字段、KV Cache 命中率</li>
+          </ul>
+          <p><strong>顶部操作按钮：</strong></p>
+          <ul>
+            <li>📋 <strong>复制调试信息</strong> — 把整条 record JSON 复制到剪贴板（用于 bug report）</li>
+            <li>💾 <strong>导出 JSON</strong> — 下载完整 record 为 .json 文件</li>
+          </ul>
+          <p><strong>使用建议：</strong>排查"AI 给的 JSON 解析失败"或"提示词哪里出问题"时优先看本 tab；API Key 等敏感信息已脱敏</p>
+        </div>
+      </details>
+      <div class="raw-turns-bar">
+        <button class="raw-turn-btn active" data-turn="stage1">阶段一诊断</button>
+        <button class="raw-turn-btn" data-turn="stage2">阶段二决策</button>
+        <button class="raw-turn-btn raw-turn-exception" data-turn="exception" hidden>⚠ 异常</button>
+      </div>
+      <div id="raw-content"><p class="placeholder">尚未进行交易分析</p></div>
+    </div>
+
+    <div id="tab-debug" class="tab-panel">
+      <details class="tab-help" data-help-key="debug">
+        <summary>❓ 这个 tab 是什么？怎么用？</summary>
+        <div class="tab-help-content">
+          <p><strong>调试 (Debug)</strong> — 展示本次分析加载的策略文件与经验库条目，便于排查 prompt 构造问题。</p>
+          <p><strong>3 个卡片：</strong></p>
+          <ul>
+            <li>📄 <strong>阶段一策略文件</strong> — 静态注入阶段一 system prompt 的 .txt 文件清单</li>
+            <li>📄 <strong>阶段二策略文件</strong> — 阶段二动态加载的 .txt 文件清单（根据方向 / 形态路由）</li>
+            <li>📚 <strong>经验库</strong> — 加载的成功 / 失败案例数量 + 文件名列表</li>
+          </ul>
+          <p><strong>使用建议：</strong>当 AI 决策明显不符合策略时，检查本 tab 看是否漏加载了某个关键策略文件；想看完整 prompt 内容去【原始】tab</p>
+        </div>
+      </details>
+      <div id="debug-content"><p class="placeholder">尚未进行交易分析</p></div>
     </div>
   </div>
 </div>
@@ -93,30 +383,99 @@
     </div>
     <form id="settings-form">
       <div id="stab-s-provider" class="stab-panel active">
-        <label>Base URL <input id="s-base-url" type="text"></label>
-        <label>Model <input id="s-model" type="text"></label>
-        <label>API Key <input id="s-api-key" type="password"></label>
-        <label>Reasoning Effort
+        <label>接口地址（Base URL） <input id="s-base-url" type="text"></label>
+        <label>模型名（Model） <input id="s-model" type="text"></label>
+        <label>API 密钥（API Key） <input id="s-api-key" type="password"></label>
+        <label>思考深度（Reasoning Effort）
           <select id="s-reasoning-effort">
-            <option value="low">low</option>
-            <option value="medium">medium</option>
-            <option value="high" selected>high</option>
-            <option value="max">max</option>
+            <option value="low">低</option>
+            <option value="medium">中</option>
+            <option value="high" selected>高</option>
+            <option value="max">最高</option>
           </select>
         </label>
-        <label>Thinking <input id="s-thinking" type="checkbox" checked></label>
+        <label class="checkbox-label">
+          <input id="s-thinking" type="checkbox" checked> 扩展思考（Thinking）
+        </label>
       </div>
       <div id="stab-s-general" class="stab-panel">
-        <label>刷新间隔(ms) <input id="s-refresh-ms" type="number" value="1000"></label>
-        <label>决策倾向
-          <select id="s-decision-stance">
-            <option value="conservative">保守</option>
-            <option value="balanced" selected>平衡</option>
-            <option value="aggressive">激进</option>
-            <option value="extreme_aggressive">极度激进</option>
-          </select>
-        </label>
-        <label>上下文警告阈值(%) <input id="s-ctx-warn" type="number" value="80"></label>
+        <!-- 数据刷新组 -->
+        <fieldset class="settings-fieldset">
+          <legend>数据刷新</legend>
+          <label>刷新间隔（Refresh Interval, ms） <input id="s-refresh-ms" type="number" value="1000"></label>
+          <label class="checkbox-label">
+            <input id="s-auto-resume-chart" type="checkbox"> 自动恢复图表（Auto Resume Chart）
+          </label>
+        </fieldset>
+        <!-- 分析行为组 -->
+        <fieldset class="settings-fieldset">
+          <legend>分析行为</legend>
+          <label>决策倾向（Decision Stance）
+            <select id="s-decision-stance">
+              <option value="conservative">保守</option>
+              <option value="balanced" selected>平衡</option>
+              <option value="aggressive">激进</option>
+              <option value="extreme_aggressive">极度激进</option>
+            </select>
+          </label>
+          <label>增量分析最大新增 K 线（Incremental Max New Bars） <input id="s-incremental-max-new-bars" type="number" min="0" max="500" value="10"></label>
+          <label class="checkbox-label">
+            <input id="s-keep-analysis" type="checkbox"> 持续跟踪分析（Keep Analysis）
+          </label>
+          <label class="checkbox-label">
+            <input id="s-cancel-keep-on-retry" type="checkbox"> 重试后取消持续跟踪（Cancel Keep On Retry）
+          </label>
+          <label class="checkbox-label">
+            <input id="s-predict-next-bar" type="checkbox"> 下根 K 线预期开关（Predict Next Bar）
+          </label>
+        </fieldset>
+        <!-- 下单与提醒组 -->
+        <fieldset class="settings-fieldset">
+          <legend>下单与提醒</legend>
+          <label>下单置信度门槛（Decision Confidence Threshold, 0-100） <input id="s-decision-confidence-threshold" type="number" min="0" max="100" value="40"></label>
+          <label class="checkbox-label">
+            <input id="s-alert-on-order-opportunity" type="checkbox"> 下单提醒开关（Alert On Order Opportunity）
+          </label>
+        </fieldset>
+        <!-- 显示组 -->
+        <fieldset class="settings-fieldset">
+          <legend>显示</legend>
+          <label>显示时区（Display Timezone）
+            <input id="s-display-timezone" type="text" list="tz-options" placeholder="Asia/Shanghai">
+          </label>
+          <datalist id="tz-options">
+            <option value="Asia/Shanghai">
+            <option value="Asia/Tokyo">
+            <option value="Asia/Hong_Kong">
+            <option value="Asia/Singapore">
+            <option value="America/New_York">
+            <option value="America/Los_Angeles">
+            <option value="Europe/London">
+            <option value="UTC">
+          </datalist>
+          <label>实时窗口字号（Stream Font Size, pt） <input id="s-stream-font-size" type="number" min="8" max="28" value="11"></label>
+          <label>图表 K 线序号字号（Chart Seq Font Size, pt） <input id="s-chart-seq-font-size" type="number" min="6" max="24" value="11"></label>
+          <label>上下文警告阈值（Context Warning Threshold, %） <input id="s-ctx-warn" type="number" value="80"></label>
+          <label>上下文窗口大小（Context Window） <input id="s-context-window" type="number" min="1000" value="2000000"></label>
+        </fieldset>
+        <!-- 决策树组 -->
+        <fieldset class="settings-fieldset">
+          <legend>决策树</legend>
+          <label class="checkbox-label">
+            <input id="s-decision-tree-autoplay" type="checkbox"> 决策树播放开关（Decision Tree Autoplay）
+          </label>
+          <label>播放时长（Play Duration, 秒） <input id="s-decision-tree-play-duration" type="number" min="1" value="50"></label>
+          <label>默认缩放（Default Zoom, %） <input id="s-decision-tree-default-zoom" type="number" min="10" value="600"></label>
+        </fieldset>
+        <!-- 第三方组 -->
+        <fieldset class="settings-fieldset">
+          <legend>第三方</legend>
+          <label>PushPlus Token <input id="s-pushplus-token" type="text" placeholder="（可留空）"></label>
+          <label class="checkbox-label">
+            <input id="s-pushplus-enabled" type="checkbox"> PushPlus 启用（PushPlus Enabled）
+          </label>
+          <label>Tushare Token <input id="s-tushare-token" type="text" placeholder="（可留空）"></label>
+        </fieldset>
       </div>
       <div id="stab-s-feishu" class="stab-panel">
         <label class="checkbox-label">
@@ -142,8 +501,40 @@
   </div>
 </div>
 
+<!-- Indicators Modal -->
+<div id="indicators-modal" class="modal hidden">
+  <div class="modal-content modal-content-lg">
+    <span class="modal-close">&times;</span>
+    <h2>📐 指标管理 (Indicators Manager)</h2>
+    <p class="muted-text ind-modal-desc">
+      基于 lightweight-charts 自建指标库（TradingView 完整版指标需商业授权，无法直接集成）。
+      左侧添加可用指标，右侧管理已启用指标及参数。
+    </p>
+    <div class="ind-layout">
+      <div class="ind-col ind-col-avail">
+        <div class="ind-col-title">可用指标 Available</div>
+        <div id="ind-available-list" class="ind-list"></div>
+      </div>
+      <div class="ind-col ind-col-active">
+        <div class="ind-col-title">已启用 Active</div>
+        <div id="ind-active-list" class="ind-list"></div>
+      </div>
+    </div>
+    <div class="form-actions">
+      <button type="button" id="btn-indicators-close">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 浮动展开按钮（侧边栏折叠时显示） -->
+<button id="sidebar-expand-fab" class="sidebar-expand-fab" title="展开侧边栏">📊</button>
+
+<!-- 下单机会提醒 Toast 容器（固定右下角，Phase E Task 12） -->
+<div id="toast-container" class="toast-container" aria-live="polite"></div>
+
 <script src="/js/api.js"></script>
 <script src="/js/chart.js"></script>
+<script src="/js/indicators.js"></script>
 <script src="/js/app.js"></script>
 </body>
 </html>

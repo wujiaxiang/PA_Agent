@@ -1,8 +1,11 @@
 """PendingWriter — persists AnalysisRecord and FollowupTurn to disk.
 
-File naming convention:
-    {YYYY-MM-DD_HH-mm-ss}_{symbol}_{timeframe}.json
-    {YYYY-MM-DD_HH-mm-ss}_{symbol}_{timeframe}.followups.jsonl
+Storage layout (partitioned):
+    {pending_dir}/{exchange}/{symbol}/{timeframe}/{YYYY-MM-DD_HH-mm-ss}.json
+    {pending_dir}/{record_id}.followups.jsonl  (sidecar stays at top level)
+
+Legacy flat layout ({pending_dir}/{ts}_{symbol}_{timeframe}.json) is still
+readable by analysis_history.list_record_paths().
 
 Disk failures are logged and emitted to the event bus but never propagated.
 """
@@ -17,6 +20,9 @@ from typing import Optional
 from pa_agent.records.schema import AnalysisRecord, FollowupTurn
 from pa_agent.util.mask_secret import mask_secret
 
+# Characters that are illegal in Windows/Linux path segments.
+_ILLEGAL_PATH_CHARS = ('/', '\\', ':', '*', '?', '"', '<', '>', '|')
+
 
 def _default_logger() -> logging.Logger:
     return logging.getLogger(__name__)
@@ -27,13 +33,42 @@ def _ms_to_local_datetime(ms: int) -> datetime:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone()
 
 
+def _safe_path_segment(s: str) -> str:
+    """Replace illegal path characters with ``-``.
+
+    Applied to exchange/symbol/timeframe before joining into a path so that
+    malformed values (e.g. ``BTC/USDT``) do not break the directory structure.
+    """
+    result = s
+    for ch in _ILLEGAL_PATH_CHARS:
+        result = result.replace(ch, '-')
+    return result
+
+
 def _build_basename(record: AnalysisRecord) -> str:
-    """Build the filename stem (without extension) for a record."""
+    """Build the filename stem (without extension) for a record.
+
+    In the partitioned layout this is just the timestamp portion; the
+    exchange/symbol/timeframe go into the directory path (see
+    ``_build_record_path``).
+    """
     dt = _ms_to_local_datetime(record.meta.timestamp_local_ms)
     ts_str = dt.strftime("%Y-%m-%d_%H-%m-%S")
-    symbol = record.meta.symbol
-    timeframe = record.meta.timeframe
-    return f"{ts_str}_{symbol}_{timeframe}"
+    return ts_str
+
+
+def _build_record_path(record: AnalysisRecord, pending_dir: Path) -> Path:
+    """Construct the partitioned storage path for a record.
+
+    Layout: ``{pending_dir}/{exchange}/{symbol}/{timeframe}/{timestamp}.json``.
+    Empty exchange collapses to ``{pending_dir}/{symbol}/{timeframe}/...``
+    (pathlib normalises empty segments away).
+    """
+    exchange_seg = _safe_path_segment(record.meta.exchange)
+    symbol_seg = _safe_path_segment(record.meta.symbol)
+    timeframe_seg = _safe_path_segment(record.meta.timeframe)
+    basename = _build_basename(record)
+    return pending_dir / exchange_seg / symbol_seg / timeframe_seg / f"{basename}.json"
 
 
 class PendingWriter:
@@ -73,8 +108,12 @@ class PendingWriter:
 
         Returns the path written to, or a best-effort path on failure.
         """
-        basename = _build_basename(record)
-        path = self._pending_dir / f"{basename}.json"
+        if not record.meta.exchange:
+            self._logger.warning(
+                "PendingWriter: record.meta.exchange is empty; writing record "
+                "to symbol/timeframe partition without exchange segment."
+            )
+        path = _build_record_path(record, self._pending_dir)
         data = record.model_dump()
         data = self._sanitize(data, self._api_key)
         self._write_json(path, data)
@@ -96,8 +135,12 @@ class PendingWriter:
 
         Returns the path written to, or a best-effort path on failure.
         """
-        basename = _build_basename(record)
-        path = self._pending_dir / f"{basename}.json"
+        if not record.meta.exchange:
+            self._logger.warning(
+                "PendingWriter: record.meta.exchange is empty; writing record "
+                "to symbol/timeframe partition without exchange segment."
+            )
+        path = _build_record_path(record, self._pending_dir)
         data = record.model_dump()
         data["_partial_reason"] = reason
         if isinstance(data.get("exception"), dict):
@@ -117,10 +160,15 @@ class PendingWriter:
 
         ``record_id`` is the basename (without extension) of the record file,
         e.g. ``"2026-05-18_14-00-13_XAUUSD_1h"``.
+
+        The sidecar file stays at the top level of the pending directory
+        (``records/pending/{record_id}.followups.jsonl``) for backward
+        compatibility with existing callers.
         """
         path = self._pending_dir / f"{record_id}.followups.jsonl"
         line = json.dumps(turn.model_dump(), ensure_ascii=False)
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
         except OSError as exc:
@@ -154,8 +202,13 @@ class PendingWriter:
         return _walk(data)
 
     def _write_json(self, path: Path, data: dict) -> None:
-        """Write *data* as pretty-printed JSON to *path*, handling errors."""
+        """Write *data* as pretty-printed JSON to *path*, handling errors.
+
+        Parent directories are created automatically (supports the partitioned
+        layout where records live under ``{exchange}/{symbol}/{timeframe}/``).
+        """
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             text = json.dumps(data, ensure_ascii=False, indent=2)
             path.write_text(text, encoding="utf-8")
         except OSError as exc:

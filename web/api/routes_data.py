@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from pa_agent.data.base import KlineBar, KlineFrame
+from pa_agent.data.bar_close_wait import seconds_until_bar_closes
 from pa_agent.data.factory import (
     DATA_SOURCE_CHOICES,
     create_data_source,
@@ -22,9 +24,12 @@ router = APIRouter(tags=["data"])
 
 
 class SubscribeRequest(BaseModel):
+    # Defaults are intentionally empty — the frontend must send the actual
+    # values from the current settings (don't hardcode XAUUSD here, otherwise
+    # switching to crypto would silently fall back to gold).
     kind: str = "tradingview"
-    symbol: str = "XAUUSD"
-    timeframe: str = "15m"
+    symbol: str = ""
+    timeframe: str = ""
     exchange: str = ""
 
 
@@ -33,6 +38,63 @@ async def list_datasources():
     return [
         {"id": k, "label": v} for k, v in DATA_SOURCE_CHOICES
     ]
+
+
+@router.get("/tv/exchanges")
+async def list_tv_exchanges(request: Request):
+    """List TradingView exchange ids (curated preset).
+
+    Returns ``[{"id": "GATEIO", "label": "Gate.io"}, ...]``.
+    Empty id maps to label "自动（探测）".
+    """
+    from pa_agent.data.tradingview import TV_EXCHANGE_PRESETS
+
+    label_map = {
+        "GATEIO": "Gate.io",
+        "BINANCE": "Binance",
+        "BYBIT": "Bybit",
+        "OKX": "OKX",
+        "BITSTAMP": "Bitstamp",
+        "COINBASE": "Coinbase",
+        "OANDA": "OANDA",
+        "PEPPERSTONE": "Pepperstone",
+        "FOREXCOM": "FOREX.com",
+        "TVC": "TVC（TradingView 自有）",
+        "CAPITALCOM": "Capital.com",
+        "SSE": "上交所",
+        "SZSE": "深交所",
+        "HKEX": "港交所",
+        "SP": "S&P",
+        "NYSE": "纽交所",
+        "NASDAQ": "纳斯达克",
+        "CBOT": "CBOT",
+        "CME_MINI": "CME Mini",
+        "": "自动（探测）",
+    }
+    return [
+        {"id": e, "label": label_map.get(e, e)} for e in TV_EXCHANGE_PRESETS
+    ]
+
+
+@router.get("/tv/symbols")
+async def list_tv_symbols(request: Request, exchange: str = ""):
+    """List curated symbols for a TradingView *exchange*.
+
+    Frontend should still allow free-text input — TradingView has no public
+    "list all symbols" API, so this endpoint returns a curated preset.
+    """
+    ctx = request.app.state.ctx
+    ds = ctx.data_source
+    # Prefer the data source's list_symbols(exchange) if available (TradingView)
+    if hasattr(ds, "list_symbols"):
+        try:
+            syms = ds.list_symbols(exchange)
+        except TypeError:
+            # Older data sources have list_symbols() without args
+            syms = ds.list_symbols()
+    else:
+        syms = []
+    return {"exchange": exchange, "symbols": syms}
 
 
 @router.get("/timeframes")
@@ -55,6 +117,15 @@ async def subscribe(req: SubscribeRequest, request: Request):
         getattr(ctx.settings.general, "last_data_source", "mt5")
     )
 
+    # Fall back to current settings when the request omits a field.  This
+    # keeps the endpoint safe when the frontend only wants to switch one
+    # dimension (e.g. just the exchange).
+    symbol = req.symbol or ctx.settings.general.last_symbol
+    timeframe = req.timeframe or ctx.settings.general.last_timeframe
+    exchange = req.exchange
+    if kind == "tradingview" and not exchange:
+        exchange = getattr(ctx.settings.general, "last_tradingview_exchange", "")
+
     if kind != old_kind:
         try:
             ctx.data_source.disconnect()
@@ -65,16 +136,16 @@ async def subscribe(req: SubscribeRequest, request: Request):
     try:
         ctx.data_source.connect()
         if kind == "tradingview" and hasattr(ctx.data_source, "set_exchange"):
-            ctx.data_source.set_exchange(req.exchange)
-        ctx.data_source.subscribe(req.symbol, req.timeframe)
+            ctx.data_source.set_exchange(exchange)
+        ctx.data_source.subscribe(symbol, timeframe)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
     ctx.settings.general.last_data_source = kind
-    ctx.settings.general.last_symbol = req.symbol
-    ctx.settings.general.last_timeframe = req.timeframe
+    ctx.settings.general.last_symbol = symbol
+    ctx.settings.general.last_timeframe = timeframe
     if kind == "tradingview":
-        ctx.settings.general.last_tradingview_exchange = req.exchange
+        ctx.settings.general.last_tradingview_exchange = exchange
 
     from pa_agent.config.paths import SETTINGS_JSON_PATH
     from pa_agent.config.settings import save_settings
@@ -83,9 +154,9 @@ async def subscribe(req: SubscribeRequest, request: Request):
     return {
         "status": "subscribed",
         "kind": kind,
-        "symbol": req.symbol,
-        "timeframe": req.timeframe,
-        "exchange": req.exchange,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "exchange": exchange,
     }
 
 
@@ -110,4 +181,58 @@ async def get_bars(request: Request, count: int = 100):
         "symbol": ctx.settings.general.last_symbol,
         "timeframe": ctx.settings.general.last_timeframe,
         "bars": bars,
+    }
+
+
+@router.get("/bars/next-close")
+async def get_next_close(
+    request: Request,
+    symbol: str = "",
+    timeframe: str = "",
+    exchange: str = "",
+):
+    """Return the next bar close timestamp and seconds remaining.
+
+    Used by the frontend「等待收盘」countdown to know when the currently
+    forming bar will close. Computes ``next_close_ts`` (= forming bar's
+    ``ts_open`` + duration) and ``seconds_remaining`` via
+    :func:`pa_agent.data.bar_close_wait.seconds_until_bar_closes`.
+
+    Falls back to current settings when parameters are omitted. Returns
+    ``seconds_remaining=None`` when the timeframe is unknown or no
+    forming bar exists.
+    """
+    ctx = request.app.state.ctx
+    tf = timeframe or getattr(ctx.settings.general, "last_timeframe", "") or ""
+    # symbol / exchange are accepted for symmetry with /api/subscribe but
+    # are not strictly required — we read the forming bar from the
+    # current data source regardless.
+    bars_raw = ctx.data_source.latest_snapshot(2)
+    if not bars_raw:
+        return {
+            "symbol": symbol or getattr(ctx.settings.general, "last_symbol", ""),
+            "timeframe": tf,
+            "next_close_ts": None,
+            "seconds_remaining": None,
+        }
+    forming = bars_raw[0]
+    ts_open_ms = int(getattr(forming, "ts_open", 0))
+    if ts_open_ms <= 0:
+        return {
+            "symbol": symbol or getattr(ctx.settings.general, "last_symbol", ""),
+            "timeframe": tf,
+            "next_close_ts": None,
+            "seconds_remaining": None,
+        }
+    seconds_remaining = seconds_until_bar_closes(ts_open_ms, tf)
+    # next_close_ts = ts_open + duration (ms)
+    from pa_agent.data.bar_close_wait import timeframe_to_seconds
+
+    duration_s = timeframe_to_seconds(tf)
+    next_close_ts = (ts_open_ms + duration_s * 1000) if duration_s else None
+    return {
+        "symbol": symbol or getattr(ctx.settings.general, "last_symbol", ""),
+        "timeframe": tf,
+        "next_close_ts": next_close_ts,
+        "seconds_remaining": seconds_remaining,
     }

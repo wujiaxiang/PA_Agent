@@ -18,9 +18,11 @@ class RecordMeta(BaseModel):
     timestamp_local_ms: int   # Local time in milliseconds
     symbol: str
     timeframe: str
+    exchange: str = ""        # TradingView exchange (e.g. GATEIO); empty for legacy records
     bar_count: int
     ai_provider: dict         # Sanitized provider config snapshot (no plaintext API key)
     decision_stance: str = "conservative"  # conservative | balanced | aggressive | extreme_aggressive
+    last_close_bar_iso: str = ""  # Local ISO string of the last closed kline; "" for legacy records
 
 
 class AnalysisRecord(BaseModel):

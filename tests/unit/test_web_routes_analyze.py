@@ -50,16 +50,33 @@ def _make_fake_record() -> MagicMock:
     record = MagicMock()
     record.meta.symbol = "XAUUSD"
     record.meta.timeframe = "1h"
+    record.meta.last_close_bar_iso = ""
+    record.stage1_messages = [
+        {"role": "system", "content": "You are a stage1 diagnosis assistant."},
+        {"role": "user", "content": "Analyze the latest 100 bars."},
+    ]
+    record.stage1_response = {
+        "id": "resp-1",
+        "content": "stage1 diagnosis JSON",
+        "reasoning_content": "stage1 thinking step-by-step",
+    }
     record.stage1_diagnosis = {
         "gate_trace": [{"node_id": "G1", "answer": "是"}],
         "gate_result": "proceed",
     }
+    record.stage2_messages = [
+        {"role": "system", "content": "You are a stage2 decision assistant."},
+        {"role": "user", "content": "Make a trading decision."},
+    ]
     record.stage2_response = {
+        "id": "resp-2",
+        "content": "stage2 decision JSON",
+        "reasoning_content": "stage2 thinking step-by-step",
+    }
+    record.stage2_decision = {
         "decision_trace": [{"node_id": "10.3", "answer": "是"}],
         "terminal": {"node_id": "11.2", "outcome": "trade"},
         "gate_shortcircuited": False,
-    }
-    record.stage2_decision = {
         "order_type": "突破单",
         "order_direction": "做多",
         "chart_overlay_active": True,
@@ -69,6 +86,11 @@ def _make_fake_record() -> MagicMock:
         "take_profit_price_2": 2090.0,
     }
     record.strategy_files_used = ["上涨通道分析识别.txt"]
+    record.experience_loaded = [
+        {"filename": "success_2024_01_01.json", "case_type": "success"},
+        {"filename": "failure_2024_01_02.json", "case_type": "failure"},
+        {"filename": "success_2024_01_03.json", "case_type": "success"},
+    ]
     record.usage_total = {"total_tokens": 150}
     record.exception = None
     return record
@@ -162,6 +184,111 @@ def test_analyze_stream_emits_orchestrator_events_and_done():
     assert ov["stop_loss_price"] == 1995.0
     assert ov["take_profit_price"] == 2050.0
     assert ov["take_profit_price_2"] == 2090.0
+
+    # raw_debug_payload：包含 stage1/stage2 prompt + raw_response + validation + exception
+    rdp = rec["raw_debug_payload"]
+    assert rdp["stage1_system_prompt"] == "You are a stage1 diagnosis assistant."
+    assert rdp["stage1_user_prompt"] == "Analyze the latest 100 bars."
+    assert rdp["stage1_raw_response"]["reasoning_content"] == "stage1 thinking step-by-step"
+    assert rdp["stage2_system_prompt"] == "You are a stage2 decision assistant."
+    assert rdp["stage2_user_prompt"] == "Make a trading decision."
+    assert rdp["stage2_raw_response"]["reasoning_content"] == "stage2 thinking step-by-step"
+    val = rdp["validation"]
+    assert val["stage1_valid"] is True
+    assert val["stage2_valid"] is True
+    assert val["stage1_missing_fields"] == []
+    assert val["stage2_missing_fields"] == []
+    assert val["stage1_invalid_fields"] == []
+    assert val["stage2_invalid_fields"] == []
+    assert rdp["exception"] is None
+
+    # debug_files_payload：包含 stage1_files / stage2_files / experience_loaded / experience_count
+    dfp = rec["debug_files_payload"]
+    assert isinstance(dfp["stage1_files"], list)
+    assert isinstance(dfp["stage2_files"], list)
+    # 「上涨通道分析识别.txt」不属于 stage1 静态文件 → 归入 stage2
+    assert "上涨通道分析识别.txt" in dfp["stage2_files"]
+    assert dfp["experience_loaded"] == [
+        "success_2024_01_01.json",
+        "failure_2024_01_02.json",
+        "success_2024_01_03.json",
+    ]
+    assert dfp["experience_count"] == {"success": 2, "failure": 1}
+
+
+def test_analyze_stream_raw_debug_payload_with_exception():
+    """exception 含 missing/invalid_fields 时，raw_debug_payload.validation 应反映出来。"""
+    app = _make_app()
+    record = _make_fake_record()
+    # 模拟阶段一异常：exception 含 stage + missing_fields + invalid_fields
+    record.exception = {
+        "category": "d",
+        "stage": "阶段一-诊断",
+        "missing_fields": ["direction"],
+        "invalid_fields": ["cycle_position"],
+        "raw_text": "...",
+    }
+    # 同时把 stage1_diagnosis 置为 None（验证 valid=false）
+    record.stage1_diagnosis = None
+
+    def fake_submit(frame, cancel_token=None, on_event=None, **kwargs):
+        return record
+
+    fake_orch = MagicMock()
+    fake_orch.submit.side_effect = fake_submit
+
+    with patch("web.api.routes_analyze.TwoStageOrchestrator", return_value=fake_orch), \
+         patch("web.api.routes_analyze.build_display_frame", return_value=MagicMock()):
+        with TestClient(app) as c:
+            resp = c.get("/api/analyze/stream?bar_count=5")
+
+    events = _parse_sse(resp.text)
+    done_data = next(d for e, d in events if e == "done")
+    rdp = done_data["record"]["raw_debug_payload"]
+    val = rdp["validation"]
+    assert val["stage1_valid"] is False
+    assert val["stage1_missing_fields"] == ["direction"]
+    assert val["stage1_invalid_fields"] == ["cycle_position"]
+    # 阶段二不受影响
+    assert val["stage2_valid"] is True
+    assert val["stage2_missing_fields"] == []
+    assert rdp["exception"]["category"] == "d"
+
+
+def test_analyze_stream_raw_debug_payload_api_key_sanitized():
+    """api_key 出现在 stage1_user_prompt 中时，应被脱敏为 mask_secret 形式。"""
+    app = _make_app()
+    record = _make_fake_record()
+    secret = "sk-test-1234567890abcdef"
+    # 在 prompt 中嵌入 api_key，验证 _sanitize 递归替换
+    record.stage1_messages = [
+        {"role": "system", "content": f"auth token: {secret}"},
+        {"role": "user", "content": "Analyze bars"},
+    ]
+
+    def fake_submit(frame, cancel_token=None, on_event=None, **kwargs):
+        return record
+
+    fake_orch = MagicMock()
+    fake_orch.submit.side_effect = fake_submit
+
+    with patch("web.api.routes_analyze.TwoStageOrchestrator", return_value=fake_orch), \
+         patch("web.api.routes_analyze.build_display_frame", return_value=MagicMock()):
+        with TestClient(app) as c:
+            # 在 app startup 完成后修改 ctx.settings.provider.api_key
+            c.app.state.ctx.settings.provider.api_key = secret
+            resp = c.get("/api/analyze/stream?bar_count=5")
+
+    events = _parse_sse(resp.text)
+    done_data = next(d for e, d in events if e == "done")
+    rdp = done_data["record"]["raw_debug_payload"]
+    # api_key 应被替换为 mask_secret 形式：保留最后 4 字符，其余替换为 '*'
+    # 原 prompt 为 "auth token: sk-test-1234567890abcdef"
+    assert secret not in rdp["stage1_system_prompt"]
+    # mask_secret 保留最后 4 字符
+    assert rdp["stage1_system_prompt"].endswith("cdef")
+    # mask_secret 把中间字符替换为 '*'，所以应至少出现 4 个连续 '*'
+    assert "****" in rdp["stage1_system_prompt"]
 
 
 def test_analyze_stream_includes_insufficient_data_event():

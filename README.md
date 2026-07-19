@@ -10,9 +10,11 @@
 
 - 🌐 **新增 Web 后端**（[web/server.py](web/server.py)）：FastAPI + SSE，支持云端 / 无 GUI 环境运行，前端 100% 走后端代理
 - 🔧 **`.env` 环境变量系统**：三层覆盖优先级（shell env > `.env` > `config/settings.json`），启动即可用，无需前端录入配置
-- 🩺 **启动健康检查**：服务启动自动验证模型 API 与 TradingView 账号连通性，不通即明确报错
-- 🎭 **Mock 数据源**：云端沙箱无可用金融数据源时（TV/yfinance/akshare 被防火墙拦截），用模拟 K 线让前后端流程跑通
+- 🩺 **启动健康检查 + 运行时心跳**：服务启动自动验证模型 API 与 TradingView 账号连通性；后台每 5 分钟 ping 模型 API，`/api/health` 返回 `ok`/`degraded`/`error` 状态
+- 🪙 **加密货币数据源**：TradingView 直连 Gate.io 交易所，匿名模式即可拉取 BTCUSDT/ETHUSDT 等现货 K 线（无需 API key）
 - 🛡️ **SSE 稳定性修复**：分析路由强制 clamp `bar_count`，异常必推 error 事件，避免 `ERR_INCOMPLETE_CHUNKED_ENCODING`
+- 🔍 **结构化日志 + trace_id**：JSONL 格式日志，每条带 `trace_id`，响应头回传 `X-Trace-Id` 便于链路追踪
+- 📋 **DataSource 契约校验**：`latest_snapshot(n)` 必须返回 n+1 根（1 forming + n closed），基类 `_validate_snapshot()` 强制校验
 
 详细改动见 [CHANGELOG](#与上游的同步策略)。
 
@@ -20,9 +22,9 @@
 
 ## 功能概览
 
-面向主观交易者的 **价格行为（Price Action）** AI 辅助决策工具。从 **MT5 / TradingView / yfinance / AkShare** 读取 K 线，将结构化 K 线数据与预计算特征送入大模型做**两阶段分析**（市场诊断 → 交易决策），**不连接券商、不执行下单**。
+面向主观交易者的 **价格行为（Price Action）** AI 辅助决策工具。从 **MT5 / TradingView / yfinance / AkShare** 读取 K 线（TradingView 含 Gate.io 等加密交易所），将结构化 K 线数据与预计算特征送入大模型做**两阶段分析**（市场诊断 → 交易决策），**不连接券商、不执行下单**。
 
-- 📈 多数据源：MT5 / TradingView / yfinance / AkShare / Mock
+- 📈 多数据源：MT5 / TradingView（含 Gate.io 加密货币）/ yfinance / AkShare
 - 🧠 两阶段 AI 分析：市场诊断 → 策略路由 → 交易决策（限价/突破/市价或不下单）
 - 🔄 增量分析与持续跟踪；决策树可视化；未来走势预期；分析后自由追问
 - 📝 完整落盘：Prompt、原始响应、诊断/决策 JSON、Token 用量、追问记录
@@ -106,13 +108,14 @@ curl http://localhost:8000/api/settings
 
 - 模板见 [`.env.example`](.env.example)，复制为 `.env` 后填值即可。
 - 解析逻辑：[pa_agent/config/env_loader.py](pa_agent/config/env_loader.py)（轻量实现，不依赖 python-dotenv）
-- 覆盖应用：[pa_agent/config/settings.py](pa_agent/config/settings.py) 的 `Settings._apply_env_overrides`（`model_validator(mode="after")`）
+- 覆盖应用：[pa_agent/app_context.py](pa_agent/app_context.py) 的 `bootstrap()` 在 `load_settings()` 之后调用 `apply_env_overrides(settings)`，把 env 值合并进已加载的 Settings 对象
 
-### 启动健康检查
+### 启动健康检查 + 运行时心跳
 
-服务启动时会自动验证模型 API 与 TradingView 账号连通性，结果写入 `app.state.health_report` 并打印日志：
+服务启动时启动后台心跳任务（每 5 分钟跑一次完整检查），结果缓存到 `app.state.last_health_report`：
 
-- `GET /api/health/check`：返回结构化诊断（支持 `?recheck=1` 重新检查）
+- `GET /api/health`：返回缓存状态（`starting`/`ok`/`degraded`/`error`），轻量探针，不触发真实检查
+- `GET /api/health/check`：同步执行完整检查（模型 API ping + 数据源 `latest_snapshot(2)`），返回各项详情与延迟
 - 智能降级：当前数据源不是 `tradingview` 时，TV 失败降级为 `warning`，不阻塞启动
 - 代码：[pa_agent/util/startup_health_check.py](pa_agent/util/startup_health_check.py)
 - **坑**：健康检查拼接 URL 时会智能识别 `base_url` 是否已带 `/v1`，避免 `/v1/v1/` 重复
@@ -121,12 +124,12 @@ curl http://localhost:8000/api/settings
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/health` | 存活探针 |
-| GET | `/api/health/check` | 启动健康检查（模型+TV），支持 `?recheck=1` |
+| GET | `/api/health` | 存活探针（返回缓存状态） |
+| GET | `/api/health/check` | 完整健康检查（模型 API + 数据源），同步执行 |
 | GET | `/api/settings` / PUT `/api/settings` | 读取/合并保存配置（API Key 自动脱敏） |
 | GET | `/api/datasources` | 列出可选数据源 |
 | GET | `/api/timeframes` | 当前数据源支持的周期 |
-| POST | `/api/subscribe` | 切换品种/周期/数据源 |
+| POST | `/api/subscribe` | 切换品种/周期/数据源（TradingView 可带 `exchange` 字段，如 `GATEIO`） |
 | GET | `/api/bars?count=N` | 拉取最新 N 根 K 线（前端图表用） |
 | GET | `/api/analyze/stream?bar_count=N` | **SSE 两阶段分析**（见下方注意） |
 
@@ -134,11 +137,10 @@ curl http://localhost:8000/api/settings
 
 ### 数据源系统
 
-抽象基类 [pa_agent/data/base.py](pa_agent/data/base.py)（`DataSource` + `KlineBar` dataclass），工厂在 [pa_agent/data/factory.py](pa_agent/data/factory.py)。支持：
+抽象基类 [pa_agent/data/base.py](pa_agent/data/base.py)（`DataSource` + `KlineBar` dataclass），工厂在 [pa_agent/data/factory.py](pa_agent/data/factory.py)。UI 可选（`DATA_SOURCE_CHOICES`）：`mt5` / `tradingview`；仅代码支持：`yfinance` / `akshare` / `eastmoney` / `tushare`。
 
-- `mt5`（Windows）、`tradingview`、`yfinance`、`akshare`、`eastmoney`、`tushare`、**`mock`**
-- **`mock`**（[pa_agent/data/mock_source.py](pa_agent/data/mock_source.py)）：生成带趋势+噪声的模拟 K 线，**无网络依赖**。云端沙箱无法访问 TV/yfinance/akshare 时用它让前后端流程跑通调试。
-- 关键约束：`latest_snapshot(n)` 必须返回 **n+1 根**（含 1 根 forming bar），否则 `build_analysis_frame` 丢掉 forming 后不足 n 根 closed 会返回 `None`。
+- **TradingView 加密货币**：`last_data_source=tradingview` + `last_tradingview_exchange=GATEIO` + `last_symbol=BTCUSDT` 即可，匿名模式无需 API key。支持的加密交易所在 [pa_agent/data/market_defaults.py](pa_agent/data/market_defaults.py) 的 `TV_CRYPTO_EXCHANGES` 定义。
+- **关键约束**：`latest_snapshot(n)` 必须返回 **n+1 根**（1 forming + n closed），由基类 `_validate_snapshot()` 强制校验，不满足抛 `ValueError`。
 
 ### AI 两阶段分析流程
 
@@ -173,17 +175,17 @@ make lint / make test / make run
 
 1. **`ERR_INCOMPLETE_CHUNKED_ENCODING`（SSE 被截断）**
    - 根因 A：`_run_analysis` 的 `build_display_frame` 调用在 try 块外，异常逃出线程池，event_queue 永远收不到 done/error → 已把整个函数体包进 try/except，保证推 error 事件。
-   - 根因 B：`bar_count=100` 分析耗时过长，超过 TRAE 预览网关 SSE 超时 → 路由已强制 clamp 前端传值到 `settings.general.analysis_bar_count` 上限（默认 20）。
+   - 根因 B：`bar_count=100` 分析耗时过长，超过 TRAE 预览网关 SSE 超时 → 路由已强制 clamp 前端传值到 `settings.general.analysis_bar_count` 上限。
 
 2. **`build_display_frame()` TypeError**：`now_ms` 是 keyword-only 参数，必须 `now_ms=now_ms` 传，不能当位置参数。
 
 3. **OpenRouter 返回 404 HTML**：`.env` 的 `base_url` 必须带 `/v1`（如 `https://openrouter.ai/api/v1`），SDK 内部自动拼 `/chat/completions`。
 
-4. **`400 output tokens too large`**：`_PRACTICAL_UNLIMITED_MAX_TOKENS` 原值 524288 会让 free 模型直接 400，已降到 32768。
+4. **`400 output tokens too large`**：`_PRACTICAL_UNLIMITED_MAX_TOKENS` 原值 524288 会让 free 模型直接 400，已降到 32768；可通过 `provider.max_output_tokens` 覆盖。
 
-5. **云端网络限制**：TRAE 远程沙箱出站防火墙拦截 `tradingview.com:443`，yfinance/akshare/binance 也被限流。调试数据源问题请用 `mock`。
+5. **`check_model_api` TypeError**：`stream_chat()` 返回 `AIReply` 不可迭代，健康检查必须用 `client.chat()` 直接调用。
 
-6. **MockSource 返回 None**：见上方"数据源系统"的 n+1 约束。
+6. **TradingView 加密品种**：`normalize_gold_symbol_for_kind` 旧逻辑会把 `BTCUSDT` 这种 crypto symbol 强制改回 `XAUUSD`，已修复为识别 crypto 时保持原样。
 
 ### 目录结构速查
 
@@ -191,7 +193,7 @@ make lint / make test / make run
 pa_agent/
 ├── main.py / app_context.py     入口与依赖装配
 ├── config/    settings.py / env_loader.py / paths.py
-├── data/      数据源（mt5/tradingview/yfinance/akshare/mock/factory/snapshot）
+├── data/      数据源（mt5/tradingview/yfinance/akshare/eastmoney/tushare/factory/snapshot）
 ├── ai/        deepseek_client / prompt_assembler / router / json_validator / 校验
 ├── orchestrator/  two_stage.py 两阶段编排
 ├── gui/       PyQt6 桌面端（云端不使用）
@@ -246,9 +248,9 @@ git push origin main
   - `.env` / `.env.example`（环境变量系统）
   - `pa_agent/config/env_loader.py`（轻量 .env 解析器）
   - `pa_agent/util/startup_health_check.py`（启动健康检查）
-  - `pa_agent/data/mock_source.py`（Mock 数据源）
+  - `.github/workflows/sync-upstream.yml`（上游同步自动化）
 - **核心层以上游为准**：`pa_agent/ai/`、`pa_agent/orchestrator/`、`prompt_engineering/`、`pa_agent/data/base.py` 等跟随上游更新，本仓库只做最小必要补丁。
-- **冲突高发点**：`pa_agent/data/factory.py`（新增了 mock 注册）、`pa_agent/config/settings.py`（新增了 `_apply_env_overrides`）、`web/api/routes_analyze.py`（bar_count clamp）。
+- **冲突高发点**：`pa_agent/data/factory.py`（新增了 env_loader 集成）、`pa_agent/data/market_defaults.py`（Gate.io 加密交易所列表）、`pa_agent/config/settings.py`（新增了 `max_output_tokens` 字段）、`pa_agent/data/tradingview.py`（WebSocket headers monkey-patch + n+1 契约修复）。
 - **推荐用 PR 而非直接 merge 到 main**：重大上游更新可先建分支 `sync/upstream-YYYYMMDD`，提 PR review 后再合并，避免直接污染 main。
 
 ### 也可用 GitHub 官方同步
