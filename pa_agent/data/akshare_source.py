@@ -128,7 +128,7 @@ def _row_time_to_ts_ms(value: Any) -> int:
     text = str(value).strip()
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
-            dt = datetime.strptime(text[: len(fmt)], fmt).replace(tzinfo=_CN_TZ)
+            dt = datetime.strptime(text, fmt).replace(tzinfo=_CN_TZ)
             return int(dt.timestamp() * 1000)
         except ValueError:
             continue

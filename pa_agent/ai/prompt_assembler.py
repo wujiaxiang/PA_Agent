@@ -37,10 +37,11 @@ _KLINE_INDICATOR_NOTE = (
 _LANGUAGE_ZH_RULE = """
 ## 语言要求（阶段一、阶段二均必须遵守）
 
-- **思考过程**：扩展思考、内部推理、以及写入 JSON 的 `reason`、`diagnosis_confidence_reasoning`、`trade_confidence_reasoning`、`estimated_win_rate_reasoning` 等说明，**全程使用简体中文**。禁止用英文写推理段落或中英混杂的长句（常见缩写如 HH、HL、Spike、TR 可保留）。
-- **最终输出**：阶段一诊断 JSON、阶段二决策 JSON 中所有面向用户的字符串（含 `reasoning`、`key_factors`、`risk_assessment`、`watch_points`、`gate_trace`/`decision_trace` 的 `question` 与 `reason` 等）**一律使用简体中文**。
-- **仅允许英文或固定英文枚举**：JSON 字段名（schema 键名）、规定的枚举取值（如 `proceed`、`wait`、`bullish`、`bearish`）、策略文件名、K 线序号格式（如 `K1`、`K42-K1`）。
-- **价格行为术语**：思考与 JSON 说明中优先使用下列简体中文 PA 术语（见下节），避免自造词或仅用英文描述。
+- **通俗易懂（最重要）**：`reasoning`、`diagnosis_summary`、`next_bar_prediction.reasoning`、`next_cycle_prediction.reasoning`、`key_factors`、`risk_assessment`、`watch_points`、`decision_trace` 的 `question` 与 `reason` 等**面向用户的解释文本，必须通俗易懂**。像给刚入门的新手讲解一样，用日常语言描述市场发生了什么、为什么这样判断、接下来可能怎样。避免堆砌专业术语；用到专业概念时用一句话解释清楚。例如不要写"H2 顺势回撤信号确认"，而写"价格第二次回调后继续上涨，说明多头仍然主导"。
+- **思考过程**：扩展思考、内部推理、以及写入 JSON 的 `reason`、`diagnosis_confidence_reasoning`、`trade_confidence_reasoning`、`estimated_win_rate_reasoning` 等说明，**全程使用简体中文**。禁止用英文写推理段落或中英混杂的长句。
+- **最终输出**：阶段一诊断 JSON、阶段二决策 JSON 中所有面向用户的字符串**一律使用简体中文**，不得出现英文单词。
+- **仅允许英文**：JSON 字段名（schema 键名）、规定的枚举取值（如 `proceed`、`wait`、`bullish`、`bearish`）、K 线序号格式（如 `K1`、`K42-K1`）。**除此之外不得使用任何英文**。
+- **价格行为术语**：优先使用下列简体中文 PA 术语；英文缩写须附带中文解释（如"H2（第二次顺势回调）"），**不得单独使用英文缩写**。
 """.strip()
 
 _PA_TERMINOLOGY_ZH = """
@@ -64,7 +65,7 @@ _PA_TERMINOLOGY_ZH = """
 | 被套 | 突破方向上的交易者被迫止损离场 |
 | 磁力位 | 失败信号棒/入场棒极点吸引价格回测 |
 
-英文缩写（可保留）：SB/EB、OB/IB、H1/H2、L1/L2、MTR、AIL/AIS、20GB。
+英文缩写须加中文解释（不可单独使用英文）：SB/EB→信号棒/入场棒、OB/IB→外包棒/内包棒、H1/H2→第一次/第二次顺势回调、L1/L2→第一次/第二次逆势回调、MTR→主要趋势反转、AIL/AIS→持续看多/持续看空、20GB→约20根K线未触及均线、TR→交易区间、MM→测量移动（等距目标位）、SPS→尖峰顺势突破、SCS→尖峰连续尖峰。
 """.strip()
 
 _STAGE2_API_TASK_RULE = """
