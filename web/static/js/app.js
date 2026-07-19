@@ -1095,8 +1095,10 @@ function startSSEBarsStream() {
         if (sseFallbackPolling) {
           sseFallbackPolling = false;
           stopLiveRefresh();
-          startSSEStatusExpiryTimer();
         }
+        // 启动每秒更新状态栏（含 elapsed/remaining）
+        // 注意：必须在收到 bar_close 后启动，而非 onopen，否则 sseNextCloseTs 还没更新
+        startSSEStatusExpiryTimer();
         // SSE 活跃时由 updateSSEStatusWithExpiry 接管文案（含 elapsed/remaining）
         updateSSEStatusWithExpiry();
         // 持续跟踪：K 线收盘后自动触发新一轮分析（分析期间不重复触发）
@@ -1142,8 +1144,10 @@ function startSSEBarsStream() {
         if (sseFallbackPolling) {
           sseFallbackPolling = false;
           stopLiveRefresh();
-          startSSEStatusExpiryTimer();
         }
+        // 启动每秒更新状态栏（含 elapsed/remaining）
+        // 注意：必须在收到 bar_update 后启动，而非 onopen，否则 sseNextCloseTs 还没更新
+        startSSEStatusExpiryTimer();
         updateSSEStatusWithExpiry();
       } catch (err) {
         console.error('bar_update event error:', err);
@@ -1160,8 +1164,11 @@ function startSSEBarsStream() {
 
     sseBarsStream.onopen = () => {
       console.log('SSE bars stream connected');
-      // SSE 连接成功 → 启动每秒更新状态栏（含 elapsed/remaining）
-      sseLastBarUpdateTs = Date.now();
+      // SSE 连接成功 → 启动每秒更新状态栏
+      // 注意：此处不设 sseLastBarUpdateTs 和 sseNextCloseTs
+      //   - sseLastBarUpdateTs: 等收到第一个 bar_update/bar_close 事件再设
+      //   - sseNextCloseTs: 同上，避免残留旧值导致「距下次收盘」显示异常
+      // 启动定时器后状态栏仅显示「● SSE 实时」，等首个事件到达再补 elapsed/remaining
       startSSEStatusExpiryTimer();
       updateSSEStatus('ok');
       if (sseFallbackPolling) {
@@ -1240,6 +1247,22 @@ function stopSSEStatusExpiryTimer() {
   }
 }
 
+// timeframe 字符串 → 秒数（与后端 bar_close_wait.timeframe_to_seconds 对齐）
+// 用于 SSE 状态栏倒计时 sanity check，防止 next_close_ts 过期/竞态时显示异常值
+function timeframeToSeconds(tf) {
+  const t = String(tf || '').trim();
+  if (!t) return 0;
+  const m = t.match(/^(\d+)([mhdw])$/i);
+  if (!m) return 0;
+  const n = parseInt(m[1], 10);
+  const unit = m[2].toLowerCase();
+  if (unit === 'm') return n * 60;
+  if (unit === 'h') return n * 3600;
+  if (unit === 'd') return n * 86400;
+  if (unit === 'w') return n * 7 * 86400;
+  return 0;
+}
+
 // 计算并更新 #live-refresh-status 文案：● SSE 实时 · 距上次刷新 Ns · 距下次收盘 Ms
 // 仅在 SSE 活跃（sseBarsStream 非 null 且非 fallback）时由定时器调用
 function updateSSEStatusWithExpiry() {
@@ -1248,12 +1271,23 @@ function updateSSEStatusWithExpiry() {
   const el = $('#live-refresh-status');
   if (!el) return;
   const elapsed = sseLastBarUpdateTs ? Math.max(0, (Date.now() - sseLastBarUpdateTs) / 1000) : 0;
-  const remaining = sseNextCloseTs > 0
-    ? Math.max(0, (sseNextCloseTs - Date.now()) / 1000)
-    : 0;
-  const closeText = sseNextCloseTs > 0
-    ? ` · 距下次收盘 ${remaining.toFixed(0)}s`
-    : '';
+  // sanity check：remaining 不能超过当前 timeframe 的 duration
+  // 防止 next_close_ts 过期、时区偏移或跨周期残留导致显示异常大的倒计时
+  const tfSecs = timeframeToSeconds(currentSettings?.general?.last_timeframe || '');
+  let remaining = 0;
+  let closeText = '';
+  if (sseNextCloseTs > 0 && tfSecs > 0) {
+    remaining = Math.max(0, (sseNextCloseTs - Date.now()) / 1000);
+    // 若 remaining 超过 1 个 timeframe duration，说明 next_close_ts 已过期或错误，丢弃
+    if (remaining > tfSecs) {
+      console.warn('[SSE] next_close_ts sanity check failed:', {
+        sseNextCloseTs, tfSecs, remaining,
+        now: Date.now()
+      });
+    } else {
+      closeText = ` · 距下次收盘 ${remaining.toFixed(0)}s`;
+    }
+  }
   let text = `● SSE 实时 · 距上次刷新 ${elapsed.toFixed(1)}s${closeText}`;
   // 持续跟踪后缀
   const cbKeep = $('#cb-keep-analysis');
