@@ -7,20 +7,20 @@ name = "pa-agent"
 version = "0.1.0"
 description = "Price Action AI assistant: MT5 kline data, two-stage LLM analysis (AGPL-3.0)"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "AGPL-3.0-or-later" }
 authors = [{ name = "PA Agent Team" }]
 dependencies = [
     "PyQt6>=6.6",
     "pyqtgraph>=0.13",
-    "numpy>=1.26",
-    "pandas>=2.2",
+    "numpy>=1.23,<1.26",
+    "pandas>=2.0,<2.2",
     "openai>=1.40",
     "tiktoken>=0.7",
     "jsonschema>=4.22",
     "pydantic>=2.7",
     "MetaTrader5>=5.0; sys_platform == 'win32'",
-    "tvdatafeed @ git+https://github.com/rongardF/tvdatafeed.git",
+
     "cryptography>=42",
     "pywin32>=306; sys_platform == 'win32'",
     "akshare>=1.14",

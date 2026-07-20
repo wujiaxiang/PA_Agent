@@ -381,6 +381,36 @@ function calculateIndicator(key, bars, params) {
   }
 }
 
+// 同步所有副图时间轴到主图
+function syncAllSubChartsToMain() {
+  const { chart } = _getCtx();
+  if (!chart) return;
+  try {
+    const currentRange = chart.timeScale().getVisibleTimeRange();
+    if (currentRange) {
+      for (const inst of window._indicatorsState.activeIndicators) {
+        if (inst._subChart) {
+          try {
+            inst._subChart.timeScale().setVisibleTimeRange(currentRange);
+          } catch (_) {
+            try {
+              inst._subChart.timeScale().scrollToRealTime();
+            } catch (_) {}
+          }
+        }
+      }
+    } else {
+      for (const inst of window._indicatorsState.activeIndicators) {
+        if (inst._subChart) {
+          try {
+            inst._subChart.timeScale().scrollToRealTime();
+          } catch (_) {}
+        }
+      }
+    }
+  } catch (_) {}
+}
+
 // ── 指标管理 ──────────────────────────────────────────────────────────
 function addIndicator(key, params) {
   const reg = INDICATOR_REGISTRY[key];
@@ -445,22 +475,68 @@ function _createSeriesFor(inst) {
       });
     }
   } else if (reg.type === 'oscillator' && oscContainer) {
-    // 副图：创建独立 chart 实例
-    const subChart = LightweightCharts.createChart(oscContainer, {
+    // 副图：包装为 pane 结构（左上角标签 + 右上角工具条 + subChart canvas）
+    const tickMarkFormatter = window._chartAPI && window._chartAPI.tickMarkFormatter;
+    const fmtLocalTime = window._chartAPI && window._chartAPI.fmtLocalTime;
+
+    // 1. 创建 pane 容器
+    const paneEl = document.createElement('div');
+    paneEl.className = 'pane';
+    paneEl.dataset.indicatorKey = inst.key;
+    paneEl.dataset.indicatorId = String(inst.id);
+
+    // 2. 创建 chart 画布宿主（subChart 挂载点）
+    const chartHost = document.createElement('div');
+    chartHost.className = 'pane-chart';
+    paneEl.appendChild(chartHost);
+
+    // 3. 创建左上角标签
+    const labelEl = document.createElement('div');
+    labelEl.className = 'pane-label';
+    labelEl.textContent = _formatPaneLabel(inst);
+    paneEl.appendChild(labelEl);
+
+    // 4. 创建右上角工具条
+    const toolbarEl = document.createElement('div');
+    toolbarEl.className = 'pane-toolbar';
+    toolbarEl.innerHTML =
+      '<button class="pane-tb-btn" data-action="collapse" title="折叠/展开">_</button>' +
+      '<button class="pane-tb-btn" data-action="hide" title="隐藏">👁</button>' +
+      '<button class="pane-tb-btn" data-action="delete" title="删除">✕</button>';
+    _bindPaneToolbar(toolbarEl, inst);
+    paneEl.appendChild(toolbarEl);
+
+    // 5. 创建 subChart（统一价格轴宽度 60px，副图不显示时间轴）
+    const paneWidth = oscContainer.clientWidth || (oscContainer.parentElement ? oscContainer.parentElement.clientWidth : 600);
+    const subChart = LightweightCharts.createChart(chartHost, {
       layout: {
         background: { type: 'solid', color: '#131722' },
         textColor: '#d1d4dc',
         fontSize: 10,
+        fontFamily: '"PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", "Noto Sans CJK SC", sans-serif',
+        locale: 'zh-CN',
       },
       grid: {
         vertLines: { color: '#1e222d' },
         horzLines: { color: '#1e222d' },
       },
-      rightPriceScale: { borderColor: '#363c4e' },
-      timeScale: { borderColor: '#363c4e', timeVisible: true, secondsVisible: false },
-      width: oscContainer.clientWidth,
+      rightPriceScale: { borderColor: '#363c4e', width: 60 },
+      timeScale: {
+        borderColor: '#363c4e',
+        visible: false,        // 副图不显示时间轴（仅主图显示共享时间轴）
+        timeVisible: false,
+        secondsVisible: false,
+        tickMarkFormatter: tickMarkFormatter,
+        rightOffset: 4,
+      },
+      localization: {
+        timeFormatter: fmtLocalTime,
+      },
+      crosshair: { mode: 0 },
+      width: paneWidth,
       height: reg.height || 120,
     });
+
     // 添加水平参考线
     if (reg.levels) {
       for (const lv of reg.levels) {
@@ -472,9 +548,13 @@ function _createSeriesFor(inst) {
           lastValueVisible: false,
           crosshairMarkerVisible: false,
         }).setData([]);
-        // 用 priceLine 画水平线（更好的方式：直接对主 series 设 priceLines）
       }
     }
+
+    inst._paneEl = paneEl;
+    inst._paneChartHost = chartHost;
+    inst._paneLabelEl = labelEl;
+    inst._paneToolbarEl = toolbarEl;
     inst._subChart = subChart;
     inst._series = {};
     for (const out of reg.outputs) {
@@ -495,16 +575,69 @@ function _createSeriesFor(inst) {
       }
     }
     _syncSubChartTimeScale(subChart);
+    // 订阅十字光标联动
+    _subscribePaneCrosshair(inst);
+
+    // 添加到容器
+    oscContainer.appendChild(paneEl);
     _layoutOscillatorPanes();
   }
 }
 
+// 格式化 pane 左上角标签：MACD(12,26,9)、RSI(14)、KDJ(9,3,3) 等
+function _formatPaneLabel(inst) {
+  const reg = INDICATOR_REGISTRY[inst.key];
+  if (!reg) return inst.key;
+  const name = (inst.key || '').toUpperCase();
+  if (!reg.params.length) return name;
+  const vals = reg.params.map(p => inst.params[p.key]);
+  return `${name}(${vals.join(',')})`;
+}
+
+// 绑定 pane 工具条按钮事件
+function _bindPaneToolbar(toolbarEl, inst) {
+  toolbarEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const action = btn.dataset.action;
+    if (action === 'collapse') {
+      // 折叠/展开：切换 .collapsed 类，折叠时 pane 高度缩为 28px
+      const pane = inst._paneEl;
+      if (!pane) return;
+      const collapsed = pane.classList.toggle('collapsed');
+      if (collapsed) {
+        pane.style.height = '28px';
+        try { inst._subChart.applyOptions({ height: 0 }); } catch (_) {}
+      } else {
+        // 恢复保存的高度
+        const h = inst._paneHeight || (INDICATOR_REGISTRY[inst.key] && INDICATOR_REGISTRY[inst.key].height) || 120;
+        pane.style.height = h + 'px';
+        try { inst._subChart.applyOptions({ height: h }); } catch (_) {}
+      }
+      _layoutOscillatorPanes();
+    } else if (action === 'hide') {
+      // 隐藏：调用 toggleIndicatorVisible(false)
+      toggleIndicatorVisible(inst.id, false);
+    } else if (action === 'delete') {
+      // 删除：调用 removeIndicator
+      removeIndicator(inst.id);
+    }
+  });
+}
+
 function _destroySeriesFor(inst) {
-  // 副图：整个 subChart 销毁
+  // 副图：整个 subChart 销毁 + pane 元素移除
   if (inst._subChart) {
     try { inst._subChart.remove(); } catch (_) {}
     inst._subChart = null;
   }
+  if (inst._paneEl && inst._paneEl.parentNode) {
+    inst._paneEl.parentNode.removeChild(inst._paneEl);
+  }
+  inst._paneEl = null;
+  inst._paneChartHost = null;
+  inst._paneLabelEl = null;
+  inst._paneToolbarEl = null;
   // 主图叠加：用 chart.removeSeries(series) — 注意 series.remove() 在 lightweight-charts 不存在
   if (inst._series) {
     const { chart } = _getCtx();
@@ -535,6 +668,10 @@ function _applyVisible(inst) {
     inst._subChart.applyOptions({ visible: inst.visible });
     _layoutOscillatorPanes();
   }
+  // 副图 pane 容器显隐
+  if (inst._paneEl) {
+    inst._paneEl.style.display = inst.visible ? '' : 'none';
+  }
   if (inst._series) {
     for (const k of Object.keys(inst._series)) {
       try { inst._series[k].applyOptions({ visible: inst.visible }); } catch (_) {}
@@ -542,41 +679,342 @@ function _applyVisible(inst) {
   }
 }
 
-// 重新布局副图容器（隐藏的副图不占高度）
+// 重新布局副图容器：管理 pane 顺序、resizer 分隔条、高度分配
+// 主图高度由 flex:1 自动撑满剩余空间，副图 pane 高度由本函数管理
 function _layoutOscillatorPanes() {
   const { oscContainer } = _getCtx();
   if (!oscContainer) return;
   const visibleSubs = window._indicatorsState.activeIndicators.filter(
-    i => i._subChart && i.visible
+    i => i._subChart && i.visible && i._paneEl
   );
   // 容器整体显隐
   oscContainer.style.display = visibleSubs.length > 0 ? 'flex' : 'none';
-  // 调整每个 subChart 高度
+
+  // 1. 清理所有旧的 resizer（保留 pane 元素本身，避免重建 chart 实例）
+  const oldResizers = oscContainer.querySelectorAll(':scope > .pane-resizer');
+  oldResizers.forEach(r => r.remove());
+
+  // 2. 按 activeIndicators 顺序重新 append pane（DOM 节点移动会保留 chart 实例）
   for (const inst of visibleSubs) {
+    if (inst._paneEl.parentNode !== oscContainer) {
+      oscContainer.appendChild(inst._paneEl);
+    } else {
+      // 已在容器内，移到末尾保持顺序
+      oscContainer.appendChild(inst._paneEl);
+    }
+  }
+
+  // 3. 在相邻 pane 之间插入 resizer（4px 高，cursor: row-resize）
+  for (let i = 0; i < visibleSubs.length - 1; i++) {
+    const upper = visibleSubs[i];
+    const lower = visibleSubs[i + 1];
+    const resizer = _createPaneResizer(upper, lower);
+    oscContainer.insertBefore(resizer, lower._paneEl);
+  }
+
+  // 4. 应用高度（从 localStorage 恢复或使用默认值）
+  const savedHeights = _loadPaneHeights();
+  const paneWidth = oscContainer.clientWidth || 0;
+  for (const inst of visibleSubs) {
+    if (inst._paneEl && inst._paneEl.classList.contains('collapsed')) {
+      // 折叠态：高度已由工具条按钮设置，跳过
+      continue;
+    }
     const reg = INDICATOR_REGISTRY[inst.key];
-    const h = reg.height || 120;
+    const defaultH = reg.height || 120;
+    const h = savedHeights[inst.key] || defaultH;
+    inst._paneHeight = h;
+    if (inst._paneEl) inst._paneEl.style.height = h + 'px';
     try {
-      inst._subChart.applyOptions({ height: h });
+      inst._subChart.applyOptions({ height: h, width: paneWidth });
     } catch (_) {}
   }
+
+  // 5. 通知主图重新调整高度（flex:1 会自动撑满剩余空间，但 chart 画布需要显式 resize）
+  //    延迟到下一帧，确保 DOM 高度已生效
+  requestAnimationFrame(() => {
+    if (window._indicatorsState.mainChart) {
+      const mainEl = document.getElementById('chart-main');
+      if (mainEl) {
+        try {
+          window._indicatorsState.mainChart.applyOptions({
+            width: mainEl.clientWidth,
+            height: mainEl.clientHeight,
+          });
+        } catch (_) {}
+      }
+    }
+  });
 }
 
 // 副图与主图时间轴联动
 function _syncSubChartTimeScale(subChart) {
   const { chart } = _getCtx();
   if (!chart) return;
-  // 主图 → 副图
-  chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
-    if (range) subChart.timeScale().setVisibleLogicalRange(range);
-  });
-  // 副图 → 主图（避免循环：先 unsubscribe，设完再 subscribe）
+  // 立即用时间范围同步（主图与副图数据点数量不同，逻辑索引不对齐，必须用时间范围）
+  try {
+    const mainRange = chart.timeScale().getVisibleRange();
+    if (mainRange) {
+      subChart.timeScale().setVisibleRange(mainRange);
+    } else {
+      subChart.timeScale().scrollToRealTime();
+    }
+  } catch (_) {
+    try {
+      subChart.timeScale().scrollToRealTime();
+    } catch (_) {}
+  }
   let syncing = false;
-  subChart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
-    if (syncing || !range) return;
+  // 主图 → 副图：时间范围同步（使用实际时间，不受数据点数量影响）
+  chart.timeScale().subscribeVisibleTimeRangeChange((timeRange) => {
+    if (syncing || !timeRange) return;
     syncing = true;
-    chart.timeScale().setVisibleLogicalRange(range);
+    try {
+      subChart.timeScale().setVisibleRange(timeRange);
+    } catch (_) {
+      try {
+        subChart.timeScale().scrollToRealTime();
+      } catch (_) {}
+    }
     syncing = false;
   });
+  // 副图 → 主图：反向同步
+  subChart.timeScale().subscribeVisibleTimeRangeChange((timeRange) => {
+    if (syncing || !timeRange) return;
+    syncing = true;
+    try {
+      chart.timeScale().setVisibleRange(timeRange);
+    } catch (_) {}
+    syncing = false;
+  });
+}
+
+// ── pane 高度拖拽分隔条 ────────────────────────────────────────────────
+// localStorage key：pa.pane.heights，存 JSON 对象 {indicatorKey: height}
+const PANE_HEIGHTS_STORAGE_KEY = 'pa.pane.heights';
+const PANE_RESIZER_HEIGHT = 4;          // resizer 高度（px）
+const PANE_MIN_HEIGHT = 100;            // 副图最小高度（px）
+const PANE_COLLAPSED_HEIGHT = 28;      // 折叠态高度（px）
+
+function _loadPaneHeights() {
+  try {
+    const raw = localStorage.getItem(PANE_HEIGHTS_STORAGE_KEY);
+    if (!raw) return {};
+    const obj = JSON.parse(raw);
+    return obj && typeof obj === 'object' ? obj : {};
+  } catch (_) { return {}; }
+}
+
+function _savePaneHeights(heightsObj) {
+  try {
+    localStorage.setItem(PANE_HEIGHTS_STORAGE_KEY, JSON.stringify(heightsObj));
+  } catch (_) {}
+}
+
+// 创建 resizer 分隔条，绑定 mousedown 拖拽逻辑
+function _createPaneResizer(upperInst, lowerInst) {
+  const resizer = document.createElement('div');
+  resizer.className = 'pane-resizer';
+  resizer.title = '拖拽调整高度';
+  resizer.dataset.upperId = String(upperInst.id);
+  resizer.dataset.lowerId = String(lowerInst.id);
+
+  let dragging = false;
+  let startY = 0;
+  let upperStartH = 0;
+  let lowerStartH = 0;
+  let heightsAtStart = {};
+
+  resizer.addEventListener('mousedown', (e) => {
+    if (!upperInst._paneEl || !lowerInst._paneEl) return;
+    // 跳过折叠态
+    if (upperInst._paneEl.classList.contains('collapsed') ||
+        lowerInst._paneEl.classList.contains('collapsed')) return;
+    dragging = true;
+    startY = e.clientY;
+    upperStartH = upperInst._paneEl.offsetHeight;
+    lowerStartH = lowerInst._paneEl.offsetHeight;
+    heightsAtStart = _loadPaneHeights();
+    resizer.classList.add('dragging');
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'row-resize';
+    e.preventDefault();
+  });
+
+  const onMove = (e) => {
+    if (!dragging) return;
+    const delta = e.clientY - startY;
+    // 上 pane 高度 = 起始 + delta（最小 100）
+    // 下 pane 高度 = 起始 - delta（最小 100）
+    let newUpper = upperStartH + delta;
+    let newLower = lowerStartH - delta;
+    if (newUpper < PANE_MIN_HEIGHT) {
+      newLower -= (PANE_MIN_HEIGHT - newUpper);
+      newUpper = PANE_MIN_HEIGHT;
+    }
+    if (newLower < PANE_MIN_HEIGHT) {
+      newUpper -= (PANE_MIN_HEIGHT - newLower);
+      newLower = PANE_MIN_HEIGHT;
+    }
+    upperInst._paneEl.style.height = newUpper + 'px';
+    lowerInst._paneEl.style.height = newLower + 'px';
+    upperInst._paneHeight = newUpper;
+    lowerInst._paneHeight = newLower;
+    try { upperInst._subChart.applyOptions({ height: newUpper }); } catch (_) {}
+    try { lowerInst._subChart.applyOptions({ height: newLower }); } catch (_) {}
+    // 主图重新计算高度（flex:1 自动撑满剩余空间，但 chart 画布需 resize）
+    requestAnimationFrame(() => {
+      if (window._indicatorsState.mainChart) {
+        const mainEl = document.getElementById('chart-main');
+        if (mainEl) {
+          try {
+            window._indicatorsState.mainChart.applyOptions({
+              width: mainEl.clientWidth,
+              height: mainEl.clientHeight,
+            });
+          } catch (_) {}
+        }
+      }
+    });
+  };
+
+  const onUp = () => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove('dragging');
+    document.body.style.userSelect = '';
+    document.body.style.cursor = '';
+    // 持久化高度
+    const heights = _loadPaneHeights();
+    if (upperInst._paneHeight) heights[upperInst.key] = upperInst._paneHeight;
+    if (lowerInst._paneHeight) heights[lowerInst.key] = lowerInst._paneHeight;
+    _savePaneHeights(heights);
+  };
+
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+
+  return resizer;
+}
+
+// ── 十字光标联动 ────────────────────────────────────────────────────────
+// syncing flag 防止主图 ↔ 副图互相触发导致循环
+let _crosshairSyncing = false;
+
+// 为主图订阅 crosshair move，同步到所有副图
+function _subscribeMainChartCrosshair() {
+  const { chart } = _getCtx();
+  if (!chart || chart._paCrosshairBound) return;
+  chart._paCrosshairBound = true;
+  chart.subscribeCrosshairMove((param) => {
+    if (_crosshairSyncing) return;
+    _crosshairSyncing = true;
+    try {
+      _syncCrosshairToPanes(param);
+    } finally {
+      _crosshairSyncing = false;
+    }
+  });
+}
+
+// 为副图订阅 crosshair move，反向同步到主图与其他副图
+function _subscribePaneCrosshair(inst) {
+  if (!inst._subChart) return;
+  inst._subChart.subscribeCrosshairMove((param) => {
+    if (_crosshairSyncing) return;
+    _crosshairSyncing = true;
+    try {
+      _syncCrosshairFromPane(inst, param);
+    } finally {
+      _crosshairSyncing = false;
+    }
+  });
+}
+
+// 主图 crosshair → 所有副图
+function _syncCrosshairToPanes(param) {
+  const { chart } = _getCtx();
+  if (!chart) return;
+  // param.point 为空表示鼠标离开图表
+  if (!param || !param.point) {
+    for (const inst of window._indicatorsState.activeIndicators) {
+      if (inst._subChart && inst.visible) {
+        try { inst._subChart.clearCrosshairPosition(); } catch (_) {}
+      }
+    }
+    return;
+  }
+  // 取主图当前 crosshair 处的 series 价格（取 candleSeries 的价格）
+  const candleSeries = window._indicatorsState.mainCandleSeries;
+  const priceData = candleSeries && param.seriesData
+    ? param.seriesData.get(candleSeries)
+    : null;
+  const price = priceData ? (priceData.close != null ? priceData.close : priceData.value) : undefined;
+  const time = param.time || param.logical;
+  if (time == null) return;
+  for (const inst of window._indicatorsState.activeIndicators) {
+    if (!inst._subChart || !inst.visible) continue;
+    try {
+      // 优先用主图 candle 价格；若无则取副图第一条 series 的对应价格
+      let p = price;
+      if (p == null && param.seriesData) {
+        const firstSeries = inst._series && Object.values(inst._series)[0];
+        if (firstSeries) {
+          const subData = param.seriesData.get(firstSeries);
+          if (subData && subData.value != null) p = subData.value;
+        }
+      }
+      if (p == null) {
+        inst._subChart.clearCrosshairPosition();
+      } else {
+        const firstSeries = inst._series && Object.values(inst._series)[0];
+        if (firstSeries) {
+          inst._subChart.setCrosshairPosition(p, time, firstSeries);
+        }
+      }
+    } catch (_) {}
+  }
+}
+
+// 副图 crosshair → 主图 + 其他副图
+function _syncCrosshairFromPane(sourceInst, param) {
+  const { chart, mainCandleSeries } = _getCtx();
+  if (!chart) return;
+  // param.point 为空表示鼠标离开
+  if (!param || !param.point) {
+    try { chart.clearCrosshairPosition(); } catch (_) {}
+    for (const inst of window._indicatorsState.activeIndicators) {
+      if (inst === sourceInst) continue;
+      if (inst._subChart && inst.visible) {
+        try { inst._subChart.clearCrosshairPosition(); } catch (_) {}
+      }
+    }
+    return;
+  }
+  const time = param.time || param.logical;
+  if (time == null) return;
+  // 取副图源 series 的价格，反向同步到主图
+  const firstSeries = sourceInst._series && Object.values(sourceInst._series)[0];
+  const subData = param.seriesData && firstSeries ? param.seriesData.get(firstSeries) : null;
+  const price = subData ? (subData.value != null ? subData.value : subData.close) : undefined;
+  if (price != null && mainCandleSeries) {
+    try { chart.setCrosshairPosition(price, time, mainCandleSeries); } catch (_) {}
+  }
+  // 同步到其他副图
+  for (const inst of window._indicatorsState.activeIndicators) {
+    if (inst === sourceInst) continue;
+    if (!inst._subChart || !inst.visible) continue;
+    try {
+      if (price == null) {
+        inst._subChart.clearCrosshairPosition();
+      } else {
+        const targetSeries = inst._series && Object.values(inst._series)[0];
+        if (targetSeries) {
+          inst._subChart.setCrosshairPosition(price, time, targetSeries);
+        }
+      }
+    } catch (_) {}
+  }
 }
 
 // ── 渲染：根据 K 线数据计算并 setData ────────────────────────────────
@@ -584,6 +1022,8 @@ function renderAllIndicators(bars) {
   for (const inst of window._indicatorsState.activeIndicators) {
     _renderOne(inst, bars);
   }
+  // 所有指标数据渲染完成后，同步副图时间轴到主图
+  setTimeout(syncAllSubChartsToMain, 100);
 }
 
 function _renderOne(inst, bars) {
@@ -803,6 +1243,8 @@ window._indicatorsAPI = {
     window._indicatorsState.mainChart = mainChart;
     window._indicatorsState.mainCandleSeries = mainCandleSeries;
     window._indicatorsState.oscContainer = oscContainer;
+    // 为主图订阅 crosshair move（联动到副图）
+    _subscribeMainChartCrosshair();
     // 恢复已保存的指标
     initIndicators();
   },
@@ -813,6 +1255,10 @@ window._indicatorsAPI = {
   },
   // 切换品种/交易所前调用，清空所有指标老数据
   clearAllData: clearAllIndicatorData,
+  // 同步所有副图时间轴到主图
+  syncSubCharts: syncAllSubChartsToMain,
+  // 重新布局副图 pane（窗口 resize / 侧边栏折叠时调用）
+  relayoutPanes: _layoutOscillatorPanes,
   // 打开模态
   openModal: openIndicatorsModal,
   closeModal() {

@@ -42,6 +42,7 @@ async def lifespan(app: FastAPI):
     from pa_agent.app_context import AppContext
     from web.bridge.event_bus import AsyncEventBus
 
+    logger.info("Lifespan startup: beginning bootstrap")
     ctx = AppContext.bootstrap()
     # Replace Qt EventBus with async stub so core emits don't crash
     ctx.event_bus = AsyncEventBus()
@@ -52,10 +53,16 @@ async def lifespan(app: FastAPI):
 
     # Start background heartbeat task (TODO P1.3)
     heartbeat_task = asyncio.create_task(_health_heartbeat(app))
+    logger.info("Health heartbeat task created")
 
     # Start background bars-stream task (SSE /api/bars/stream)
     from web.api import routes_bars_stream
-    await routes_bars_stream.start_background_task(app)
+    logger.info("Starting bars stream background task...")
+    try:
+        await routes_bars_stream.start_background_task(app)
+        logger.info("Bars stream background task started successfully")
+    except Exception as exc:
+        logger.error("Failed to start bars stream background task: %s", exc)
 
     yield
     # shutdown
@@ -124,6 +131,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def no_cache_middleware(request: Request, call_next):
+    """Disable browser caching for development."""
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.startswith("/js/") or path.startswith("/css/"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 
 @app.middleware("http")

@@ -142,6 +142,8 @@ let sseFallbackPolling = false;// SSE 失败后是否降级为轮询模式
 let sseLastBarUpdateTs = 0;    // 最近一次 SSE bar_update/bar_close 事件的时间戳（ms）
 let sseNextCloseTs = 0;        // 当前 forming bar 的下一收盘时间戳（ms，来自后端 next_close_ts）
 let sseStatusExpiryTimer = null;  // updateSSEStatusWithExpiry 定时器句柄
+let nextClosePollingTimer = null;  // 低频拉取 next_close_ts 定时器（fallback/纯轮询模式下使用）
+let nextClosePollingInFlight = false;  // 防止并发 fetch
 let displayTimezone = "Asia/Shanghai";  // 显示时区（IANA 名称），与 chart.js _displayTimezone 同步
 let isAnalyzing = false;                // 是否有分析进行中（供「持续跟踪」开关判断）
 let waitCloseCountdownTimer = null;     // 等待收盘 setInterval 句柄
@@ -156,6 +158,18 @@ let chatReasoningText = '';
 let chatContentText = '';
 let lastUserMessage = '';
 let stageCharCounts = { stage1: { reasoning: 0, content: 0 }, stage2: { reasoning: 0, content: 0 }, chat: { reasoning: 0, content: 0 } };
+
+// ── 切换性能重构（switch-performance-refactor spec） ──────────────────
+// _inflightSwitch: 切换进行中标志位，防止 applySubscribe 重入
+// _switchErrorTimer: showSwitchError 自动隐藏定时器
+// symbolListCache / symbolListCacheTs: 品种列表缓存（exchange -> 数据 / 时间戳）
+// _inflightExchange: 防止并发请求同一交易所品种列表
+let _inflightSwitch = false;
+let _switchErrorTimer = null;
+const symbolListCache = new Map();
+const symbolListCacheTs = new Map();
+const SYMBOL_CACHE_TTL = 10 * 60 * 1000;  // 10 分钟
+let _inflightExchange = null;
 
 // ── 侧边栏可调宽度（Phase A Task 1） ──────────────────────────────────
 // 拖拽 .sidebar-resizer 调整 #sidebar 宽度（360-900px），持久化到 localStorage
@@ -217,20 +231,20 @@ function initSidebarResizer() {
     if (typeof resizeChart === 'function') resizeChart();
   });
 
-  // 兜底：用 ResizeObserver 监听 chart-container 尺寸变化（处理折叠/展开、窗口分屏等场景）
-  const chartContainer = $('#chart-container');
-  if (chartContainer && typeof ResizeObserver !== 'undefined') {
+  // 兜底：用 ResizeObserver 监听 chart-pane 尺寸变化（处理折叠/展开、窗口分屏等场景）
+  const chartPane = $('#chart-pane');
+  if (chartPane && typeof ResizeObserver !== 'undefined') {
     const ro = new ResizeObserver(() => {
       if (typeof resizeChart === 'function') resizeChart();
     });
-    ro.observe(chartContainer);
+    ro.observe(chartPane);
   }
 }
 
 // ── Init ───────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
   initSidebarResizer();  // 恢复侧边栏宽度（Phase A Task 1），需在 createChart 前完成以避免布局抖动
-  const { chart: c, candleSeries: cs, emaSeries: es, emaSeriesMap: em } = createChart($('#chart-container'));
+  const { chart: c, candleSeries: cs, emaSeries: es, emaSeriesMap: em } = createChart($('#chart-main'));
   chart = c; candleSeries = cs; emaSeries = es; emaSeriesMap = em;
 
   await loadSettings();      // 先加载 settings，回填交易所/品种/周期
@@ -255,21 +269,30 @@ document.addEventListener('DOMContentLoaded', async () => {
 window.addEventListener('resize', resizeChart);
 
 function resizeChart() {
-  const el = $('#chart-container');
-  if (chart) chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
-  // 副图容器宽度跟随主图（高度由各 subChart 自己 applyOptions）
+  const mainEl = $('#chart-main');
+  const paneEl = $('#chart-pane');
+  if (!mainEl || !paneEl) return;
+  // 主图宽度 = chart-pane 宽度；主图高度 = chart-main 实际高度（由 flex 布局计算）
+  const paneWidth = paneEl.clientWidth;
+  if (chart) {
+    chart.applyOptions({ width: paneWidth, height: mainEl.clientHeight });
+  }
+  // 副图容器宽度跟随画布
   const oscWrap = document.getElementById('chart-osc-wrap');
   if (oscWrap) {
-    const parentWidth = (el.parentElement || el).clientWidth;
-    oscWrap.style.width = parentWidth + 'px';
-    // 通知每个副图调整宽度
+    oscWrap.style.width = paneWidth + 'px';
+    // 通知每个副图调整宽度（高度由 _layoutOscillatorPanes 单独管理）
     if (window._indicatorsState) {
       for (const inst of window._indicatorsState.activeIndicators) {
         if (inst._subChart) {
-          try { inst._subChart.applyOptions({ width: parentWidth }); } catch (_) {}
+          try { inst._subChart.applyOptions({ width: paneWidth }); } catch (_) {}
         }
       }
     }
+  }
+  // 触发副图重新布局（主图高度变化后副图也需调整）
+  if (window._indicatorsAPI && window._indicatorsAPI.relayoutPanes) {
+    try { window._indicatorsAPI.relayoutPanes(); } catch (_) {}
   }
 }
 
@@ -288,10 +311,16 @@ async function loadBars() {
     // 通知指标库重新计算并渲染（含 EMA/SMA/BOLL/RSI/MACD/KDJ 等）
     if (window._indicatorsAPI) window._indicatorsAPI.onBarsUpdated(lastBars);
     fitView(chart, 20, lastBars.length);
+    // 主图 fitView 后同步副图时间轴
+    if (window._indicatorsAPI && window._indicatorsAPI.syncSubCharts) {
+      window._indicatorsAPI.syncSubCharts();
+    }
     liveRefreshLastTs = Date.now();
     updateLiveRefreshStatus();
   } catch (e) {
     console.error('loadBars:', e);
+    // 向上抛出，由 applySubscribe 捕获并提示（switch-performance-refactor spec）
+    throw e;
   }
 }
 
@@ -417,22 +446,42 @@ async function loadExchanges() {
 }
 
 async function loadSymbols() {
+  const exchange = $('#ds-exchange').value || '';
+  // 缓存命中：10 分钟内已请求过该交易所，直接用缓存渲染
+  if (symbolListCache.has(exchange)
+      && (Date.now() - (symbolListCacheTs.get(exchange) || 0)) < SYMBOL_CACHE_TTL) {
+    const cached = symbolListCache.get(exchange) || [];
+    symbolList = cached;
+    // 重新渲染下拉（用户可能切回了之前的交易所，需要恢复搜索框内容）
+    const curSymbol = $('#ds-symbol').value || (currentSettings?.general?.last_symbol || 'BTCUSDT');
+    const searchInput = $('#ds-symbol-search');
+    if (searchInput) searchInput.value = curSymbol;
+    // 若搜索框已展开下拉，立即用缓存刷新结果
+    const dropdown = $('#symbol-search-dropdown');
+    if (dropdown && !dropdown.hasAttribute('hidden')) {
+      filterSymbolList(searchInput ? searchInput.value.trim() : '');
+    }
+    return;
+  }
+  // 去重：同一交易所并发请求时只发一次，后续调用直接 return
+  if (_inflightExchange === exchange) return;
+  _inflightExchange = exchange;
   try {
-    const exchange = $('#ds-exchange').value || '';
     const data = await API.get(`/api/tv/symbols?exchange=${encodeURIComponent(exchange)}`);
     const syms = data.symbols || [];
-    // 同时填充 select（默认下拉）和 datalist（自定义输入提示）
-    const sel = $('#ds-symbol-select');
-    const dl = $('#ds-symbol-options');
+    // 写入缓存
+    symbolListCache.set(exchange, syms);
+    symbolListCacheTs.set(exchange, Date.now());
+    symbolList = syms;
     const curSymbol = $('#ds-symbol').value || (currentSettings?.general?.last_symbol || 'BTCUSDT');
-    if (sel) {
-      sel.innerHTML = syms.map(s => `<option value="${s}"${s === curSymbol ? ' selected' : ''}>${s}</option>`).join('');
-    }
-    if (dl) {
-      dl.innerHTML = syms.map(s => `<option value="${s}">`).join('');
+    const searchInput = $('#ds-symbol-search');
+    if (searchInput) {
+      searchInput.value = curSymbol;
     }
   } catch (e) {
     console.error('loadSymbols:', e);
+  } finally {
+    _inflightExchange = null;
   }
 }
 
@@ -528,13 +577,26 @@ function bindEvents() {
     loadSymbols();
     // 不自动应用，等用户点"应用"按钮
   });
-  // 品种下拉选择 → 同步到隐藏的 text input（供 applySubscribe 读取）
-  const symSelect = $('#ds-symbol-select');
-  if (symSelect) {
-    symSelect.addEventListener('change', () => {
-      $('#ds-symbol').value = symSelect.value;
-    });
+  // 品种搜索输入事件
+  const symSearchInput = $('#ds-symbol-search');
+  if (symSearchInput) {
+    symSearchInput.addEventListener('input', handleSymbolSearch);
+    symSearchInput.addEventListener('focus', showSymbolDropdown);
+    symSearchInput.addEventListener('keydown', handleSymbolSearchKeydown);
   }
+  // 清除搜索按钮
+  const symClearBtn = $('#btn-symbol-clear');
+  if (symClearBtn) {
+    symClearBtn.addEventListener('click', clearSymbolSearch);
+  }
+  // 点击外部关闭搜索下拉
+  document.addEventListener('click', (e) => {
+    const dropdown = $('#symbol-search-dropdown');
+    const searchContainer = $('.symbol-search-container');
+    if (dropdown && !dropdown.hasAttribute('hidden') && !searchContainer.contains(e.target)) {
+      dropdown.setAttribute('hidden', '');
+    }
+  });
   // 品种下拉/自定义输入切换
   const symToggleBtn = $('#btn-symbol-toggle');
   if (symToggleBtn) {
@@ -548,9 +610,7 @@ function bindEvents() {
     if (e.target === $('#settings-modal')) $('#settings-modal').classList.add('hidden');
   });
 
-  // 侧边栏折叠/展开
-  const btnCollapse = $('#btn-sidebar-collapse');
-  if (btnCollapse) btnCollapse.addEventListener('click', () => setSidebarCollapsed(true));
+  // 侧边栏折叠/展开（工具栏按钮 + 折叠后浮出按钮）
   const btnToggle = $('#btn-sidebar-toggle');
   if (btnToggle) btnToggle.addEventListener('click', () => {
     const sb = $('#sidebar');
@@ -882,62 +942,174 @@ async function feishuTestHandler() {
 }
 
 // ── 应用订阅（切换交易所/品种/周期） ───────────────────────────────────
+// switch-performance-refactor spec：
+//   - _inflightSwitch 防重入
+//   - /api/subscribe 15s 超时（AbortController）
+//   - subscribe 成功后并行执行 loadBars/loadSettings/loadHistoryList/refreshIncrementalButtonState
+//   - loadBars 完成后再 startSSEBarsStream（避免 SSE 收到旧 symbol 事件）
+//   - 失败用 showSwitchError 替代 alert，3 秒后恢复按钮状态
 async function applySubscribe() {
+  // 重入保护：切换进行中直接忽略后续点击
+  if (_inflightSwitch) return;
   const btn = $('#btn-apply-subscribe');
-  const symbol = $('#ds-symbol').value.trim().toUpperCase();
+  const symbolInput = $('#ds-symbol');
+  const exchangeSelect = $('#ds-exchange');
+  const searchInput = $('#ds-symbol-search');
+  const symbol = symbolInput.value.trim().toUpperCase();
   const timeframe = $('#ds-timeframe').value;
-  const exchange = $('#ds-exchange').value;
+  const exchange = exchangeSelect.value;
   if (!symbol) {
-    alert('请输入品种代码');
+    showSwitchError('请输入品种代码', 'symbol');
     return;
   }
+
+  _inflightSwitch = true;
   // 切换前若实时刷新开启，先关闭 SSE，避免收到旧 symbol 的事件
   const wasLiveRefreshOn = $('#cb-live-refresh').checked;
   if (wasLiveRefreshOn) stopSSEBarsStream();
+  // 进入 loading 状态：按钮/搜索框/交易所下拉均 disabled
   btn.disabled = true;
   btn.textContent = '切换中…';
+  if (searchInput) searchInput.disabled = true;
+  exchangeSelect.disabled = true;
   // 先清空所有指标老数据，避免新数据来之前老指标还显示在图上
   if (window._indicatorsAPI) window._indicatorsAPI.clearAllData();
+
+  // 恢复 UI 控件为可编辑状态（不管成功或失败最终都要恢复）
+  const restoreControls = () => {
+    btn.textContent = '应用';
+    btn.disabled = false;
+    if (searchInput) searchInput.disabled = false;
+    exchangeSelect.disabled = false;
+    _inflightSwitch = false;
+  };
+
   try {
     await API.post('/api/subscribe', {
       kind: 'tradingview',
       symbol,
       timeframe,
       exchange,
+    }, { timeout: 15000 });
+
+    // subscribe 成功后并行执行 4 个请求：loadBars / loadSettings / loadHistoryList / refreshIncrementalButtonState
+    // - loadBars 成功后才能 startSSEBarsStream（避免 SSE 收到旧 symbol 事件），用 .then 链接
+    // - 其他三个无依赖，单个失败不影响其他
+    const barsPromise = loadBars().then(() => {
+      // SSE 时序：loadBars 完成后再启动 SSE，确保新数据已加载
+      if (wasLiveRefreshOn) startSSEBarsStream();
     });
-    // 切换成功后重新拉 K 线（loadBars 内部会通知指标库重新计算）
-    await loadBars();
-    // 刷新 currentSettings（后端 /api/subscribe 已更新 last_symbol/last_timeframe 等）
-    // 避免后续依赖 currentSettings 的逻辑（如 SSE 倒计时 sanity check）拿到旧值
-    await loadSettings();
-    // 切换 symbol/timeframe 后，历史记录列表也要刷新
-    loadHistoryList();
+
+    const [barsResult, settingsResult, historyResult, incrementalResult] = await Promise.allSettled([
+      barsPromise,
+      loadSettings(),
+      loadHistoryList(),
+      refreshIncrementalButtonState(),
+    ]);
+
     // 切换品种/周期时自动取消持续跟踪
     const cbKeep = $('#cb-keep-analysis');
     if (cbKeep) cbKeep.checked = false;
     updateLiveRefreshStatus();
-    btn.textContent = '应用';
-    btn.disabled = false;
-    // 之前开启了实时刷新 → 为新 symbol 重启 SSE
-    if (wasLiveRefreshOn) startSSEBarsStream();
-    // 切换成功 → 检查是否有成功记录以决定增量按钮可用性
-    refreshIncrementalButtonState();
+
+    // loadBars 失败：K 线渲染失败，提示用户但其他模块已尝试完成
+    if (barsResult.status === 'rejected') {
+      throw barsResult.reason;
+    }
+    // 其他三个失败仅记录日志，不阻塞切换流程
+    if (settingsResult.status === 'rejected') {
+      console.error('applySubscribe: loadSettings failed', settingsResult.reason);
+    }
+    if (historyResult.status === 'rejected') {
+      console.error('applySubscribe: loadHistoryList failed', historyResult.reason);
+    }
+    if (incrementalResult.status === 'rejected') {
+      console.error('applySubscribe: refreshIncrementalButtonState failed', incrementalResult.reason);
+    }
+
+    restoreControls();
   } catch (e) {
-    const msg = e.message || String(e);
-    // 品种名无效：错误信息含 symbol / not found / 404 时显示红色校验警告
-    if (/symbol|not\s*found|404/i.test(msg)) {
-      const alert = $('#symbol-alert');
-      if (alert) {
-        alert.textContent = '⚠️ 品种名无效，请检查';
-        alert.removeAttribute('hidden');
+    const msg = (e && e.message) || String(e);
+    // 错误类型判定：优先使用后端返回的 error_type，其次按消息文本兜底分类
+    let type = e?.error_type;
+    if (!type) {
+      const msgLower = msg.toLowerCase();
+      if (msg === 'timeout' || /timeout|timed?\s*out/.test(msgLower)) {
+        type = 'timeout';
+      } else if (/symbol|not\s*found|404|unsupported\s+timeframe/.test(msgLower)) {
+        type = 'symbol';
+      } else if (/tvDatafeed|tradingview.*connect|connection|network|fetch/.test(msgLower)) {
+        type = 'connection';
+      } else {
+        type = 'connection';
       }
     }
-    alert('切换失败: ' + msg);
-    btn.textContent = '应用';
-    btn.disabled = false;
-    // 切换失败（后端仍为旧 symbol）→ 恢复 SSE 推送
-    if (wasLiveRefreshOn) startSSEBarsStream();
+
+    // 针对性提示文案
+    let displayMsg;
+    if (type === 'timeout') {
+      displayMsg = '切换超时，请重试。';
+    } else if (type === 'symbol') {
+      displayMsg = '品种无效，请检查代码：' + msg;
+    } else {
+      // 连接错误：包含 tvDatafeed 未安装的兜底提示
+      if (/tvDatafeed|tradingview.*connect|importerror|module/.test(msg.toLowerCase())) {
+        displayMsg = '数据源连接失败：缺少 TradingView 数据模块。请执行 pip install git+https://github.com/rongardF/tvdatafeed.git 并重启服务器。';
+      } else {
+        displayMsg = '数据源连接失败：' + msg + '。请检查网络或尝试其他交易所。';
+      }
+    }
+    showSwitchError(displayMsg, type);
+
+    // 失败 3 秒后恢复按钮状态（让用户看到错误提示后再恢复可点击）
+    setTimeout(() => {
+      restoreControls();
+      // 失败后若之前 SSE 是开启的，恢复 SSE（仍是旧 symbol 的 stream）
+      if (wasLiveRefreshOn) startSSEBarsStream();
+    }, 3000);
   }
+}
+
+// ── 切换错误提示组件 ──────────────────────────────────────────────────
+// 在工具栏下方 #switch-error 元素中显示错误提示条，3 类错误用不同颜色：
+//   - connection（红）：数据源/网络连接失败
+//   - symbol（橙）：品种无效
+//   - timeout（黄）：切换超时
+// 5 秒后自动隐藏；支持手动关闭。
+function showSwitchError(msg, type = 'connection') {
+  const el = $('#switch-error');
+  if (!el) {
+    // 兜底：找不到 #switch-error 元素时退回 console.error
+    console.error('[switch-error]', type, msg);
+    return;
+  }
+  // 清掉之前的自动隐藏定时器，避免新提示被旧的定时器提前隐藏
+  if (_switchErrorTimer) {
+    clearTimeout(_switchErrorTimer);
+    _switchErrorTimer = null;
+  }
+  // 设置类型 class（清除旧类型）并填充内容
+  el.classList.remove('type-connection', 'type-symbol', 'type-timeout');
+  el.classList.add('type-' + type);
+  el.innerHTML = ''
+    + '<span class="switch-error-msg"></span>'
+    + '<button type="button" class="switch-error-close" title="关闭">✕</button>';
+  // 用 textContent 写消息，避免 msg 中包含 HTML 被解析
+  el.querySelector('.switch-error-msg').textContent = msg;
+  el.removeAttribute('hidden');
+  // 手动关闭按钮
+  el.querySelector('.switch-error-close').addEventListener('click', () => {
+    el.setAttribute('hidden', '');
+    if (_switchErrorTimer) {
+      clearTimeout(_switchErrorTimer);
+      _switchErrorTimer = null;
+    }
+  });
+  // 5 秒后自动隐藏
+  _switchErrorTimer = setTimeout(() => {
+    el.setAttribute('hidden', '');
+    _switchErrorTimer = null;
+  }, 5000);
 }
 
 // ── 增量分析按钮可用性检查 ────────────────────────────────────────────
@@ -983,36 +1155,197 @@ function startLiveRefresh(intervalMs) {
   const safeInterval = Math.max(500, interval);
   liveRefreshTimer = setInterval(refreshBarsOnly, safeInterval);
   liveRefreshLastTs = Date.now();
+  // 轮询模式下也需要显示「距下次收盘」倒计时：启动低频拉取 next_close_ts
+  // （SSE 活跃时 fetchAndUpdateNextCloseTs 内部会自动跳过）
+  startNextClosePolling();
   updateLiveRefreshStatus();
 }
 
 // ── 品种输入模式切换（下拉 ↔ 自定义输入） ────────────────────────────
 let symbolInputMode = 'select';  // 'select' or 'custom'
+let symbolList = [];              // 品类列表数据，供搜索使用
 
 function toggleSymbolInputMode() {
-  const sel = $('#ds-symbol-select');
+  const searchInput = $('#ds-symbol-search');
   const input = $('#ds-symbol');
   const btn = $('#btn-symbol-toggle');
+  const searchContainer = $('.symbol-search-container');
   if (symbolInputMode === 'select') {
     // 切换到自定义输入
     symbolInputMode = 'custom';
-    sel.classList.add('hidden');
+    searchContainer.classList.add('hidden');
     input.classList.remove('hidden');
-    input.value = sel.value || '';
+    input.type = 'text';
+    input.value = searchInput.value || '';
+    input.size = 15;
     input.focus();
     btn.classList.add('active');
     btn.textContent = '📋';
-    btn.title = '切换回下拉选择';
+    btn.title = '切换回搜索选择';
   } else {
-    // 切换回下拉
+    // 切换回搜索
     symbolInputMode = 'select';
     input.classList.add('hidden');
-    sel.classList.remove('hidden');
-    if (input.value) sel.value = input.value;  // 尝试选中
+    input.type = 'hidden';
+    searchContainer.classList.remove('hidden');
+    if (input.value) searchInput.value = input.value;
     btn.classList.remove('active');
     btn.textContent = '✏️';
     btn.title = '切换到自定义输入';
   }
+}
+
+// ── 品类搜索功能 ──────────────────────────────────────────────────────
+let symbolSearchSelectedIndex = 0;
+
+function parseSymbol(symbol) {
+  if (typeof symbol === 'object' && symbol !== null) {
+    return { code: symbol.code || '', name: symbol.name || '', full: symbol.code || '' };
+  }
+  const parts = symbol.split(' ');
+  if (parts.length >= 2) {
+    const code = parts[0];
+    const name = parts.slice(1).join(' ');
+    return { code, name, full: symbol };
+  }
+  return { code: symbol, name: '', full: symbol };
+}
+
+function handleSymbolSearch(e) {
+  const query = e.target.value.trim();
+  const clearBtn = $('#btn-symbol-clear');
+  if (clearBtn) {
+    clearBtn.toggleAttribute('hidden', !query);
+  }
+  filterSymbolList(query);
+}
+
+function filterSymbolList(query) {
+  const dropdown = $('#symbol-search-dropdown');
+  const resultsContainer = $('.symbol-search-results');
+  if (!dropdown || !resultsContainer) return;
+
+  let filtered = symbolList;
+  if (query) {
+    const q = query.toLowerCase();
+    filtered = symbolList.filter(s => {
+      const { code, name } = parseSymbol(s);
+      return code.toLowerCase().includes(q) || name.toLowerCase().includes(q);
+    });
+  }
+
+  symbolSearchSelectedIndex = 0;
+  renderSymbolResults(filtered);
+
+  if (filtered.length > 0) {
+    dropdown.removeAttribute('hidden');
+  } else if (!query) {
+    dropdown.removeAttribute('hidden');
+  }
+}
+
+function showSymbolDropdown() {
+  const dropdown = $('#symbol-search-dropdown');
+  if (dropdown) {
+    dropdown.removeAttribute('hidden');
+    filterSymbolList($('#ds-symbol-search').value.trim());
+  }
+}
+
+function renderSymbolResults(results) {
+  const container = $('.symbol-search-results');
+  if (!container) return;
+
+  if (results.length === 0) {
+    container.innerHTML = '<div class="symbol-search-no-results">未找到匹配的品类</div>';
+    return;
+  }
+
+  const maxResults = 20;
+  const displayResults = results.slice(0, maxResults);
+
+  container.innerHTML = displayResults.map((symbol, index) => {
+    const { code, name } = parseSymbol(symbol);
+    const isSelected = index === symbolSearchSelectedIndex;
+    return `
+      <div class="symbol-search-item${isSelected ? ' selected' : ''}" 
+           data-symbol="${code}" 
+           data-index="${index}"
+           onclick="selectSymbol('${code}')">
+        <span class="symbol-name">${name || code}</span>
+        <span class="symbol-code">${code}</span>
+      </div>
+    `;
+  }).join('');
+}
+
+function selectSymbol(symbol) {
+  const searchInput = $('#ds-symbol-search');
+  const hiddenInput = $('#ds-symbol');
+  const dropdown = $('#symbol-search-dropdown');
+
+  if (searchInput) searchInput.value = symbol;
+  if (hiddenInput) hiddenInput.value = symbol;
+  if (dropdown) dropdown.setAttribute('hidden', '');
+
+  const alert = $('#symbol-alert');
+  if (alert) alert.setAttribute('hidden', '');
+}
+
+function clearSymbolSearch() {
+  const searchInput = $('#ds-symbol-search');
+  const clearBtn = $('#btn-symbol-clear');
+  if (searchInput) {
+    searchInput.value = '';
+    searchInput.focus();
+  }
+  if (clearBtn) {
+    clearBtn.setAttribute('hidden', '');
+  }
+  filterSymbolList('');
+}
+
+function handleSymbolSearchKeydown(e) {
+  const dropdown = $('#symbol-search-dropdown');
+  if (!dropdown || dropdown.hasAttribute('hidden')) return;
+
+  const results = dropdown.querySelectorAll('.symbol-search-item');
+  if (results.length === 0) return;
+
+  switch (e.key) {
+    case 'ArrowDown':
+      e.preventDefault();
+      symbolSearchSelectedIndex = (symbolSearchSelectedIndex + 1) % results.length;
+      updateSymbolSearchSelection(results);
+      break;
+    case 'ArrowUp':
+      e.preventDefault();
+      symbolSearchSelectedIndex = (symbolSearchSelectedIndex - 1 + results.length) % results.length;
+      updateSymbolSearchSelection(results);
+      break;
+    case 'Enter':
+      e.preventDefault();
+      if (results[symbolSearchSelectedIndex]) {
+        const symbol = results[symbolSearchSelectedIndex].dataset.symbol;
+        selectSymbol(symbol);
+      }
+      break;
+    case 'Escape':
+      e.preventDefault();
+      dropdown.setAttribute('hidden', '');
+      break;
+  }
+}
+
+function updateSymbolSearchSelection(results) {
+  results.forEach((item, index) => {
+    if (index === symbolSearchSelectedIndex) {
+      item.classList.add('selected');
+      item.scrollIntoView({ block: 'nearest' });
+    } else {
+      item.classList.remove('selected');
+    }
+  });
 }
 
 // ── 指标管理（由 indicators.js 实现，app.js 只负责按钮绑定） ────────
@@ -1036,29 +1369,45 @@ function updateLiveRefreshStatus() {
   if (sseBarsStream && !sseFallbackPolling) {
     return;
   }
-  // SSE 模式（含降级轮询）下，状态文本由 updateSSEStatus 维护，此处跳过避免覆盖
-  // 但仍需追加「持续跟踪中」标记，因此不能直接 return；改为若 SSE 活跃，仅
-  // 在文本末尾追加持续跟踪标记。
   const cbKeep = $('#cb-keep-analysis');
   const keepSuffix = (cbKeep && cbKeep.checked) ? ' · 持续跟踪中' : '';
-  if (sseBarsStream || sseFallbackPolling) {
-    const el = $('#live-refresh-status');
-    if (!el) return;
-    // 保留 SSE 状态文案，仅追加持续跟踪后缀
+  const el = $('#live-refresh-status');
+  if (!el) return;
+
+  // 计算倒计时：fallback 轮询 / 纯轮询模式下也显示「距下次收盘」（由 startNextClosePolling 维护 sseNextCloseTs）
+  let closeText = '';
+  if (sseNextCloseTs > 0) {
+    const dsTf = $('#ds-timeframe')?.value || '';
+    const tfSecs = timeframeToSeconds(dsTf || currentSettings?.general?.last_timeframe || '');
+    if (tfSecs > 0) {
+      const remaining = Math.max(0, (sseNextCloseTs - Date.now()) / 1000);
+      if (remaining <= tfSecs) {
+        closeText = ` · 距下次收盘 ${remaining.toFixed(0)}s`;
+      }
+    }
+  }
+
+  if (sseFallbackPolling) {
+    // SSE 失败已降级轮询：显示降级提示 + 距上次刷新 + 倒计时 + 持续跟踪
+    const elapsed = liveRefreshLastTs ? Math.max(0, (Date.now() - liveRefreshLastTs) / 1000) : 0;
+    el.textContent = `⚠ 降级轮询 · 距上次刷新 ${elapsed.toFixed(1)}s${closeText}${keepSuffix}`;
+    el.style.color = '#ef5350';
+    return;
+  }
+  if (sseBarsStream) {
+    // SSE 连接中（尚未收到事件）：保留原文案，仅追加持续跟踪后缀
     const base = el.textContent || '';
     const stripped = keepSuffix ? base.replace(/ · 持续跟踪中$/, '') : base;
     el.textContent = keepSuffix ? (stripped + keepSuffix) : stripped;
     return;
   }
-  const el = $('#live-refresh-status');
-  if (!el) return;
   if (!liveRefreshTimer) {
     el.textContent = keepSuffix ? keepSuffix.replace(/^ · /, '') : '';
     if (!el.textContent) el.style.color = '';
     return;
   }
   const elapsed = liveRefreshLastTs ? Math.max(0, Date.now() - liveRefreshLastTs) : 0;
-  el.textContent = `· 距上次刷新 ${(elapsed / 1000).toFixed(1)}s${keepSuffix}`;
+  el.textContent = `· 距上次刷新 ${(elapsed / 1000).toFixed(1)}s${closeText}${keepSuffix}`;
 }
 
 // 每秒更新一次"距上次刷新"显示
@@ -1098,6 +1447,8 @@ function startSSEBarsStream() {
         if (sseFallbackPolling) {
           sseFallbackPolling = false;
           stopLiveRefresh();
+          // SSE 恢复后 next_close_ts 由事件推送，停止低频轮询
+          stopNextClosePolling();
         }
         // 启动每秒更新状态栏（含 elapsed/remaining）
         // 注意：必须在收到 bar_close 后启动，而非 onopen，否则 sseNextCloseTs 还没更新
@@ -1147,6 +1498,7 @@ function startSSEBarsStream() {
         if (sseFallbackPolling) {
           sseFallbackPolling = false;
           stopLiveRefresh();
+          stopNextClosePolling();
         }
         // 启动每秒更新状态栏（含 elapsed/remaining）
         // 注意：必须在收到 bar_update 后启动，而非 onopen，否则 sseNextCloseTs 还没更新
@@ -1198,6 +1550,8 @@ function startSSEBarsStream() {
         startLiveRefresh(3000);  // 3s 间隔，降低后端压力
         updateSSEStatus('fallback');
       }
+      // 启动低频拉取 next_close_ts（fallback 模式下也显示倒计时）
+      startNextClosePolling();
       // 10s 后尝试重连 SSE（仅在用户仍开启实时且页面可见时）
       if (sseReconnectTimer) clearTimeout(sseReconnectTimer);
       sseReconnectTimer = setTimeout(() => {
@@ -1214,6 +1568,7 @@ function startSSEBarsStream() {
     sseFallbackPolling = true;
     startLiveRefresh(3000);
     updateSSEStatus('fallback');
+    startNextClosePolling();
   }
 }
 
@@ -1232,6 +1587,7 @@ function stopSSEBarsStream() {
   }
   // 清除每秒更新状态栏的定时器并重置 SSE 状态变量
   stopSSEStatusExpiryTimer();
+  stopNextClosePolling();
   sseNextCloseTs = 0;
   sseLastBarUpdateTs = 0;
 }
@@ -1247,6 +1603,46 @@ function stopSSEStatusExpiryTimer() {
   if (sseStatusExpiryTimer) {
     clearInterval(sseStatusExpiryTimer);
     sseStatusExpiryTimer = null;
+  }
+}
+
+// 异步拉取 /api/bars/next-close 更新 sseNextCloseTs（用于 fallback/纯轮询模式下显示倒计时）
+// 幂等；并发请求时直接 return。失败静默（下次定时器再试）。
+async function fetchAndUpdateNextCloseTs() {
+  if (nextClosePollingInFlight) return;
+  // SSE 活跃时 next_close_ts 由 bar_update/bar_close 事件推送，无需 fetch
+  if (sseBarsStream && !sseFallbackPolling) return;
+  nextClosePollingInFlight = true;
+  try {
+    const symbol = $('#ds-symbol')?.value || currentSettings?.general?.last_symbol || '';
+    const tf = $('#ds-timeframe')?.value || currentSettings?.general?.last_timeframe || '';
+    const ex = $('#ds-exchange')?.value || currentSettings?.general?.last_tradingview_exchange || '';
+    if (!symbol || !tf) return;
+    const url = `/api/bars/next-close?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(tf)}&exchange=${encodeURIComponent(ex)}`;
+    const data = await API.get(url);
+    if (data && data.next_close_ts > 0) {
+      sseNextCloseTs = Number(data.next_close_ts);
+    }
+  } catch (e) {
+    // 静默失败，下次定时器再试
+  } finally {
+    nextClosePollingInFlight = false;
+  }
+}
+
+// 启动低频（5s）拉取 next_close_ts 定时器（幂等）
+// 用于 SSE 不可用时（fallback 轮询 / 纯轮询模式）也能显示「距下次收盘」倒计时
+function startNextClosePolling() {
+  if (nextClosePollingTimer) return;
+  // 立即拉一次，避免首次显示延迟 5s
+  fetchAndUpdateNextCloseTs();
+  nextClosePollingTimer = setInterval(fetchAndUpdateNextCloseTs, 5000);
+}
+
+function stopNextClosePolling() {
+  if (nextClosePollingTimer) {
+    clearInterval(nextClosePollingTimer);
+    nextClosePollingTimer = null;
   }
 }
 
@@ -1413,22 +1809,10 @@ function setSidebarCollapsed(collapsed) {
     sb.classList.remove('collapsed');
     if (fab) fab.classList.remove('visible');
   }
-  // 折叠/展开后图表宽度变化，需要重新调整尺寸
-  setTimeout(() => {
-    resizeChart();
-    // 同步副图宽度
-    if (window._indicatorsState) {
-      for (const inst of window._indicatorsState.activeIndicators) {
-        if (inst._subChart) {
-          try {
-            const el = $('#chart-container');
-            const parentWidth = (el.parentElement || el).clientWidth;
-            inst._subChart.applyOptions({ width: parentWidth });
-          } catch (_) {}
-        }
-      }
-    }
-  }, 280);  // 等待 CSS transition 完成（0.25s）
+  // 用 requestAnimationFrame 确保 CSS transition 完成后 resize
+  requestAnimationFrame(() => {
+    setTimeout(() => resizeChart(), 280);
+  });
 }
 
 async function startAnalysis() {
@@ -1585,6 +1969,10 @@ async function startAnalysis() {
             setDecisionOverlays(candleSeries, overlay);
           }
           fitView(chart, 20, lastBars ? lastBars.length : 0);
+          // 主图 fitView 后同步副图时间轴（确保副图跟随主图逻辑范围）
+          if (window._indicatorsAPI && window._indicatorsAPI.syncSubCharts) {
+            window._indicatorsAPI.syncSubCharts();
+          }
           enableChat();
           // 分析完成后刷新增量分析按钮可用性（新记录可被增量复用）
           refreshIncrementalButtonState();
@@ -1817,6 +2205,10 @@ async function startIncrementalAnalysis() {
             setDecisionOverlays(candleSeries, overlay);
           }
           fitView(chart, 20, lastBars ? lastBars.length : 0);
+          // 主图 fitView 后同步副图时间轴（确保副图跟随主图逻辑范围）
+          if (window._indicatorsAPI && window._indicatorsAPI.syncSubCharts) {
+            window._indicatorsAPI.syncSubCharts();
+          }
           enableChat();
           refreshIncrementalButtonState();
           // 下单机会提醒（Phase E Task 12）

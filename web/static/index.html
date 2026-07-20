@@ -17,12 +17,17 @@
   <div class="toolbar-segment">
     <select id="ds-exchange" class="seg-select" title="交易所"></select>
     <div class="symbol-picker">
-      <select id="ds-symbol-select" class="seg-select" title="品种"></select>
-      <input id="ds-symbol" type="text" value="BTCUSDT" size="10" autocomplete="off" placeholder="自定义..." class="hidden seg-input">
-      <button id="btn-symbol-toggle" type="button" class="icon-btn symbol-toggle-btn" title="切换下拉/自定义输入">✏️</button>
+      <div class="symbol-search-container">
+        <input id="ds-symbol-search" type="text" autocomplete="off" placeholder="搜索品类..." class="seg-input symbol-search-input">
+        <button id="btn-symbol-clear" type="button" class="icon-btn symbol-clear-btn" title="清除搜索" hidden>✕</button>
+      </div>
+      <div id="symbol-search-dropdown" class="symbol-search-dropdown" hidden>
+        <div class="symbol-search-results"></div>
+      </div>
+      <input id="ds-symbol" type="hidden" value="BTCUSDT">
+      <button id="btn-symbol-toggle" type="button" class="icon-btn symbol-toggle-btn" title="切换自定义输入">✏️</button>
       <div id="symbol-alert" class="symbol-alert" hidden></div>
     </div>
-    <datalist id="ds-symbol-options"></datalist>
     <select id="ds-timeframe" class="seg-select" title="周期"></select>
     <input id="ds-bar-count" type="number" value="100" min="2" max="5000" size="4" class="seg-input" title="K线数量">
     <button id="btn-apply-subscribe" class="compact-btn" title="应用数据源切换">应用</button>
@@ -49,12 +54,17 @@
     <button id="btn-sidebar-toggle" class="icon-btn" title="显示/隐藏侧边栏">📊</button>
   </div>
 </header>
+<!-- 切换错误提示条：applySubscribe 失败时由 showSwitchError() 显示 -->
+<div id="switch-error" class="switch-error" hidden></div>
 
 <div id="main">
   <div id="chart-wrap">
-    <div id="chart-container"></div>
-    <div id="chart-osc-wrap"></div>
-    <div id="tz-label">⏰ 浏览器本地时区</div>
+    <!-- 统一画布容器：主图占满剩余空间，副图作为 pane 自下而上堆叠 -->
+    <div id="chart-pane">
+      <div id="chart-main"></div>
+      <div id="chart-osc-wrap"></div>
+      <div id="tz-label">⏰ 浏览器本地时区</div>
+    </div>
   </div>
   <div id="sidebar">
     <!-- 拖拽分隔条：拖拽调整侧边栏宽度（Phase A Task 1） -->
@@ -77,8 +87,7 @@
       </button>
       <button id="btn-incremental" class="compact-btn" title="基于上次成功记录做增量分析" disabled>增量</button>
       <button id="btn-back-to-live" class="icon-btn hidden" title="返回实时">⚡</button>
-      <button id="btn-sidebar-collapse" class="icon-btn" title="隐藏侧边栏">📍</button>
-    </div>
+      </div>
     <div id="flow-bar" class="flow-bar" hidden>
       <div class="flow-step" data-step="1"><span class="flow-step-num">1</span><span class="flow-step-label">等待数据</span></div>
       <div class="flow-step" data-step="2"><span class="flow-step-num">2</span><span class="flow-step-label">阶段一推理</span></div>
@@ -532,9 +541,9 @@
 <!-- 下单机会提醒 Toast 容器（固定右下角，Phase E Task 12） -->
 <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
-<script src="/js/api.js"></script>
-<script src="/js/chart.js"></script>
-<script src="/js/indicators.js"></script>
-<script src="/js/app.js"></script>
+<script src="/js/api.js?v=3"></script>
+<script src="/js/chart.js?v=3"></script>
+<script src="/js/indicators.js?v=3"></script>
+<script src="/js/app.js?v=3"></script>
 </body>
 </html>

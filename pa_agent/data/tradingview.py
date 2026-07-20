@@ -163,6 +163,91 @@ TV_SYMBOL_PRESETS: dict[str, list[str]] = {
     "": ["XAUUSD", "BTCUSDT", "ETHUSDT", "EURUSD", "GOLD"],
 }
 
+# Symbol name mappings for display purposes
+TV_SYMBOL_NAMES: dict[str, str] = {
+    # Crypto
+    "BTCUSDT": "比特币",
+    "ETHUSDT": "以太坊",
+    "SOLUSDT": "Solana",
+    "BNBUSDT": "币安币",
+    "XRPUSDT": "瑞波币",
+    "DOGEUSDT": "狗狗币",
+    "ADAUSDT": "卡尔达诺",
+    "AVAXUSDT": "Avalanche",
+    "LINKUSDT": "Chainlink",
+    "TONUSDT": "Toncoin",
+    "LTCUSDT": "莱特币",
+    "TRXUSDT": "波场",
+    "DOTUSDT": "波卡",
+    "BCHUSDT": "比特现金",
+    "ATOMUSDT": "Cosmos",
+    "BTC-USDT": "比特币",
+    "ETH-USDT": "以太坊",
+    "SOL-USDT": "Solana",
+    "BNB-USDT": "币安币",
+    "XRP-USDT": "瑞波币",
+    "DOGE-USDT": "狗狗币",
+    "ADA-USDT": "卡尔达诺",
+    "AVAX-USDT": "Avalanche",
+    "LINK-USDT": "Chainlink",
+    "TON-USDT": "Toncoin",
+    "BTCUSD": "比特币",
+    "ETHUSD": "以太坊",
+    "LTCUSD": "莱特币",
+    "XRPUSD": "瑞波币",
+    "BCHUSD": "比特现金",
+    "SOLUSD": "Solana",
+    # Forex
+    "XAUUSD": "现货黄金",
+    "EURUSD": "欧元/美元",
+    "GBPUSD": "英镑/美元",
+    "USDJPY": "美元/日元",
+    "AUDUSD": "澳元/美元",
+    "USDCAD": "美元/加元",
+    "USDCHF": "美元/瑞郎",
+    "GOLD": "黄金",
+    # A-shares
+    "600519": "贵州茅台",
+    "601318": "中国平安",
+    "600036": "招商银行",
+    "601398": "工商银行",
+    "600276": "恒瑞医药",
+    "000001": "平安银行",
+    "000333": "美的集团",
+    "000651": "格力电器",
+    "002594": "比亚迪",
+    "300750": "宁德时代",
+    # HK stocks
+    "0700": "腾讯控股",
+    "1810": "小米集团",
+    "9988": "阿里巴巴",
+    "3690": "美团",
+    "1299": "友邦保险",
+    # US stocks
+    "AAPL": "苹果",
+    "MSFT": "微软",
+    "AMZN": "亚马逊",
+    "TSLA": "特斯拉",
+    "JPM": "摩根大通",
+    "GOOGL": "谷歌",
+    "META": "Meta",
+    "NVDA": "英伟达",
+    # Indices
+    "SPX": "标普500",
+    "SPX500": "标普500",
+    "NDX": "纳斯达克100",
+    "VIX": "波动率指数",
+    # Futures
+    "ZC": "玉米期货",
+    "ZS": "大豆期货",
+    "ZW": "小麦期货",
+    "ZL": "豆油期货",
+    "ES": "标普500期货",
+    "NQ": "纳斯达克期货",
+    "YM": "道琼斯期货",
+    "RTY": "罗素2000期货",
+}
+
 
 class TradingViewSource(DataSource):
     """Live K-line data from TradingView via tvdatafeed."""
@@ -205,20 +290,28 @@ class TradingViewSource(DataSource):
                 self._tv = TvDatafeed(self._username, self._password)
             else:
                 self._tv = TvDatafeed()  # anonymous
-            # Bound tvDatafeed's hardcoded 15s WebSocket timeout so a stalled
-            # connection fails faster instead of freezing the UI.
             try:
                 setattr(self._tv, _TV_WS_TIMEOUT_ATTR, _TV_WS_TIMEOUT_S)
             except Exception:  # noqa: BLE001
                 logger.debug("Could not override tvDatafeed ws timeout", exc_info=True)
             self._connected = True
             logger.info("TradingViewSource connected (anonymous=%s)", not self._username)
+        except ImportError as exc:
+            self._connected = False
+            msg = str(exc)
+            if "numpy" in msg.lower() or "X86_V2" in msg:
+                logger.warning(
+                    "NumPy 与当前 CPU 不兼容，无法获取 TradingView 数据。"
+                    "请尝试安装兼容的 NumPy 版本或使用 A股数据源。"
+                )
+            else:
+                logger.warning(
+                    "tvDatafeed 未安装，无法获取 TradingView 实时数据。请执行: "
+                    "pip install git+https://github.com/rongardF/tvdatafeed.git"
+                )
         except Exception as exc:
             self._connected = False
-            raise DataSourceTransientError(
-                f"TradingView 连接失败：{exc}（若未安装请执行 "
-                "pip install git+https://github.com/rongardF/tvdatafeed.git）"
-            ) from exc
+            logger.warning("TradingView 连接失败：%s", exc)
 
     def disconnect(self) -> None:
         self._close_tv_socket()
@@ -495,27 +588,45 @@ class TradingViewSource(DataSource):
         for i, row in enumerate(df.itertuples(index=False)):
             ts_ms = _row_ts_ms(row)
             if i == 0:
-                # Forming bar (seq=0 per DataSource contract).
+                # bars[0]: either forming (seq=0) or, when market is closed,
+                # the newest closed bar (seq=1) — tvDatafeed returns only
+                # closed bars during halt/weekend.
                 from pa_agent.data.bar_close_wait import seconds_until_bar_closes
 
                 secs_left = seconds_until_bar_closes(
                     ts_ms, self._timeframe, now_ms=None
                 )
                 still_forming = secs_left is not None and secs_left > 0
-                bar = KlineBar(
-                    seq=0,
-                    ts_open=ts_ms,
-                    open=float(row.open),
-                    high=float(row.high),
-                    low=float(row.low),
-                    close=float(row.close),
-                    volume=float(getattr(row, "volume", 0.0)),
-                    closed=not still_forming,
-                )
+                if still_forming:
+                    bar = KlineBar(
+                        seq=0,
+                        ts_open=ts_ms,
+                        open=float(row.open),
+                        high=float(row.high),
+                        low=float(row.low),
+                        close=float(row.close),
+                        volume=float(getattr(row, "volume", 0.0)),
+                        closed=False,
+                    )
+                else:
+                    # Market-halt mode: bars[0] is the newest closed bar.
+                    bar = KlineBar(
+                        seq=1,
+                        ts_open=ts_ms,
+                        open=float(row.open),
+                        high=float(row.high),
+                        low=float(row.low),
+                        close=float(row.close),
+                        volume=float(getattr(row, "volume", 0.0)),
+                        closed=True,
+                    )
             else:
-                # Closed bar: seq=1..n (per DataSource contract).
+                # Closed bar: seq increments from 1 in halt mode, from 1
+                # (starting at index 1) in normal mode.
+                head_closed = bool(bars[0].closed)
+                seq = i + 1 if head_closed else i
                 bar = KlineBar(
-                    seq=i,
+                    seq=seq,
                     ts_open=ts_ms,
                     open=float(row.open),
                     high=float(row.high),
@@ -525,7 +636,10 @@ class TradingViewSource(DataSource):
                     closed=True,
                 )
             bars.append(normalize_kline_bar(bar))
-            if len(bars) >= n + 1:
+            # Normal mode: n+1 bars (1 forming + n closed).
+            # Halt mode: n bars (all closed).
+            target_len = n if (bars and bars[0].closed) else n + 1
+            if len(bars) >= target_len:
                 break
 
         return self._validate_snapshot(n, bars)

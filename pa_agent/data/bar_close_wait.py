@@ -49,23 +49,32 @@ def seconds_until_bar_closes(
     *,
     now_ms: int | None = None,
 ) -> int | None:
-    """Whole seconds until the bar that opened at ``ts_open_ms`` closes."""
+    """Whole seconds until the bar that opened at ``ts_open_ms`` closes.
+
+    Returns 0 once the bar's absolute close time has passed
+    (``now_ms >= ts_open_ms + duration_ms``). This handles the
+    market-closed / halt scenario where the newest bar is already closed
+    and there is no forming bar to wait for.
+    """
     duration_s = timeframe_to_seconds(timeframe)
     if duration_s is None:
         return None
     if now_ms is None:
         now_ms = int(time.time() * 1000)
-    # NOTE:
-    # Some data sources provide ``ts_open`` with a fixed timezone/base offset.
-    # Using absolute ``close_ms = ts_open + duration`` would then make the
-    # countdown drift by that whole offset (e.g. ~8h).
-    # Instead, compute remaining time within the duration window by taking
-    # elapsed % duration. This is robust to constant offsets.
     duration_ms = duration_s * 1000
+    # Primary check: absolute close-time. ``_row_ts_ms`` in tradingview.py
+    # already normalises ts_open to UTC ms, so this is robust for TV data.
+    close_ms = int(ts_open_ms) + duration_ms
+    if int(now_ms) >= close_ms:
+        return 0
     elapsed_ms = int(now_ms) - int(ts_open_ms)
     if elapsed_ms == 0:
         return duration_s
 
+    # NOTE:
+    # Some legacy data sources provided ``ts_open`` with a fixed timezone/base
+    # offset. Taking elapsed % duration is robust to those constant offsets,
+    # so we keep the modulo path as a fallback for any non-UTC ts_open.
     # remainder in [0, duration_ms)
     remainder_ms = elapsed_ms % duration_ms
     if remainder_ms == 0:

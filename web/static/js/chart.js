@@ -149,9 +149,11 @@ function _tickMarkFormatter(time, tickMarkType, locale) {
   }
 }
 
-// 暴露 setDisplayTimezone 供 app.js 调用
+// 暴露 API 供 app.js 和 indicators.js 调用
 window._chartAPI = window._chartAPI || {};
 window._chartAPI.setDisplayTimezone = setDisplayTimezone;
+window._chartAPI.tickMarkFormatter = _tickMarkFormatter;
+window._chartAPI.fmtLocalTime = _fmtLocalTime;
 
 // ── 创建图表 ─────────────────────────────────────────────────────────
 function createChart(container) {

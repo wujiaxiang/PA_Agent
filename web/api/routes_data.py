@@ -5,6 +5,7 @@ import logging
 import time
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from pa_agent.data.base import KlineBar, KlineFrame
@@ -94,7 +95,17 @@ async def list_tv_symbols(request: Request, exchange: str = ""):
             syms = ds.list_symbols()
     else:
         syms = []
-    return {"exchange": exchange, "symbols": syms}
+
+    from pa_agent.data.tradingview import TV_SYMBOL_NAMES
+    # 前端有 10 分钟缓存（symbolListCache + SYMBOL_CACHE_TTL），后端响应头
+    # 配置 Cache-Control: max-age=600 与前端 TTL 对齐，避免中间代理/浏览器
+    # 在缓存过期后立即重新请求导致后端被密集打。
+    response = JSONResponse({
+        "exchange": exchange,
+        "symbols": [{"code": s, "name": TV_SYMBOL_NAMES.get(s, s)} for s in syms]
+    })
+    response.headers["Cache-Control"] = "max-age=600"
+    return response
 
 
 @router.get("/timeframes")
@@ -133,13 +144,42 @@ async def subscribe(req: SubscribeRequest, request: Request):
             pass
         ctx.data_source = create_data_source(kind)
 
+    # switch-performance-refactor spec: 连接复用
+    # 当数据源类型不变（仍是 tradingview）且 TvDatafeed 已连接时，
+    # 跳过 connect() 重连（避免 WebSocket 重建带来的数秒级阻塞），
+    # 仅调用 set_exchange + subscribe 即可。
+    already_connected = (
+        kind == old_kind == "tradingview"
+        and bool(getattr(ctx.data_source, "_connected", False))
+    )
+
     try:
-        ctx.data_source.connect()
+        if not already_connected:
+            ctx.data_source.connect()
         if kind == "tradingview" and hasattr(ctx.data_source, "set_exchange"):
             ctx.data_source.set_exchange(exchange)
         ctx.data_source.subscribe(symbol, timeframe)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        # switch-performance-refactor spec: 结构化错误响应
+        # 根据异常信息分类返回 error_type，前端据此显示针对性提示：
+        #   - symbol：包含 "symbol"/"not found"，品种无效
+        #   - timeout：包含 "timeout"，请求超时
+        #   - connection：其他错误，连接失败
+        msg_lower = str(exc).lower()
+        if "symbol" in msg_lower or "not found" in msg_lower:
+            error_type = "symbol"
+        elif "timeout" in msg_lower or "timed out" in msg_lower:
+            error_type = "timeout"
+        else:
+            error_type = "connection"
+        # 同时通过响应体（error_type 字段）和响应头（X-Error-Type）传递错误类型，
+        # 前端 API.post 优先读取响应体；头作为兜底。
+        response = JSONResponse(
+            {"detail": str(exc), "error_type": error_type},
+            status_code=500,
+        )
+        response.headers["X-Error-Type"] = error_type
+        return response
 
     ctx.settings.general.last_data_source = kind
     ctx.settings.general.last_symbol = symbol

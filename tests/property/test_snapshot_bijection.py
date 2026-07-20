@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 from hypothesis import given, settings as h_settings
 from hypothesis import strategies as st
@@ -24,11 +25,19 @@ def _make_bar(seq: int, ts: float, *, closed: bool) -> KlineBar:
 
 
 def _bars_with_forming(n_closed: int, extra: int) -> list[KlineBar]:
-    """Newest-first: forming at 0, then n_closed+extra closed bars."""
-    base = 1000.0
-    bars = [_make_bar(1, base + float(n_closed + extra), closed=False)]
+    """Newest-first: forming at 0, then n_closed+extra closed bars.
+
+    Uses near-current timestamps so the forming bar is genuinely within its
+    period (``seconds_until_bar_closes`` uses absolute close-time and would
+    otherwise flag a stale closed=False flag as already closed).
+    """
+    now_ms = float(int(time.time() * 1000))
+    # 1h timeframe: keep forming bar ~30 min into its window (1800s elapsed).
+    base = now_ms - 1800_000.0
+    bars = [_make_bar(1, base, closed=False)]
+    # Closed bars: each 1h before the previous (3600_000 ms apart).
     for i in range(n_closed + extra):
-        bars.append(_make_bar(i + 2, base + float(n_closed + extra - i - 1), closed=True))
+        bars.append(_make_bar(i + 2, base - (i + 1) * 3600_000.0, closed=True))
     return bars
 
 
@@ -52,13 +61,18 @@ def test_analysis_frame_seq_bijection(n: int, extra: int) -> None:
     extra=st.integers(min_value=0, max_value=20),
 )
 @h_settings(max_examples=200)
-def test_live_frame_forming_bar_is_seq1(n: int, extra: int) -> None:
-    """build_live_frame keeps forming bar at seq=1 when present at index 0."""
+def test_live_frame_forming_bar_is_seq0(n: int, extra: int) -> None:
+    """build_live_frame keeps forming bar at seq=0 when present at index 0."""
     raw = _bars_with_forming(n, extra)
     frame = build_live_frame(raw, n, symbol="TEST", timeframe="1h")
     assert frame is not None
-    assert frame.bars[0].seq == 1
+    assert frame.bars[0].seq == 0
     assert frame.bars[0].closed is False
+    # Closed bars should be seq=1..n after the forming bar.
+    assert len(frame.bars) == n + 1
+    for i, b in enumerate(frame.bars[1:], start=1):
+        assert b.seq == i
+        assert b.closed is True
 
 
 @given(

@@ -375,73 +375,73 @@ def _run_analysis(
     """
     # *loop* is the main-thread event loop, passed from analyze_stream
 
-    bars_raw = ctx.data_source.latest_snapshot(bar_count)
-    now_ms = int(time.time() * 1000)
-    frame = build_display_frame(
-        bars_raw, bar_count,
-        ctx.settings.general.last_symbol,
-        ctx.settings.general.last_timeframe,
-        now_ms=now_ms,
-    )
-
-    orchestrator = _build_orchestrator(ctx)
-    cancel_token = CancelToken()
-    callbacks = _install_callbacks(event_queue, loop)
-
-    previous_record = None
-    incremental_new_bar_count: int | None = None
-    if incremental:
-        try:
-            symbol = ctx.settings.general.last_symbol
-            timeframe = ctx.settings.general.last_timeframe
-            exchange = getattr(
-                ctx.settings.general, "last_tradingview_exchange", ""
-            ) or ""
-            previous_record = find_latest_successful_record(
-                symbol=symbol, timeframe=timeframe, exchange=exchange
-            )
-            if previous_record is not None:
-                incremental_new_bar_count = count_new_bars_since_record(
-                    frame, previous_record
-                )
-                if incremental_new_bar_count is None:
-                    # Anchor not found in current window → cannot do safe
-                    # incremental; fall back to full analysis.
-                    previous_record = None
-                    logger.info(
-                        "Incremental analysis: anchor not found in current "
-                        "window, falling back to full analysis"
-                    )
-                else:
-                    # 阈值保护：超过 incremental_max_new_bars 则降级为完整分析
-                    max_new = int(
-                        getattr(
-                            ctx.settings.general,
-                            "incremental_max_new_bars",
-                            10,
-                        )
-                        or 10
-                    )
-                    if max_new > 0 and incremental_new_bar_count > max_new:
-                        logger.info(
-                            "Incremental analysis: new bars %d > threshold %d, "
-                            "falling back to full analysis",
-                            incremental_new_bar_count,
-                            max_new,
-                        )
-                        previous_record = None
-                        incremental_new_bar_count = None
-            else:
-                logger.info(
-                    "Incremental analysis: no previous successful record, "
-                    "falling back to full analysis"
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Incremental lookup failed: %s", exc)
-            previous_record = None
-            incremental_new_bar_count = None
-
     try:
+        bars_raw = ctx.data_source.latest_snapshot(bar_count)
+        now_ms = int(time.time() * 1000)
+        frame = build_display_frame(
+            bars_raw, bar_count,
+            ctx.settings.general.last_symbol,
+            ctx.settings.general.last_timeframe,
+            now_ms=now_ms,
+        )
+
+        orchestrator = _build_orchestrator(ctx)
+        cancel_token = CancelToken()
+        callbacks = _install_callbacks(event_queue, loop)
+
+        previous_record = None
+        incremental_new_bar_count: int | None = None
+        if incremental:
+            try:
+                symbol = ctx.settings.general.last_symbol
+                timeframe = ctx.settings.general.last_timeframe
+                exchange = getattr(
+                    ctx.settings.general, "last_tradingview_exchange", ""
+                ) or ""
+                previous_record = find_latest_successful_record(
+                    symbol=symbol, timeframe=timeframe, exchange=exchange
+                )
+                if previous_record is not None:
+                    incremental_new_bar_count = count_new_bars_since_record(
+                        frame, previous_record
+                    )
+                    if incremental_new_bar_count is None:
+                        # Anchor not found in current window → cannot do safe
+                        # incremental; fall back to full analysis.
+                        previous_record = None
+                        logger.info(
+                            "Incremental analysis: anchor not found in current "
+                            "window, falling back to full analysis"
+                        )
+                    else:
+                        # 阈值保护：超过 incremental_max_new_bars 则降级为完整分析
+                        max_new = int(
+                            getattr(
+                                ctx.settings.general,
+                                "incremental_max_new_bars",
+                                10,
+                            )
+                            or 10
+                        )
+                        if max_new > 0 and incremental_new_bar_count > max_new:
+                            logger.info(
+                                "Incremental analysis: new bars %d > threshold %d, "
+                                "falling back to full analysis",
+                                incremental_new_bar_count,
+                                max_new,
+                            )
+                            previous_record = None
+                            incremental_new_bar_count = None
+                else:
+                    logger.info(
+                        "Incremental analysis: no previous successful record, "
+                        "falling back to full analysis"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Incremental lookup failed: %s", exc)
+                previous_record = None
+                incremental_new_bar_count = None
+
         record = orchestrator.submit(
             frame,
             cancel_token=cancel_token,

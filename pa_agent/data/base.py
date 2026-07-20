@@ -123,12 +123,14 @@ class DataSource(ABC):
     def latest_snapshot(self, n: int) -> list[KlineBar]:
         """Return the *n* most recent bars (index 0 = newest, including forming bar).
 
-        Contract:
-        - Must return exactly ``n + 1`` bars: ``n`` closed bars (seq=1..n) plus
-          1 forming bar (seq=0, ``closed=False``) at index 0.
-        - ``bars[0]`` is the forming bar (newest, not yet closed).
-        - ``bars[1]`` is the most recent closed bar (seq=1).
-        - ``bars[-1]`` is the oldest closed bar (seq=n).
+        Contract (two modes):
+        - Normal mode (market open): returns ``n + 1`` bars — 1 forming bar
+          (``seq=0``, ``closed=False``) at index 0 plus ``n`` closed bars
+          (``seq=1..n``).
+        - Halt mode (market closed / weekend): returns ``n`` bars, all closed
+          (``seq=1..n``). ``bars[0]`` is the newest closed bar (``seq=1``).
+
+        ``bars[0]`` is always the newest bar in both modes.
 
         Implementations SHOULD call ``self._validate_snapshot(n, bars)`` before
         returning to enforce this contract (see TODO P2.2).
@@ -139,45 +141,72 @@ class DataSource(ABC):
     def _validate_snapshot(self, n: int, bars: list[KlineBar]) -> list[KlineBar]:
         """Enforce the ``latest_snapshot`` contract (TODO P2.2).
 
-        Verifies the returned list contains exactly ``n + 1`` bars with the
-        forming bar at index 0 (``closed=False``, ``seq=0``) and ``n`` closed
-        bars (``seq=1..n``).  Raises ``ValueError`` with a clear message on
-        violation so new DataSource implementations fail fast instead of
-        producing subtle downstream bugs in ``build_analysis_frame``.
+        Verifies the returned list matches one of the two valid modes:
+        - Normal: ``n + 1`` bars, ``bars[0]`` is forming (``closed=False``,
+          ``seq=0``), ``bars[1..n]`` closed with ``seq=1..n``.
+        - Halt: ``n`` bars, all closed with ``seq=1..n``.
+
+        Raises ``ValueError`` with a clear message on violation so new
+        DataSource implementations fail fast instead of producing subtle
+        downstream bugs in ``build_analysis_frame``.
 
         Subclasses should call this at the end of ``latest_snapshot``:
             ``return self._validate_snapshot(n, bars)``
         """
-        if len(bars) != n + 1:
+        if len(bars) not in (n, n + 1):
             raise ValueError(
                 f"{type(self).__name__}.latest_snapshot(n={n}) returned "
                 f"{len(bars)} bars, expected exactly {n + 1} "
-                f"(n closed bars + 1 forming bar). "
+                f"(n closed bars + 1 forming bar) or {n} (halt mode). "
                 f"See base.DataSource.latest_snapshot contract."
             )
-        forming = bars[0]
-        if forming.closed:
-            raise ValueError(
-                f"{type(self).__name__}.latest_snapshot(n={n}): bars[0] must be "
-                f"the forming bar (closed=False), got closed={forming.closed} "
-                f"seq={forming.seq}."
-            )
-        if forming.seq != 0:
-            raise ValueError(
-                f"{type(self).__name__}.latest_snapshot(n={n}): bars[0].seq must "
-                f"be 0 (forming bar), got seq={forming.seq}."
-            )
-        for i, bar in enumerate(bars[1:], start=1):
-            if not bar.closed:
+        head = bars[0]
+        if not head.closed:
+            # Normal mode: bars[0] is the forming bar.
+            if head.seq != 0:
                 raise ValueError(
-                    f"{type(self).__name__}.latest_snapshot(n={n}): bars[{i}] must "
-                    f"be closed (only bars[0] is the forming bar), got closed=False "
-                    f"seq={bar.seq}."
+                    f"{type(self).__name__}.latest_snapshot(n={n}): bars[0].seq "
+                    f"must be 0 (forming bar), got seq={head.seq}."
                 )
-            expected_seq = i
-            if bar.seq != expected_seq:
+            if len(bars) != n + 1:
                 raise ValueError(
-                    f"{type(self).__name__}.latest_snapshot(n={n}): bars[{i}].seq "
-                    f"must be {expected_seq}, got seq={bar.seq}."
+                    f"{type(self).__name__}.latest_snapshot(n={n}): forming bar "
+                    f"present but returned {len(bars)} bars, expected {n + 1}."
                 )
+            for i, bar in enumerate(bars[1:], start=1):
+                if not bar.closed:
+                    raise ValueError(
+                        f"{type(self).__name__}.latest_snapshot(n={n}): bars[{i}] must "
+                        f"be closed (only bars[0] is the forming bar), got closed=False "
+                        f"seq={bar.seq}."
+                    )
+                if bar.seq != i:
+                    raise ValueError(
+                        f"{type(self).__name__}.latest_snapshot(n={n}): bars[{i}].seq "
+                        f"must be {i}, got seq={bar.seq}."
+                    )
+        else:
+            # Halt mode: bars[0] is the newest closed bar (seq=1).
+            if head.seq != 1:
+                raise ValueError(
+                    f"{type(self).__name__}.latest_snapshot(n={n}): halt-mode "
+                    f"bars[0].seq must be 1, got seq={head.seq}."
+                )
+            if len(bars) != n:
+                raise ValueError(
+                    f"{type(self).__name__}.latest_snapshot(n={n}): halt mode "
+                    f"returned {len(bars)} bars, expected {n} (no forming bar)."
+                )
+            for i, bar in enumerate(bars, start=1):
+                if not bar.closed:
+                    raise ValueError(
+                        f"{type(self).__name__}.latest_snapshot(n={n}): halt mode "
+                        f"requires all bars closed, but bars[{i - 1}] has "
+                        f"closed=False."
+                    )
+                if bar.seq != i:
+                    raise ValueError(
+                        f"{type(self).__name__}.latest_snapshot(n={n}): bars[{i - 1}].seq "
+                        f"must be {i}, got seq={bar.seq}."
+                    )
         return bars

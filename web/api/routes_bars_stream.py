@@ -90,9 +90,11 @@ def _format_bar(bar: Any) -> dict:
 def _compute_next_close_ts(ts_open_ms: Any, timeframe: str) -> int | None:
     """计算 forming bar 的下一根收盘时间戳（毫秒）。
 
-    ``next_close_ts = ts_open + timeframe_duration_ms``。
+    使用与 seconds_until_bar_closes 一致的算法：通过 elapsed % duration
+    计算剩余时间，再加上当前时间，避免时区偏移导致的计算错误。
     timeframe 无法解析或 ts_open 无效时返回 None。
     """
+    import time as _time
     try:
         ts_open = int(ts_open_ms)
     except (TypeError, ValueError):
@@ -102,7 +104,15 @@ def _compute_next_close_ts(ts_open_ms: Any, timeframe: str) -> int | None:
     duration_s = timeframe_to_seconds(timeframe)
     if duration_s is None or duration_s <= 0:
         return None
-    return ts_open + duration_s * 1000
+    now_ms = int(_time.time() * 1000)
+    duration_ms = duration_s * 1000
+    elapsed_ms = now_ms - ts_open
+    if elapsed_ms <= 0:
+        return ts_open + duration_ms
+    remainder_ms = elapsed_ms % duration_ms
+    if remainder_ms == 0:
+        return now_ms + duration_ms
+    return now_ms + (duration_ms - remainder_ms)
 
 
 # ── 后台 bar close 检测 Task ───────────────────────────────────────────────────
@@ -193,6 +203,7 @@ async def _background_bars_loop(app: Any) -> None:
             source = getattr(ctx, "data_source", None) if ctx is not None else None
             if ctx is None or source is None:
                 await asyncio.sleep(_NO_SOURCE_RETRY_S)
+                await _broadcast({"event": "ping", "data": ""})
                 continue
 
             symbol, timeframe = _resolve_symbol_timeframe(ctx, source)
@@ -202,16 +213,19 @@ async def _background_bars_loop(app: Any) -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("bars_stream snapshot fetch failed: %s", exc)
                 await asyncio.sleep(_NO_SOURCE_RETRY_S)
+                await _broadcast({"event": "ping", "data": ""})
                 continue
 
             if not bars:
                 await asyncio.sleep(_NO_SOURCE_RETRY_S)
+                await _broadcast({"event": "ping", "data": ""})
                 continue
 
             forming_bar = bars[0]
             ts_open_ms = int(getattr(forming_bar, "ts_open", 0))
             if ts_open_ms <= 0:
                 await asyncio.sleep(_NO_SOURCE_RETRY_S)
+                await _broadcast({"event": "ping", "data": ""})
                 continue
 
             wait_seconds = seconds_until_bar_closes(ts_open_ms, timeframe)
@@ -273,6 +287,9 @@ async def start_background_task(app: Any) -> None:
     global _background_task
     if _background_task is None or _background_task.done():
         _background_task = asyncio.create_task(_background_bars_loop(app))
+        logger.info("Background bars stream task created")
+    else:
+        logger.info("Background bars stream task already running")
 
 
 async def stop_background_task() -> None:
