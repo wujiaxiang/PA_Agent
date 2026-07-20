@@ -1,0 +1,2 @@
+# TradingView auth token cache (contains JWT, must not commit)
+.tv_token_cache.json

@@ -38,7 +38,7 @@ async def put_settings(request: Request, body: dict):
     """Merge *body* into current settings and save to disk."""
     ctx = request.app.state.ctx
     current = ctx.settings
-    for section in ("provider", "prompt", "validation", "general", "feishu", "tushare", "pushplus"):
+    for section in ("provider", "prompt", "validation", "general", "feishu", "tushare", "pushplus", "tradingview"):
         if section in body and isinstance(body[section], dict):
             target = getattr(current, section, None)
             if target is not None:

@@ -158,6 +158,20 @@ class TushareSettings(BaseModel):
     token: str = ""
 
 
+class TradingViewSettings(BaseModel):
+    """TradingView credentials persisted in settings.json.
+
+    Stored in plain text — TradingView login has no scoped-token concept.
+    When both fields are empty, the factory falls back to anonymous mode.
+    Env vars ``PA_AGENT_TRADINGVIEW_USERNAME`` / ``PA_AGENT_TRADINGVIEW_PASSWORD``
+    override these on a per-deployment basis (.env for headless servers).
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    username: str = ""
+    password: str = ""
+
+
 class PushPlusSettings(BaseModel):
     """PushPlus notification settings (settings.json only; no GUI)."""
     model_config = ConfigDict(extra="ignore")
@@ -177,6 +191,7 @@ class Settings(BaseModel):
     feishu: FeishuSettings = Field(default_factory=FeishuSettings)
     pushplus: PushPlusSettings = Field(default_factory=PushPlusSettings)
     tushare: TushareSettings = Field(default_factory=TushareSettings)
+    tradingview: TradingViewSettings = Field(default_factory=TradingViewSettings)
 
 
 def provider_api_key_configured(settings: Settings | None) -> bool:

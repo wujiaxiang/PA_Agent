@@ -404,6 +404,12 @@ async function loadSettings() {
     setChecked('#s-pushplus-enabled', pp.enabled);
     const ts = s.tushare || {};
     $('#s-tushare-token').value = ts.token || '';
+    // TradingView 凭证
+    const tv = s.tradingview || {};
+    const tvUserEl = $('#s-tv-username');
+    const tvPassEl = $('#s-tv-password');
+    if (tvUserEl) tvUserEl.value = tv.username || '';
+    if (tvPassEl) tvPassEl.value = tv.password || '';
     // API Key 未配置警告：检查 provider.api_key_encrypted 是否为空字符串
     updateApiKeyAlert(s);
     return s;
@@ -869,9 +875,14 @@ async function saveSettingsHandler() {
       tushare: {
         token: $('#s-tushare-token').value,
       },
+      // TradingView 凭证（空字符串=匿名访问；保存到 settings.json 后下次切换生效）
+      tradingview: {
+        username: ($('#s-tv-username')?.value || '').trim(),
+        password: ($('#s-tv-password')?.value || '').trim(),
+      },
     });
     $('#settings-modal').classList.add('hidden');
-    alert('设置已保存');
+    showToast('设置已保存', 'success');
     // 立即应用新时区到图表（不必等 loadSettings）
     displayTimezone = newTz;
     if (window._chartAPI?.setDisplayTimezone) {
@@ -888,7 +899,7 @@ async function saveSettingsHandler() {
       startSSEBarsStream();
     }
   } catch (e) {
-    alert('保存失败: ' + e.message);
+    showToast('保存失败: ' + e.message, 'error');
   }
 }
 
@@ -4007,7 +4018,7 @@ async function replayRecord(recordId) {
     $('#tab-decision').classList.add('active');
   } catch (e) {
     console.error('replayRecord:', e);
-    alert('加载历史记录失败');
+    showToast('加载历史记录失败', 'error');
   }
 }
 
@@ -4258,8 +4269,9 @@ function exportRecordJson() {
 }
 
 // 临时 Toast 提示（不依赖 toast-container，使用简易浮层）
-function showToast(message) {
+function showToast(message, type) {
   // 复用已有 toast-container（Phase E 引入）；不存在则创建临时浮层
+  // type: 'success' | 'warning' | 'error' | undefined（默认中性灰）
   let container = document.getElementById('toast-container');
   if (!container) {
     container = document.createElement('div');
@@ -4269,12 +4281,18 @@ function showToast(message) {
   }
   const toast = document.createElement('div');
   toast.className = 'toast-card';
-  toast.style.cssText = 'background:#1e222d;color:#d1d4dc;border:1px solid #363c4e;border-radius:6px;padding:8px 14px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,0.4);max-width:280px;';
+  // 按 type 选择背景色（与 app 中 success/error 视觉约定一致）
+  let bg = '#1e222d';   // default
+  if (type === 'success') bg = '#1e3a2e';
+  else if (type === 'warning') bg = '#3a2e1e';
+  else if (type === 'error') bg = '#3a1e1e';
+  toast.style.cssText = `background:${bg};color:#d1d4dc;border:1px solid #363c4e;border-radius:6px;padding:8px 14px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,0.4);max-width:280px;`;
   toast.textContent = message;
   container.appendChild(toast);
+  const ttl = type === 'error' ? 4000 : 2000;
   setTimeout(() => {
     if (toast.parentNode) toast.parentNode.removeChild(toast);
-  }, 2000);
+  }, ttl);
 }
 
 // ── 下单机会提醒（Phase E Task 12） ────────────────────────────────────

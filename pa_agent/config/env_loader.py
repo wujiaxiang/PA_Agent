@@ -184,10 +184,24 @@ def apply_env_overrides(settings: Any) -> None:
         logger.info("Applied %d env overrides from .env / process env", applied)
 
 
-def get_tv_credentials() -> tuple[str, str]:
-    """Return (username, password) for TradingView from env vars.
+def get_tv_credentials(settings: "object | None" = None) -> tuple[str, str]:
+    """Return (username, password) for TradingView.
 
-    Returns ("", "") if not set — callers use this to decide anonymous vs
-    authenticated mode.
+    Resolution order: ``settings.tradingview`` (UI-managed) → env vars
+    ``PA_AGENT_TRADINGVIEW_USERNAME`` / ``PA_AGENT_TRADINGVIEW_PASSWORD``
+    (headless server / .env deployment).
+
+    Returns ("", "") when neither source is configured — callers use this
+    to decide anonymous vs authenticated mode.
     """
-    return (get_env_str("PA_AGENT_TRADINGVIEW_USERNAME"), get_env_str("PA_AGENT_TRADINGVIEW_PASSWORD"))
+    s_user = s_pass = ""
+    if settings is not None:
+        tv = getattr(settings, "tradingview", None)
+        if tv is not None:
+            s_user = (getattr(tv, "username", "") or "").strip()
+            s_pass = (getattr(tv, "password", "") or "").strip()
+    if s_user and s_pass:
+        return (s_user, s_pass)
+    env_user = get_env_str("PA_AGENT_TRADINGVIEW_USERNAME")
+    env_pass = get_env_str("PA_AGENT_TRADINGVIEW_PASSWORD")
+    return (s_user or env_user, s_pass or env_pass)

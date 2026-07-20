@@ -83,6 +83,217 @@ def _patch_tvdatafeed_ws_headers() -> None:
     finally:
         _tv_ws_headers_patched = True
 
+
+# Browser-like User-Agent for TradingView signin. tvDatafeed 2.1.0 uses
+# requests' default UA which TradingView silently rate-limits; a browser UA
+# is required for the /accounts/signin/ endpoint to return real auth tokens.
+_TV_AUTH_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+# Name-mangled attribute tvDatafeed 2.1.0 uses for its signin method.
+_TV_AUTH_ATTR = "_TvDatafeed__auth"
+
+_tv_auth_patched = False
+
+# ── auth token cache ────────────────────────────────────────────────────────
+# tvDatafeed 2.1.0 calls __auth on every TvDatafeed(username, password)
+# construction. Our connect() is invoked on server startup, on data-source
+# type switch, and on reconnect-after-error — each login attempt hits
+# TradingView's /accounts/signin/ endpoint, and rapid repeated logins
+# trigger risk control (rate_limit, recaptcha_required). To avoid that,
+# we cache the auth_token both in-memory (process lifetime) and on disk
+# (across restarts), keyed by (username, password_hash).
+#
+# TradingView's JWT auth_token is valid for ~7 days; we use a conservative
+# 24h TTL so a long-running server won't keep using a stale token.
+import hashlib
+import json as _json
+import os as _os
+import time as _time
+from pathlib import Path as _Path
+
+_TV_TOKEN_TTL_S = 24 * 3600  # 24 hours
+_TV_TOKEN_CACHE_ENV = _os.environ.get("PA_AGENT_TV_TOKEN_CACHE", "")
+_TV_TOKEN_CACHE_FILE = (
+    _Path(_TV_TOKEN_CACHE_ENV)
+    if _TV_TOKEN_CACHE_ENV
+    else _Path(__file__).resolve().parent.parent.parent / "config" / ".tv_token_cache.json"
+)
+
+# In-memory cache: (username, password_hash) -> (token, saved_at_epoch)
+_tv_token_cache: dict[tuple[str, str], tuple[str, float]] = {}
+
+
+def _hash_password(password: str) -> str:
+    """SHA-256 of password — stored on disk instead of plaintext creds."""
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def _load_disk_cache() -> dict[tuple[str, str], tuple[str, float]]:
+    """Read the on-disk token cache. Returns empty dict on any error."""
+    try:
+        if not _TV_TOKEN_CACHE_FILE.exists():
+            return {}
+        raw = _json.loads(_TV_TOKEN_CACHE_FILE.read_text(encoding="utf-8"))
+        out: dict[tuple[str, str], tuple[str, float]] = {}
+        for entry in raw.get("tokens", []) if isinstance(raw, dict) else []:
+            try:
+                u = str(entry.get("username", ""))
+                h = str(entry.get("password_hash", ""))
+                t = str(entry.get("token", ""))
+                ts = float(entry.get("saved_at", 0))
+                if u and h and t and ts > 0:
+                    out[(u, h)] = (t, ts)
+            except (TypeError, ValueError):
+                continue
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_disk_cache() -> None:
+    """Persist the in-memory cache to disk. Best-effort, never raises."""
+    try:
+        _TV_TOKEN_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        entries = [
+            {
+                "username": u,
+                "password_hash": h,
+                "token": t,
+                "saved_at": ts,
+            }
+            for (u, h), (t, ts) in _tv_token_cache.items()
+        ]
+        _TV_TOKEN_CACHE_FILE.write_text(
+            _json.dumps({"tokens": entries}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("tvDatafeed token cache write failed: %s", exc)
+
+
+def _patch_tvdatafeed_auth() -> None:
+    """Monkey-patch tvDatafeed 2.1.0's ``__auth`` to use a real session.
+
+    The stock implementation calls ``requests.post`` directly with no
+    session, no User-Agent, and no cookies. TradingView's /accounts/signin/
+    endpoint returns ``{"error": "...", "code": "rate_limit"}`` for such
+    bare requests — even when the credentials are correct — so tvDatafeed
+    silently falls back to anonymous mode and logs ``error while signin``.
+
+    Fix: open a ``requests.Session``, set a browser UA, GET the homepage
+    to seed cookies, then POST the signin form. Verified to return a valid
+    ``user.auth_token`` (846-char JWT) for accounts that can log in via Web.
+
+    Token caching: the resulting auth_token is cached both in-memory and
+    on disk (``config/.tv_token_cache.json``), keyed by
+    ``(username, sha256(password))`` with a 24h TTL. Subsequent calls
+    (new TvDatafeed constructions, server restarts) return the cached
+    token directly without hitting /accounts/signin/ — this avoids
+    triggering TradingView's risk control (recaptcha_required) on
+    frequent logins.
+
+    Idempotent — subsequent calls are no-ops.
+    """
+    global _tv_auth_patched
+    if _tv_auth_patched:
+        return
+
+    # Load disk cache into memory once at patch time
+    _tv_token_cache.update(_load_disk_cache())
+    if _tv_token_cache:
+        logger.info(
+            "tvDatafeed token cache loaded: %d entr(y|ies) from %s",
+            len(_tv_token_cache), _TV_TOKEN_CACHE_FILE,
+        )
+
+    try:
+        import requests
+        from tvDatafeed import TvDatafeed  # type: ignore[import]
+
+        # Preserve the original so we can fall back if our path fails
+        # unexpectedly (e.g. TradingView changes its signin API entirely).
+        original_auth = getattr(TvDatafeed, _TV_AUTH_ATTR, None)
+
+        def _patched_auth(self, username, password):
+            if not username or not password:
+                return None
+
+            # 1. Cache lookup — if we have a fresh token for these creds,
+            #    return it without hitting TradingView.
+            cache_key = (username, _hash_password(password))
+            cached = _tv_token_cache.get(cache_key)
+            if cached is not None:
+                token, saved_at = cached
+                age = _time.time() - saved_at
+                if age < _TV_TOKEN_TTL_S and token:
+                    logger.info(
+                        "tvDatafeed auth: using cached token (age=%.1fh, ttl=%.0fh)",
+                        age / 3600, _TV_TOKEN_TTL_S / 3600,
+                    )
+                    return token
+                # Expired — evict; fall through to network login
+                logger.info(
+                    "tvDatafeed auth: cached token expired (age=%.1fh), re-login",
+                    age / 3600,
+                )
+                _tv_token_cache.pop(cache_key, None)
+
+            # 2. Network login — session + UA + cookies.
+            session = requests.Session()
+            session.headers.update({"User-Agent": _TV_AUTH_USER_AGENT})
+            try:
+                # 2a. Seed session cookies (TradingView rejects POSTs without them)
+                session.get("https://www.tradingview.com/", timeout=15)
+                # 2b. POST signin form
+                resp = session.post(
+                    "https://www.tradingview.com/accounts/signin/",
+                    data={
+                        "username": username,
+                        "password": password,
+                        "remember": "on",
+                    },
+                    headers={"Referer": "https://www.tradingview.com"},
+                    timeout=15,
+                )
+                data = resp.json()
+                token = (data.get("user") or {}).get("auth_token")
+                if token:
+                    # 3. Persist to in-memory + disk cache
+                    _tv_token_cache[cache_key] = (token, _time.time())
+                    _save_disk_cache()
+                    logger.info(
+                        "tvDatafeed auth: login OK, token cached (len=%d)",
+                        len(token),
+                    )
+                    return token
+                # TradingView returns {"error": "...", "code": "..."} on failure
+                err = data.get("error") or "unknown error"
+                code = data.get("code") or ""
+                logger.warning(
+                    "tvDatafeed auth failed: error=%r code=%r", err, code,
+                )
+                return None
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "tvDatafeed patched __auth exception: %s; "
+                    "falling back to original implementation", exc,
+                )
+                if original_auth is not None:
+                    return original_auth(self, username, password)
+                return None
+
+        setattr(TvDatafeed, _TV_AUTH_ATTR, _patched_auth)
+        logger.info("Patched tvDatafeed __auth (session + UA + token cache)")
+    except ImportError:
+        logger.debug("tvDatafeed not installed; __auth patch skipped")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("tvDatafeed __auth patch failed: %s", exc)
+    finally:
+        _tv_auth_patched = True
+
 # Map our timeframe strings to tvDatafeed Interval enum names
 _TF_MAP: dict[str, str] = {
     "1m":  "in_1_minute",
@@ -286,6 +497,7 @@ class TradingViewSource(DataSource):
         try:
             from tvDatafeed import TvDatafeed  # type: ignore[import]
             _patch_tvdatafeed_ws_headers()
+            _patch_tvdatafeed_auth()
             if self._username and self._password:
                 self._tv = TvDatafeed(self._username, self._password)
             else:

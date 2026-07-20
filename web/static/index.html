@@ -406,6 +406,15 @@
         <label class="checkbox-label">
           <input id="s-thinking" type="checkbox" checked> 扩展思考（Thinking）
         </label>
+        <fieldset class="settings-fieldset">
+          <legend>TradingView 凭证（选填）</legend>
+          <p class="muted-text" style="font-size:12px;margin:0 0 6px;">
+            匿名访问美股（如 NVDA）会被限流。配置账号后即可正常拉取。
+            凭证保存到 settings.json；切换/应用品种后生效。
+          </p>
+          <label>用户名（Username） <input id="s-tv-username" type="text" autocomplete="off"></label>
+          <label>密码（Password） <input id="s-tv-password" type="password" autocomplete="off"></label>
+        </fieldset>
       </div>
       <div id="stab-s-general" class="stab-panel">
         <!-- 数据刷新组 -->

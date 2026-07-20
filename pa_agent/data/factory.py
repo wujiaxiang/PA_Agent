@@ -82,9 +82,14 @@ def create_data_source(kind: str | None) -> DataSource:
     normalized = normalize_data_source_kind(kind)
     if normalized == "tradingview":
         from pa_agent.config.env_loader import get_tv_credentials
+        from pa_agent.config.paths import SETTINGS_JSON_PATH
+        from pa_agent.config.settings import load_settings
         from pa_agent.data.tradingview import TradingViewSource
 
-        username, password = get_tv_credentials()
+        # Read TV credentials from settings.json first (UI-managed),
+        # falling back to env vars for headless deployment.
+        settings = load_settings(SETTINGS_JSON_PATH)
+        username, password = get_tv_credentials(settings)
         return TradingViewSource(username=username, password=password)
     if normalized == "eastmoney":
         from pa_agent.data.eastmoney_source import EastMoneySource

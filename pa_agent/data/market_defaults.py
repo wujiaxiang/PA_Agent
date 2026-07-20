@@ -470,12 +470,21 @@ def resolve_tv_gold_pair(
     sym = sym or GOLD_TV_SYMBOL
     expected = TV_GOLD_SYMBOL_BY_EXCHANGE.get(ex)
     if expected is not None:
+        # Known gold exchange — normalize symbol (XAUUSD <-> GOLD).
         if sym != expected:
             return ex, expected, True
         return ex, expected, False
+    # Symbol is a gold keyword on a non-gold exchange → route to default gold feed.
     if sym == "GOLD":
         return "TVC", "GOLD", ex != "TVC"
-    return GOLD_TV_EXCHANGE, GOLD_TV_SYMBOL, ex != GOLD_TV_EXCHANGE or sym != GOLD_TV_SYMBOL
+    if sym in _GOLD_TV_SYMBOLS:
+        return GOLD_TV_EXCHANGE, GOLD_TV_SYMBOL, ex != GOLD_TV_EXCHANGE or sym != GOLD_TV_SYMBOL
+    # Non-gold exchange + non-gold symbol (e.g. NASDAQ/NVDA, NYSE/AAPL) — trust
+    # the user's choice. Previously this branch forced every unknown symbol to
+    # OANDA/XAUUSD, which corrupted equity subscriptions on every load_settings()
+    # call via migrate_general_gold_defaults() — users saved NVDA/NASDAQ but the
+    # next page refresh showed XAUUSD/OANDA.
+    return ex or "", sym, False
 
 
 def migrate_general_gold_defaults(general: dict) -> None:
