@@ -4,6 +4,13 @@
 
 仓库同样**不会上传**：`records/`（分析落盘）、`experience/`（经验库内容）、`logs/`、`trade_records/`（交易 CSV/截图）、`.env`、根目录临时图片与个人笔记等。仅源代码、`prompt_engineering/` 策略文本、`tests/` 与 `docs/` 说明文档会进入 GitHub。
 
+## 相关文档
+
+- [README.md](../README.md) — 项目总览、快速开始、三层覆盖优先级说明
+- [.env.example](../.env.example) — 环境变量模板（与 `settings.json` 配合使用）
+- [PA_Agent使用文档.md](../PA_Agent使用文档.md) — 完整功能说明
+- [CONTRIBUTING.md](../CONTRIBUTING.md) — 开发者环境搭建
+
 ## 首次使用
 
 1. 复制模板为本地配置：

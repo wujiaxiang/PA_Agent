@@ -1,6 +1,20 @@
 # PA Agent — 功能详细使用文档
 
 > AI K线分析辅助工具，基于价格行为学（Price Action），通过 DeepSeek / Claude 等大模型进行市场结构分析与交易决策。
+>
+> **本文档为原项目文档，主要描述桌面 GUI 模式**。Web 后端（本仓库二次开发主推）的差异见 [README.md §Web 后端 vs 桌面 GUI 的差异](README.md#web-后端-vs-桌面-gui-的差异重要)。
+
+---
+
+## 相关文档
+
+- [README.md](README.md) — 项目总览、快速开始、开发者指南、已知坑库
+- [docs/获取数据功能说明.md](docs/获取数据功能说明.md) — 数据源连接与刷新机制（双模式对比）
+- [docs/图表K线与分析快照说明.md](docs/图表K线与分析快照说明.md) — K 线序号与休市模式行为
+- [config/README.md](config/README.md) — `settings.json` 全字段说明
+- [CONTRIBUTING.md](CONTRIBUTING.md) — 贡献代码必读
+- [TODO.md](TODO.md) — 后续优化路线图
+- [AGENTS.md](AGENTS.md) — 项目改动日志
 
 ---
 

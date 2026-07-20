@@ -37,6 +37,44 @@
 
 完整功能说明见原项目文档 [`PA_Agent使用文档.md`](PA_Agent使用文档.md)，配置字段说明见 [`config/README.md`](config/README.md)。
 
+### 文档索引
+
+本仓库文档分四类，按使用场景查阅：
+
+#### 用户文档（使用工具）
+
+| 文档 | 内容 | 适用模式 |
+| --- | --- | --- |
+| [PA_Agent使用文档.md](PA_Agent使用文档.md) | 原项目完整功能说明（桌面 GUI 为主） | 桌面 GUI |
+| [docs/获取数据功能说明.md](docs/获取数据功能说明.md) | 数据源连接、刷新机制、切换逻辑、错误处理 | 双模式 |
+| [docs/图表K线与分析快照说明.md](docs/图表K线与分析快照说明.md) | K 线序号 K1…KN、forming bar、休市模式行为 | 双模式 |
+| [config/README.md](config/README.md) | `settings.json` 全字段说明、安全提醒 | 双模式 |
+
+#### 开发者文档（贡献代码）
+
+| 文档 | 内容 |
+| --- | --- |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 开发环境、启动方式、提交前检查、PR 建议、开发者参考约束 |
+| [README.md §开发者指南](#开发者指南) | 架构概览、关键 API、数据源系统、测试分层、已知坑库 |
+| [README.md §已知坑与修复记录](#已知坑与修复记录重要) | 13 条已踩过的坑，调试前必读 |
+
+#### 项目管理文档（迭代规划与日志）
+
+| 文档 | 内容 |
+| --- | --- |
+| [TODO.md](TODO.md) | 本机部署步骤、P0/P1/P2 优化项完成记录、阶段 1-9 执行顺序、后续可推进的优化 |
+| [AGENTS.md](AGENTS.md) | 项目改动日志（按日期），大迭代 / 重构 / 关键 bug 修复必须追加 |
+
+#### 二次开发改动概览
+
+| 改动 | 文档位置 |
+| --- | --- |
+| Web 后端 vs 桌面 GUI 差异表 | [§Web 后端 vs 桌面 GUI 的差异](#web-后端-vs-桌面-gui-的差异重要) |
+| 13 条已知坑与修复 | [§已知坑与修复记录](#已知坑与修复记录重要) |
+| 上游同步策略 | [§与上游的同步策略](#与上游的同步策略) |
+
+> **维护规则**：四类文档联动更新规则见 [AGENTS.md §维护提醒](AGENTS.md#维护提醒)。
+
 ---
 
 ## 快速开始
@@ -70,6 +108,26 @@ curl http://localhost:8000/api/settings
 ```
 
 环境要求：Python 3.11+；Windows/macOS/Linux。`.env` 模板与三层覆盖优先级说明见 [`.env.example`](.env.example)。
+
+#### Windows 一键启动
+
+Windows 用户可双击 [`start_pa_agent.bat`](start_pa_agent.bat)，脚本会自动切换到项目根目录并启动 Web 后端（默认端口 8000）。
+
+#### Web 后端 vs 桌面 GUI 的差异（重要）
+
+本仓库**默认推荐 Web 后端**模式，但桌面 GUI 仍可用。两者差异如下：
+
+| 维度 | Web 后端（推荐） | 桌面 GUI |
+| --- | --- | --- |
+| 启动入口 | `python -m uvicorn web.server:app` 或 `start_pa_agent.bat` | `python -m pa_agent.main` |
+| UI 技术栈 | FastAPI + 前端（HTML/JS/CSS，浏览器渲染） | PyQt6 |
+| 配置入口 | `.env` + `config/settings.json`（三层覆盖） | 启动后 GUI 设置面板写入 `config/settings.json` |
+| 实时 K 线 | SSE 推送（`/api/bars/stream`） | Qt EventBus + 定时器轮询 |
+| 历史记录 | REST API `/api/records` | 本地文件浏览 |
+| 适用场景 | 云端 / 无显示器 / 远程访问 | 本地桌面、需要直连 MT5 |
+| Demo 模式 | ❌ 暂未实现 | ✅ 支持 |
+
+> ⚠️ **启动方式不一致提醒**：原项目主入口是 `python -m pa_agent.main`（桌面 GUI），本仓库二次开发后**默认改为 Web 后端**启动。若你按原项目文档执行 `python -m pa_agent.main`，会启动 PyQt6 GUI（需显示器），与 Web 后端是完全独立的进程。两种模式共享 `pa_agent/` 核心层与 `config/settings.json` 配置，但运行时互不通信，**不要同时启动两个**。
 
 ---
 
@@ -196,6 +254,41 @@ make lint / make test / make run
 5. **`check_model_api` TypeError**：`stream_chat()` 返回 `AIReply` 不可迭代，健康检查必须用 `client.chat()` 直接调用。
 
 6. **TradingView 加密品种**：`normalize_gold_symbol_for_kind` 旧逻辑会把 `BTCUSDT` 这种 crypto symbol 强制改回 `XAUUSD`，已修复为识别 crypto 时保持原样。
+
+7. **休市后 K1 序号不显示**（2026-07-20 修复）：
+   - 现象：NVDA 美股收盘后，最后一根 K 线是 close bar，但前端不显示 `#1` 序号。
+   - 根因：[bar_close_wait.py](pa_agent/data/bar_close_wait.py) 的 `seconds_until_bar_closes` 用 `elapsed_ms % duration_ms` 取模算法，对已收盘 bar 仍返回正值（"到下一次开盘的剩余时间"），导致 bar 被错误标记为 `seq=0, closed=False`（forming bar），前端 `setSeqMarkers` 跳过 `seq <= 0` 的 bar。
+   - 修复：`seconds_until_bar_closes` 在 `now_ms >= ts_open_ms + duration_ms` 时直接返回 0（绝对时间判断）；[tradingview.py](pa_agent/data/tradingview.py) 的 `_latest_snapshot_inner` 在休市模式下 `bars[0]` 用 `seq=1, closed=True`；[base.py](pa_agent/data/base.py) 的 `_validate_snapshot` 支持两种模式（正常 n+1 根含 forming / 休市 n 根全 closed）。
+
+8. **tvDatafeed 未安装 / NumPy CPU 不兼容**：
+   - 现象：切换港交所（HKEX）等非加密交易所时 `No module named 'tvDatafeed'`；或 `numpy` 报 `X86_V2` CPU 指令集错误。
+   - 修复：`pip install git+https://github.com/rongardF/tvdatafeed.git`；NumPy 不兼容时降级到 `numpy==1.26.4`。A股数据源（AkShare）无需 tvDatafeed，可作 fallback。
+
+9. **K 线时间轴 8h 偏移**（[tradingview.py](pa_agent/data/tradingview.py) `_row_ts_ms`）：
+   - 现象：TradingView 返回的 naive DatetimeIndex 被当作 UTC，导致 K 线显示在未来 8 小时。
+   - 根因：`datetime_to_ts_ms` 把 naive Timestamp 当 UTC 处理，但 tvDatafeed 实际返回的是交易所本地时间（服务器时区，如 UTC+8）。
+   - 修复：`_row_ts_ms` 先把 naive Timestamp 本地化到服务器时区再转 UTC。
+
+10. **主副图时间轴不对齐**（[indicators.js](web/static/js/indicators.js)）：
+    - 现象：添加 MACD/RSI 副图后，滚动/缩放主图时副图时间轴不同步。
+    - 根因：原同步用逻辑索引（数据点位置），但主副图数据点数量不同导致索引错位。
+    - 修复：改用时间戳范围同步（`getVisibleRange()` / `setVisibleRange()` / `subscribeVisibleTimeRangeChange`）。
+
+11. **SSE 倒计时不显示 / 显示异常**：
+    - 现象 1：选 1h 周期时持续追踪倒计时显示 10000+ 秒。根因：`onopen` 立即设置 `sseLastBarUpdateTs`，但 `sseNextCloseTs` 尚未被第一个 `bar_update` 事件更新。修复：`onopen` 仅启动定时器，不设置 `sseLastBarUpdateTs`；新增 sanity check（`remaining > tfSecs` 则丢弃）。
+    - 现象 2：切换周期后倒计时消失。根因：`applySubscribe` 切换周期后未刷新 `currentSettings`。修复：`tfSecs` 优先从 `#ds-timeframe` 读取，`applySubscribe` 成功后调用 `loadSettings()`。
+    - 现象 3：`_compute_next_close_ts()` 用 `ts_open + duration` 产生时区偏移。修复：改用 `elapsed % duration` 取模算法（与 `seconds_until_bar_closes` 对齐）。
+    - 现象 4：SSE 连接失败降级到轮询后无倒计时。修复：新增 `fetchAndUpdateNextCloseTs()` 低频拉取 `/api/bars/next-close`。
+
+12. **分析失败后进度条跳到完成**：
+    - 现象：阶段一分析失败后，进度条仍推进到 100%。
+    - 根因：后端在分析失败时仍推送 `done` 事件，前端无条件调用 `setFlowBarStep(6)`。
+    - 修复：新增 `.flow-step.failed` CSS 类与 `setFlowBarFailed(failedStep)`；`done` 事件检查 `evt.record.exception`，有异常时保留失败状态 10 秒。
+
+13. **`_validate_snapshot` 休市模式契约**（2026-07-20 修复，配合坑 7）：
+    - 正常模式：返回 `n+1` 根，`bars[0].closed == False, seq == 0`（forming bar）。
+    - 休市模式：返回 `n` 根，全部 `closed == True`，`bars[0].seq == 1`（无 forming bar）。
+    - [snapshot.py](pa_agent/data/snapshot.py) 的 `has_forming_bar_at_head` 已正确处理两种模式，消费方应使用该函数判断，**不要**硬编码 `bars[0].closed == False`。
 
 ### 目录结构速查
 
