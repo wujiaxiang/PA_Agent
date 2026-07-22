@@ -58,7 +58,8 @@ def _derive_last_close_bar_iso(record: AnalysisRecord) -> str:
 
     派生链：
       1. ``record.meta.last_close_bar_iso``（新记录由 orchestrator 写入）
-      2. ``record.kline_data[-1].ts_open``（ms 时间戳）→ 本地 ISO 字符串；
+      2. ``record.kline_data[1].ts_open``（ms 时间戳）→ 本地 ISO 字符串；
+         kline_data 是 newest-first，bars[0] = forming bar，bars[1] = K1（刚收盘）；
          兼容旧字段 ``time``
       3. ``record.stage1_diagnosis.bar_analysis.last_closed_bar``（直接字符串），
          但必须通过 ISO 时间格式校验，过滤 "K1" 这类 K 线代号
@@ -70,9 +71,10 @@ def _derive_last_close_bar_iso(record: AnalysisRecord) -> str:
 
     if record.kline_data:
         try:
-            bar = record.kline_data[-1] or {}
+            # kline_data is newest-first: bars[0] = forming bar, bars[1] = K1 (just closed)
+            target_bar = record.kline_data[1] if len(record.kline_data) > 1 else record.kline_data[0]
             # 实际时间字段是 ts_open（ms）；time 是旧字段名，做兼容
-            ts_ms = int(bar.get("ts_open") or bar.get("time") or 0)
+            ts_ms = int(target_bar.get("ts_open") or target_bar.get("time") or 0)
             if ts_ms > 0:
                 return datetime.fromtimestamp(ts_ms / 1000).isoformat()
         except (TypeError, ValueError, AttributeError, IndexError):
@@ -168,6 +170,8 @@ def _list_records(
             "partial_reason": partial_reason,
             "has_exception": record.exception is not None,
             "last_close_bar_iso": _derive_last_close_bar_iso(record),
+            "incremental": getattr(record.meta, "incremental", False),
+            "continuous": getattr(record.meta, "continuous", False),
         })
     return result
 

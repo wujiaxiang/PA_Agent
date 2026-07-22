@@ -197,6 +197,8 @@ def _emit_buffered_stream(
 def _build_empty_record(
     frame: KlineFrame,
     settings: Optional["Settings"],
+    incremental: bool = False,
+    continuous: bool = False,
 ) -> AnalysisRecord:
     """Build a partial AnalysisRecord with meta populated from the frame."""
     ts_ms = now_local_ms()
@@ -236,17 +238,20 @@ def _build_empty_record(
     if settings is not None:
         exchange = str(getattr(settings.general, "last_tradingview_exchange", "") or "")
 
-    # Derive last_close_bar_iso from the last kline bar's `time` (ms timestamp).
-    # Mirrors timestamp_local_iso generation: local ISO via datetime.fromtimestamp.
+    # Derive last_close_bar_iso from the first closed bar's ts_open (ms timestamp).
+    # kline_data is newest-first: bars[0] = forming bar, bars[1] = K1 (just closed).
+    # Use K1's ts_open as the "close bar time" for display in history list.
     last_close_bar_iso = ""
     if kline_data:
         try:
-            ts_close_ms = int(kline_data[-1].get("time", 0))
+            # bars[0] = forming bar (closed=False), bars[1] = K1 (just closed)
+            target_bar = kline_data[1] if len(kline_data) > 1 else kline_data[0]
+            ts_close_ms = int(target_bar.get("ts_open") or target_bar.get("time", 0))
             if ts_close_ms > 0:
                 last_close_bar_iso = datetime.fromtimestamp(
                     ts_close_ms / 1000
                 ).isoformat(timespec="milliseconds")
-        except (TypeError, ValueError, AttributeError):
+        except (TypeError, ValueError, AttributeError, IndexError):
             last_close_bar_iso = ""
 
     meta = RecordMeta(
@@ -259,6 +264,8 @@ def _build_empty_record(
         ai_provider=ai_provider,
         decision_stance=decision_stance,
         last_close_bar_iso=last_close_bar_iso,
+        incremental=incremental,
+        continuous=continuous,
     )
 
     return AnalysisRecord(
@@ -369,6 +376,8 @@ class TwoStageOrchestrator:
         on_stage2_files: Callable[[list[str]], None] | None = None,
         previous_record: AnalysisRecord | None = None,
         incremental_new_bar_count: int | None = None,
+        incremental: bool = False,
+        continuous: bool = False,
     ) -> AnalysisRecord:
         """Run the two-stage analysis pipeline and return an AnalysisRecord.
 
@@ -392,7 +401,7 @@ class TwoStageOrchestrator:
             Fully or partially populated record.
         """
         # ── Step 1: Build partial record ──────────────────────────────────────
-        record = _build_empty_record(frame, self._settings)
+        record = _build_empty_record(frame, self._settings, incremental=incremental, continuous=continuous)
 
         # ── Step 2: Pre-Stage-1 cancel check ─────────────────────────────────
         if cancel_token.is_set():

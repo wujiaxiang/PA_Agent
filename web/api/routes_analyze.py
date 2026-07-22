@@ -364,6 +364,7 @@ def _run_analysis(
     event_queue: asyncio.Queue,
     loop,
     incremental: bool = False,
+    continuous: bool = False,
 ):
     """Run the two-stage pipeline (synchronous) and push events to *event_queue*.
 
@@ -447,6 +448,8 @@ def _run_analysis(
             cancel_token=cancel_token,
             previous_record=previous_record,
             incremental_new_bar_count=incremental_new_bar_count,
+            incremental=incremental,
+            continuous=continuous,
             **callbacks,
         )
         record_payload = _serialize_record(record)
@@ -478,6 +481,7 @@ def _run_analysis(
 async def analyze_stream(
     request: Request,
     bar_count: int = Query(default=100, ge=2, le=5000),
+    continuous: bool = Query(default=False),
 ):
     """SSE endpoint — triggers two-stage analysis and streams every event."""
     ctx = request.app.state.ctx
@@ -486,7 +490,7 @@ async def analyze_stream(
     # Kick off analysis in thread pool
     loop = asyncio.get_running_loop()
     loop.run_in_executor(
-        _executor, _run_analysis, ctx, bar_count, event_queue, loop
+        _executor, _run_analysis, ctx, bar_count, event_queue, loop, False, continuous
     )
 
     async def event_generator():
@@ -509,6 +513,7 @@ async def analyze_stream(
 async def analyze_incremental_stream(
     request: Request,
     bar_count: int = Query(default=100, ge=2, le=5000),
+    continuous: bool = Query(default=False),
 ):
     """SSE endpoint — incremental analysis based on the last successful record.
 
@@ -557,6 +562,7 @@ async def analyze_incremental_stream(
         event_queue,
         loop,
         True,  # incremental=True
+        continuous,
     )
 
     async def event_generator():

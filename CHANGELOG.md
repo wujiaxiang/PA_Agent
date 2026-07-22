@@ -6,6 +6,21 @@
 
 ## 2026-07-22
 
+### 7. closebar 时间错误修复 + 增量/持续分析标识
+
+- **问题**：历史分析记录中 closebar 时间显示错误（显示最早 bar 的时间而非刚收盘 bar 的时间）；无法区分增量分析和持续分析
+- **根因**：
+  1. `two_stage.py` 和 `routes_records.py` 中 `kline_data` 是 newest-first 顺序，代码却用 `kline_data[-1]` 取最早的 bar 时间，应取 `kline_data[1]`（K1，刚收盘的 bar）
+  2. 记录元数据缺少 `incremental` 和 `continuous` 字段，无法追溯分析类型
+- **修复**：
+  1. `pa_agent/records/schema.py`：`RecordMeta` 添加 `incremental: bool = False`、`continuous: bool = False`
+  2. `pa_agent/orchestrator/two_stage.py`：`_build_empty_record` 和 `submit` 方法添加参数，取 `kline_data[1]` 计算 closebar 时间
+  3. `web/api/routes_analyze.py`：`_run_analysis` 添加 `continuous` 参数，路由支持 `continuous=true` 查询参数
+  4. `web/api/routes_records.py`：`_list_records` 返回 `incremental` 和 `continuous` 字段，修复 `_derive_last_close_bar_iso` 取 `kline_data[1]`
+  5. `web/static/js/app.js`：持续分析触发时传递 `continuous=true`，历史记录列表显示「增量」「持续」标签
+  6. `web/static/css/style.css`：添加 `.history-tag`、`.history-tag-incremental`、`.history-tag-continuous` 样式
+- **文件**：`pa_agent/records/schema.py`、`pa_agent/orchestrator/two_stage.py`、`web/api/routes_analyze.py`、`web/api/routes_records.py`、`web/static/js/app.js`、`web/static/css/style.css`
+
 ### 6. 休市（美股已收盘）时倒计时显示错误
 
 - **问题**：美股收盘后（如北京时间 04:00 后），「等待收盘」按钮和状态栏仍显示错误的倒计时（取模算法返回的未来周期边界时间戳），倒计时归零后还会错误触发分析

@@ -23,6 +23,8 @@ class RecordMeta(BaseModel):
     ai_provider: dict         # Sanitized provider config snapshot (no plaintext API key)
     decision_stance: str = "conservative"  # conservative | balanced | aggressive | extreme_aggressive
     last_close_bar_iso: str = ""  # Local ISO string of the last closed kline; "" for legacy records
+    incremental: bool = False      # Whether this was an incremental analysis (reused prior context)
+    continuous: bool = False       # Whether this was triggered by continuous analysis mode
 
 
 class AnalysisRecord(BaseModel):

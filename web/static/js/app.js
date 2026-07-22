@@ -149,6 +149,7 @@ let nextClosePollingInFlight = false;  // 防止并发 fetch
 let displayTimezone = "Asia/Shanghai";  // 显示时区（IANA 名称），与 chart.js _displayTimezone 同步
 let isAnalyzing = false;                // 是否有分析进行中（供「持续分析」开关判断）
 let waitCloseCountdownTimer = null;     // 等待收盘 setInterval 句柄（仅 SSE 不活跃时使用）
+let waitCloseDisplayTimer = null;       // 等待收盘显示用 setInterval 句柄（勾选复选框时使用）
 let waitCloseCountdownResolver = null;  // SSE 活跃时倒计时归零的 resolve 回调（由 updateSSEStatusWithExpiry 触发）
 
 // ── 追问嵌入实时 tab（Phase C Task 3） ──────────────────────────────────
@@ -272,6 +273,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     window._indicatorsAPI.onBarsUpdated(lastBars || []);
   }
   resizeChart();
+
+  // 初始化时检查是否需要启动倒计时显示
+  const cbWait = $('#cb-wait-close');
+  const cbKeep = $('#cb-keep-analysis');
+  if ((cbWait && cbWait.checked) || (cbKeep && cbKeep.checked)) {
+    startWaitingCountdownDisplay();
+  }
 });
 
 window.addEventListener('resize', resizeChart);
@@ -538,19 +546,20 @@ function bindEvents() {
     });
   }
   // 合并分析按钮：根据当前状态决定是「开始分析」还是「取消分析」
+  // idle / waiting → 启动分析（waiting 表示已勾选等待收盘，点击即启动倒计时+分析）
+  // analyzing → 取消分析
   const btnAnalyzeToggle = $('#btn-analyze-toggle');
   if (btnAnalyzeToggle) {
     btnAnalyzeToggle.addEventListener('click', () => {
       const state = btnAnalyzeToggle.dataset.state || 'idle';
-      if (state === 'idle') {
-        startAnalysis();
-      } else {
-        // analyzing 或 loading 状态 → 取消
+      if (state === 'analyzing') {
         if (currentAnalysisStream) {
           currentAnalysisStream.abort();
         }
-        // 取消等待收盘倒计时（如处于等待中）
         stopWaitCloseCountdown();
+      } else {
+        // idle 或 waiting → 启动分析
+        startAnalysis();
       }
     });
   }
@@ -753,12 +762,16 @@ function bindEvents() {
     }
   });
 
-  // 等待收盘复选框：取消勾选时清掉倒计时
+  // 等待收盘复选框：勾选时启动倒计时显示，取消时停止
   const cbWaitClose = $('#cb-wait-close');
   if (cbWaitClose) {
     cbWaitClose.addEventListener('change', (e) => {
-      if (!e.target.checked) {
-        stopWaitCloseCountdown();
+      if (e.target.checked) {
+        // 勾选：立即启动倒计时显示
+        startWaitingCountdownDisplay();
+      } else {
+        // 取消：停止倒计时
+        stopWaitingCountdownDisplay();
       }
       // 同步分析按钮样式（waiting ⇄ idle）
       refreshAnalyzeButtonWaitingState();
@@ -778,10 +791,16 @@ function bindEvents() {
         if (cbWait) { cbWait.checked = true; cbWait.disabled = true; }
         // 如果实时之前未开，现在开启 SSE
         if (!sseBarsStream) startSSEBarsStream();
+        // 启动倒计时显示
+        startWaitingCountdownDisplay();
       } else {
         // 关闭持续分析：恢复「实时」「等待收盘」可编辑状态
         if (cbLive) cbLive.disabled = false;
         if (cbWait) cbWait.disabled = false;
+        // 如果等待收盘也没勾选，停止倒计时显示
+        if (!cbWait || !cbWait.checked) {
+          stopWaitingCountdownDisplay();
+        }
       }
       // 同步分析按钮样式（waiting ⇄ idle）
       refreshAnalyzeButtonWaitingState();
@@ -1532,9 +1551,9 @@ function startSSEBarsStream() {
             // 自动增量：有增量基础记录时用增量分析，否则完整分析
             const btnInc = $('#btn-incremental');
             if (btnInc && !btnInc.disabled) {
-              startIncrementalAnalysis();
+              startIncrementalAnalysis(true);
             } else {
-              startAnalysis();
+              startAnalysis(true);
             }
           }
         }
@@ -2040,7 +2059,7 @@ function setSidebarCollapsed(collapsed) {
   requestAnimationFrame(tick);
 }
 
-async function startAnalysis() {
+async function startAnalysis(continuousMode = false) {
   // 等待收盘：若勾选了「等待收盘」复选框，先调 /api/bars/next-close 拿到剩余
   // 秒数，每秒更新倒计时，归零后再实际发起 /api/analyze/stream 请求。
   const cbWaitClose = $('#cb-wait-close');
@@ -2075,9 +2094,10 @@ async function startAnalysis() {
   setSeqMarkers(candleSeries, lastBars || []);
 
   const barCount = parseInt($('#ds-bar-count').value) || 100;
+  const continuousParam = continuousMode ? '&continuous=true' : '';
 
   try {
-    const { controller, source } = API.sse(`/api/analyze/stream?bar_count=${barCount}`);
+    const { controller, source } = API.sse(`/api/analyze/stream?bar_count=${barCount}${continuousParam}`);
     currentAnalysisStream = controller;
 
     let stage = '';
@@ -2239,7 +2259,75 @@ async function startAnalysis() {
   }
 }
 
-// ── 等待 K 线收盘倒计时 ────────────────────────────────────────────────
+// ── 等待 K 线收盘倒计时（仅显示，不触发分析） ──────────────────────────────
+// 用户勾选「等待收盘」复选框时调用，仅显示倒计时，不触发分析流程。
+// 与 startWaitCloseCountdown 的区别：后者是点击分析按钮后等待收盘再触发分析。
+async function startWaitingCountdownDisplay() {
+  // 清理旧的显示定时器
+  stopWaitingCountdownDisplay();
+
+  // SSE 不可用时，先走一次 REST fallback 拉取 next_close_ts
+  if (!sseNextCloseTs || sseNextCloseTs <= Date.now()) {
+    await fetchAndUpdateNextCloseTs(true);
+  }
+
+  // SSE 活跃：复用 sseStatusExpiryTimer，由 updateSSEStatusWithExpiry 更新按钮文本
+  if (sseBarsStream && !sseFallbackPolling) {
+    startSSEStatusExpiryTimer();
+    // 立即更新一次按钮文本
+    if (sseNextCloseTs > 0) {
+      const remMs = sseNextCloseTs - Date.now();
+      const rem = remMs <= 0 ? 0 : Math.ceil(remMs / 1000);
+      if (rem > 0) updateWaitingButtonCountdown(rem);
+    }
+    return;
+  }
+
+  // SSE 不活跃：走独立 setInterval 更新按钮文本
+  const computeRemaining = () => {
+    if (!sseNextCloseTs || sseNextCloseTs <= 0) return -1;
+    const remMs = sseNextCloseTs - Date.now();
+    return remMs <= 0 ? 0 : Math.ceil(remMs / 1000);
+  };
+
+  let tickCount = 0;
+  waitCloseDisplayTimer = setInterval(() => {
+    const cb = $('#cb-wait-close');
+    if (!cb || !cb.checked) {
+      stopWaitingCountdownDisplay();
+      return;
+    }
+    const remaining = computeRemaining();
+    if (remaining < 0) {
+      tickCount++;
+      if (tickCount % 5 === 0) {
+        fetchAndUpdateNextCloseTs(true);
+      }
+      return;
+    }
+    if (remaining <= 0) {
+      // 倒计时归零，但不触发分析（只是显示），重置等待下一根
+      fetchAndUpdateNextCloseTs(true);
+      return;
+    }
+    updateWaitingButtonCountdown(remaining);
+  }, 1000);
+}
+
+function stopWaitingCountdownDisplay() {
+  if (waitCloseDisplayTimer) {
+    clearInterval(waitCloseDisplayTimer);
+    waitCloseDisplayTimer = null;
+  }
+  // 重置按钮文本为「等待收盘」
+  const btn = $('#btn-analyze-toggle');
+  if (btn && btn.dataset.state === 'waiting') {
+    const textEl = btn.querySelector('.btn-analyze-text');
+    if (textEl) textEl.textContent = '等待收盘';
+  }
+}
+
+// ── 等待 K 线收盘倒计时（完整流程，触发分析） ──────────────────────────────
 // 调 GET /api/bars/next-close 拿 seconds_remaining，setInterval 每秒递减更新
 // #wait-close-countdown 文案「等待收盘：还剩 Ns」；归零后 clearInterval 并
 // 返回 true 表示可以继续发起分析。用户中途取消勾选则返回 false。
@@ -2329,8 +2417,13 @@ function stopWaitCloseCountdown() {
     clearInterval(waitCloseCountdownTimer);
     waitCloseCountdownTimer = null;
   }
-  // 清理 SSE 活跃模式下的 resolver（防止泄漏：用户取消等待或切换页面时）
-  waitCloseCountdownResolver = null;
+  // 先捕获 resolver 并调用 resolve(false)，再置 null
+  // 避免外部调用时 startAnalysis 永久挂在 await startWaitCloseCountdown() 处
+  if (waitCloseCountdownResolver) {
+    const r = waitCloseCountdownResolver;
+    waitCloseCountdownResolver = null;
+    r(false);
+  }
   // 重置等待按钮文本为「等待收盘」
   const btn = $('#btn-analyze-toggle');
   if (btn && btn.dataset.state === 'waiting') {
@@ -2341,7 +2434,7 @@ function stopWaitCloseCountdown() {
 
 // ── 增量分析（基于上次成功记录） ──────────────────────────────────────
 // 复用 startAnalysis 的事件处理逻辑，仅切换 endpoint 为 /api/analyze/incremental/stream
-async function startIncrementalAnalysis() {
+async function startIncrementalAnalysis(continuousMode = false) {
   const cbWaitClose = $('#cb-wait-close');
   if (cbWaitClose && cbWaitClose.checked) {
     const started = await startWaitCloseCountdown();
@@ -2365,9 +2458,10 @@ async function startIncrementalAnalysis() {
   setSeqMarkers(candleSeries, lastBars || []);
 
   const barCount = parseInt($('#ds-bar-count').value) || 100;
+  const continuousParam = continuousMode ? '&continuous=true' : '';
 
   try {
-    const { controller, source } = API.sse(`/api/analyze/incremental/stream?bar_count=${barCount}`);
+    const { controller, source } = API.sse(`/api/analyze/incremental/stream?bar_count=${barCount}${continuousParam}`);
     currentAnalysisStream = controller;
 
     let stage = '';
@@ -4219,9 +4313,15 @@ function renderHistoryList(records) {
     const closeBarTime = r.last_close_bar_iso
       ? new Date(r.last_close_bar_iso).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
       : '';
+    // 增量分析 / 持续分析标识
+    const tags = [];
+    if (r.incremental) tags.push('<span class="history-tag history-tag-incremental">增量</span>');
+    if (r.continuous) tags.push('<span class="history-tag history-tag-continuous">持续</span>');
+    const tagsHtml = tags.join('');
     return `<div class="history-item" data-record-id="${recordId}">
       <span class="history-item-time">${escapeHtml(time)}</span>
       ${closeBarTime ? `<span class="history-item-close-bar">📍 ${escapeHtml(closeBarTime)}</span>` : ''}
+      ${tagsHtml}
       <span class="history-item-decision">${escapeHtml(decision)}</span>
       <button class="history-item-delete" title="删除" data-record-id="${recordId}">✕</button>
     </div>`;
