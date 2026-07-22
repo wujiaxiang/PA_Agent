@@ -355,21 +355,22 @@ def test_resolve_symbol_timeframe_defaults():
 
 
 def test_compute_next_close_ts_basic():
-    """1m timeframe：next_close_ts = ts_open + 60_000 ms。"""
+    """1m timeframe：next_close_ts = ts_open + 60_000 ms（注入 now_ms=ts_open 确保 elapsed=0）。"""
     # ts_open = 1_700_000_000_000 (2023-11-14 22:13:20 UTC)
     ts_open = 1_700_000_000_000
-    result = routes_bars_stream._compute_next_close_ts(ts_open, "1m")
+    # 注入 now_ms=ts_open，使 elapsed=0，返回 ts_open + duration
+    result = routes_bars_stream._compute_next_close_ts(ts_open, "1m", now_ms=ts_open)
     assert result == ts_open + 60_000
 
 
 def test_compute_next_close_ts_various_timeframes():
-    """不同 timeframe 都能正确换算为毫秒。"""
+    """不同 timeframe 都能正确换算为毫秒（注入 now_ms=ts_open 确保 elapsed=0）。"""
     ts_open = 1_700_000_000_000
-    assert routes_bars_stream._compute_next_close_ts(ts_open, "5m") == ts_open + 5 * 60_000
-    assert routes_bars_stream._compute_next_close_ts(ts_open, "15m") == ts_open + 15 * 60_000
-    assert routes_bars_stream._compute_next_close_ts(ts_open, "1h") == ts_open + 60 * 60_000
-    assert routes_bars_stream._compute_next_close_ts(ts_open, "4h") == ts_open + 4 * 60 * 60_000
-    assert routes_bars_stream._compute_next_close_ts(ts_open, "1d") == ts_open + 24 * 60 * 60_000
+    assert routes_bars_stream._compute_next_close_ts(ts_open, "5m", now_ms=ts_open) == ts_open + 5 * 60_000
+    assert routes_bars_stream._compute_next_close_ts(ts_open, "15m", now_ms=ts_open) == ts_open + 15 * 60_000
+    assert routes_bars_stream._compute_next_close_ts(ts_open, "1h", now_ms=ts_open) == ts_open + 60 * 60_000
+    assert routes_bars_stream._compute_next_close_ts(ts_open, "4h", now_ms=ts_open) == ts_open + 4 * 60 * 60_000
+    assert routes_bars_stream._compute_next_close_ts(ts_open, "1d", now_ms=ts_open) == ts_open + 24 * 60 * 60_000
 
 
 def test_compute_next_close_ts_invalid_ts_open():
@@ -390,7 +391,7 @@ def test_compute_next_close_ts_invalid_timeframe():
 # ── _push_bar_update / _push_bar_close 携带 next_close_ts ────────────────────
 
 
-def test_push_bar_update_includes_next_close_ts():
+def test_push_bar_update_includes_next_close_ts(monkeypatch):
     """_push_bar_update 广播的事件 data 中应包含 next_close_ts 字段。"""
 
     class FakeBar:
@@ -407,6 +408,13 @@ def test_push_bar_update_includes_next_close_ts():
     ts_open = 1_700_000_000_000
     source = MagicMock()
     source.latest_snapshot = MagicMock(return_value=[FakeBar(ts_open)])
+
+    # 注入固定的 now_ms=ts_open，使 elapsed=0，next_close_ts = ts_open + duration
+    monkeypatch.setattr(
+        routes_bars_stream,
+        "_compute_next_close_ts",
+        lambda ts_open_ms, tf, now_ms=None: ts_open_ms + 60_000,
+    )
 
     async def _test():
         # 加一个订阅者接收事件
@@ -429,7 +437,7 @@ def test_push_bar_update_includes_next_close_ts():
     assert data["last_bar"]["ts_open"] == ts_open
 
 
-def test_push_bar_close_includes_next_close_ts():
+def test_push_bar_close_includes_next_close_ts(monkeypatch):
     """_push_bar_close 广播的事件 data 中应包含 next_close_ts 字段（基于新 forming bar）。"""
 
     class FakeBar:
@@ -446,6 +454,13 @@ def test_push_bar_close_includes_next_close_ts():
     source = MagicMock()
     source.latest_snapshot = MagicMock(
         return_value=[FakeBar(new_ts_open), FakeBar(new_ts_open - 60_000)]
+    )
+
+    # 注入固定的 now_ms，使 elapsed=0，next_close_ts = new_ts_open + 60_000
+    monkeypatch.setattr(
+        routes_bars_stream,
+        "_compute_next_close_ts",
+        lambda ts_open_ms, tf, now_ms=None: ts_open_ms + 60_000,
     )
 
     async def _test():

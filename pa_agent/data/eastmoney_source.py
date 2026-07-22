@@ -153,6 +153,12 @@ class EastMoneySource(DataSource):
         self._snap_cache_n = 0
         logger.info("EastMoneySource unsubscribed")
 
+    def clear_snapshot_cache(self) -> None:
+        """Clear the TTL snapshot cache to force a fresh fetch on next call."""
+        self._snap_cache_bars = []
+        self._snap_cache_n = 0
+        self._snap_cache_ts = 0.0
+
     def latest_snapshot(self, n: int) -> list[KlineBar]:
         if not self._connected:
             raise DataSourceTransientError("东方财富数据源未连接")

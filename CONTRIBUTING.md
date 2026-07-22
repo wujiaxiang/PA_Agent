@@ -9,7 +9,7 @@
 - [README.md](README.md) — 项目总览、快速开始、架构概览、13 条已知坑库
 - [TODO.md](TODO.md) — 后续优化路线图（本文件是 TODO 的开发约束补充）
 - [AGENTS.md](AGENTS.md) — 项目改动日志（大改动必须同步追加到 AGENTS）
-- [PA_Agent使用文档.md](PA_Agent使用文档.md) — 完整功能说明
+- [PA_Agent使用文档.md](docs/PA_Agent使用文档.md) — 完整功能说明
 - [config/README.md](config/README.md) — `settings.json` 全字段说明
 - [docs/](docs/) — 技术细节文档（K 线序号、数据获取流程）
 
@@ -43,11 +43,16 @@
 ### Web 后端（推荐）
 
 ```bash
+# 开发模式（推荐）：监视 Python 文件变化自动热重载，改代码后无需手动重启
+python -m uvicorn web.server:app --host 0.0.0.0 --port 8000 --reload --reload-dir web --reload-dir pa_agent
+# 生产模式
 python -m uvicorn web.server:app --host 0.0.0.0 --port 8000
 # Windows 也可双击 start_pa_agent.bat
 ```
 
 启动后访问 http://localhost:8000/，通过 `/api/health/check` 验证模型 API 与数据源连通性。
+
+> **重要**：不使用 `--reload` 时，修改 `web/` 或 `pa_agent/` 下的 Python 代码后**必须手动重启 uvicorn**，否则改动不生效（常被误判为「浏览器缓存问题」）。修改前端静态资源（`web/static/`）后需递增 `index.html` 中的 `?v=N` 版本号。
 
 ### 桌面 GUI（原项目主入口）
 

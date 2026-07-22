@@ -152,14 +152,24 @@ def validate_trace_semantics(
             if not reason:
                 errors.append(f"{path_prefix}[{i}].reason: required non-empty string")
             elif reason in _BOILERPLATE_REASONS:
-                errors.append(f"{path_prefix}[{i}].reason: boilerplate text not allowed")
+                # 套话不阻塞分析，但记录警告便于后续优化提示词
+                logger.warning(
+                    "%s[%d].reason: boilerplate text '%s' (node_id=%s)",
+                    path_prefix, i, reason, nid,
+                )
         elif reason and reason in _BOILERPLATE_REASONS:
-            errors.append(f"{path_prefix}[{i}].reason: boilerplate text not allowed")
+            # 套话不阻塞分析，但记录警告便于后续优化提示词
+            logger.warning(
+                "%s[%d].reason: boilerplate text '%s' (node_id=%s)",
+                path_prefix, i, reason, nid,
+            )
 
         if reason:
             if reason in reasons_seen:
-                errors.append(
-                    f"{path_prefix}[{i}].reason: duplicate reason text across trace nodes"
+                # 重复理由不阻塞分析，但记录警告便于后续优化提示词
+                logger.warning(
+                    "%s[%d].reason: duplicate text '%s' (already used in earlier nodes)",
+                    path_prefix, i, reason,
                 )
             reasons_seen.append(reason)
 

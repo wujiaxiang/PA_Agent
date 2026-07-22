@@ -212,7 +212,7 @@ for (let i = 0; i < sorted.length; i++) {
 
 ## 9. 相关文档
 
-- 整体用法：[`PA_Agent使用文档.md`](../PA_Agent使用文档.md)
+- 整体用法：[`PA_Agent使用文档.md`](PA_Agent使用文档.md)
 - 项目概述：[`README.md`](../README.md)
 - 已知坑与修复记录：[`README.md` §已知坑](../README.md#已知坑与修复记录重要)
 - 本地配置：[`config/README.md`](../config/README.md)

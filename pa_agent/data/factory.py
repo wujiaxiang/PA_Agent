@@ -89,8 +89,10 @@ def create_data_source(kind: str | None) -> DataSource:
         # Read TV credentials from settings.json first (UI-managed),
         # falling back to env vars for headless deployment.
         settings = load_settings(SETTINGS_JSON_PATH)
-        username, password = get_tv_credentials(settings)
-        return TradingViewSource(username=username, password=password)
+        session_id, username, password = get_tv_credentials(settings)
+        return TradingViewSource(
+            username=username, password=password, session_id=session_id
+        )
     if normalized == "eastmoney":
         from pa_agent.data.eastmoney_source import EastMoneySource
 

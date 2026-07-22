@@ -4,9 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PA Agent Web</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="/css/style.css">
+<link rel="stylesheet" href="/css/style.css?v=16">
 </head>
 <body>
 
@@ -39,13 +42,6 @@
     <label class="toggle-label" title="实时刷新">
       <input id="cb-live-refresh" type="checkbox"> 实时
     </label>
-    <label class="toggle-label" title="勾选后提交分析时会等待当前 K 线收盘再发请求">
-      <input id="cb-wait-close" type="checkbox"> 等待收盘
-    </label>
-    <span id="wait-close-countdown" class="wait-close-countdown" hidden></span>
-    <label class="toggle-label" title="持续跟踪：每根 K 线收盘后自动触发新一轮分析">
-      <input id="cb-keep-analysis" type="checkbox"> 持续跟踪
-    </label>
     <span id="live-refresh-status" class="muted-text"></span>
   </div>
   <div class="toolbar-right">
@@ -69,9 +65,23 @@
   <div id="sidebar">
     <!-- 拖拽分隔条：拖拽调整侧边栏宽度（Phase A Task 1） -->
     <div class="sidebar-resizer" id="sidebar-resizer" title="拖拽调整宽度"></div>
-    <!-- 侧边栏头部：历史按钮 + 分析按钮（状态切换）+ 返回实时 + 折叠按钮 -->
+    <!-- 侧边栏头部：Aurora Quant Console 设计 -->
+    <!-- 第1行：工具图标组（refined outline SVG，统一 16px / stroke 1.75） -->
+    <!-- 第2行：主操作「分析」CTA（4 层阴影 + shimmer 微光动画） -->
+    <!-- 第3行：控制台开关（LED 指示灯 + 锐利 6px 圆角）+ 增量按钮 -->
     <div class="sidebar-header">
-      <button id="btn-history" class="icon-btn" title="历史分析记录">🕐</button>
+      <!-- 第1行：工具图标组 -->
+      <div class="sidebar-header-tools">
+        <button id="btn-history" class="tool-icon-btn" title="历史分析记录" aria-label="历史">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
+        </button>
+        <button id="btn-fit-view" class="tool-icon-btn" title="恢复图表（自适应缩放）" aria-label="自适应">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+        </button>
+        <button id="btn-back-to-live" class="tool-icon-btn hidden" title="返回实时" aria-label="返回实时">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        </button>
+      </div>
       <div id="history-popover" class="history-popover hidden">
         <div class="history-popover-header">
           <span>历史分析记录</span>
@@ -81,13 +91,30 @@
           <div class="history-empty muted-text">暂无历史记录</div>
         </div>
       </div>
+      <!-- 第2行：主操作「分析」CTA — 4 层阴影 + shimmer -->
       <button id="btn-analyze-toggle" class="btn-analyze" data-state="idle" title="开始 AI 分析">
-        <span class="btn-analyze-icon">▶</span>
+        <span class="btn-analyze-shimmer" aria-hidden="true"></span>
+        <span class="btn-analyze-icon" aria-hidden="true">▶</span>
         <span class="btn-analyze-text">分析</span>
       </button>
-      <button id="btn-incremental" class="compact-btn" title="基于上次成功记录做增量分析" disabled>增量</button>
-      <button id="btn-back-to-live" class="icon-btn hidden" title="返回实时">⚡</button>
+      <!-- 第3行：控制台开关 + 次级按钮 -->
+      <div class="sidebar-header-options">
+        <label class="console-toggle" title="勾选后提交分析时会等待当前 K 线收盘再发请求">
+          <input id="cb-wait-close" type="checkbox">
+          <span class="toggle-led" aria-hidden="true"></span>
+          <span class="toggle-label">等待收盘</span>
+        </label>
+        <label class="console-toggle" title="持续分析：每根 K 线收盘后自动触发新一轮分析（依赖实时+等待收盘）">
+          <input id="cb-keep-analysis" type="checkbox">
+          <span class="toggle-led" aria-hidden="true"></span>
+          <span class="toggle-label">持续分析</span>
+        </label>
+        <button id="btn-incremental" class="btn-incremental" title="基于上次成功记录做增量分析" disabled>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
+          <span>增量</span>
+        </button>
       </div>
+    </div>
     <div id="flow-bar" class="flow-bar" hidden>
       <div class="flow-step" data-step="1"><span class="flow-step-num">1</span><span class="flow-step-label">等待数据</span></div>
       <div class="flow-step" data-step="2"><span class="flow-step-num">2</span><span class="flow-step-label">阶段一推理</span></div>
@@ -409,9 +436,14 @@
         <fieldset class="settings-fieldset">
           <legend>TradingView 凭证（选填）</legend>
           <p class="muted-text" style="font-size:12px;margin:0 0 6px;">
-            匿名访问美股（如 NVDA）会被限流。配置账号后即可正常拉取。
-            凭证保存到 settings.json；切换/应用品种后生效。
+            <strong>推荐：使用 Session ID</strong> — 在浏览器登录 TradingView 后，
+            按 F12 → Application → Cookies → https://www.tradingview.com → 复制 sessionid 值。
+            系统会自动用此 cookie 获取 auth_token，完全绕过机器人验证。
           </p>
+          <p class="muted-text" style="font-size:12px;margin:0 0 8px;">
+            <strong>备用：账号密码</strong> — 可能触发 reCAPTCHA 风控，不推荐。
+          </p>
+          <label>Session ID <input id="s-tv-session-id" type="text" autocomplete="off" placeholder="浏览器 cookie 中的 sessionid 值"></label>
           <label>用户名（Username） <input id="s-tv-username" type="text" autocomplete="off"></label>
           <label>密码（Password） <input id="s-tv-password" type="password" autocomplete="off"></label>
         </fieldset>
@@ -553,6 +585,6 @@
 <script src="/js/api.js?v=3"></script>
 <script src="/js/chart.js?v=3"></script>
 <script src="/js/indicators.js?v=3"></script>
-<script src="/js/app.js?v=3"></script>
+<script src="/js/app.js?v=20"></script>
 </body>
 </html>

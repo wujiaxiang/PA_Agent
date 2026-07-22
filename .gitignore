@@ -51,7 +51,6 @@ index.js
 /*.jpg
 /*.png
 !/赞助码.jpeg
-!/二元决策树演示图.jpg
 !/assets/**/*.png
 videoCover-*
 *_fix_*.md
@@ -62,8 +61,22 @@ fix_garbage_line.py
 MAC*.txt
 *部署*.txt
 *智能体*.txt
-!MAC版本智能体部署方法.txt
-!把这个扔给龙虾-智能体部署方法.txt
+# 以下文件已迁移至 docs/ 子目录，根目录不再保留
+# （如需在 docs/ 下保留特定文件，请在 docs/ 段单独加 ! 规则）
+
+# ── 根目录临时测试脚本（调试产物，用完即删）─────────────────────────────────
+/test_debug*.py
+/test_redesign*.py
+/test_kline_button*.py
+/test_bindEvents*.py
+/test_bug_diagnose*.py
+/test_redesign_verify*.py
+/test_sse*.py
+/extract_tv_token.py
+/screenshot*.py
+/diag_*.py
+/diag_screenshots/
+/web/static/extract-token.html
 
 # ── IDE / Agent 本地目录 ─────────────────────────────────────────────────────
 .idea/

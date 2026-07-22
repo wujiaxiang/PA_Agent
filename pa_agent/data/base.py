@@ -138,6 +138,14 @@ class DataSource(ABC):
         Raises DataSourceTransientError on recoverable network issues.
         """
 
+    def clear_snapshot_cache(self) -> None:
+        """Clear any cached snapshot data.
+
+        Subclasses that implement TTL caching for ``latest_snapshot`` should
+        override this to invalidate their caches. This is called when a bar
+        closes to ensure fresh data is returned on the next snapshot request.
+        """
+
     def _validate_snapshot(self, n: int, bars: list[KlineBar]) -> list[KlineBar]:
         """Enforce the ``latest_snapshot`` contract (TODO P2.2).
 

@@ -241,6 +241,11 @@ async def get_next_close(
     Falls back to current settings when parameters are omitted. Returns
     ``seconds_remaining=None`` when the timeframe is unknown or no
     forming bar exists.
+
+    休市检测：若 ``bars[0].closed == True``（无 forming bar，市场已收盘），
+    返回 ``market_closed=True`` 与 ``next_close_ts=None``，前端据此清空
+    倒计时并显示「休市中」。否则取模算法会基于过期 ts_open 计算出错误
+    的未来周期边界时间戳，导致休市期间显示错误倒计时。
     """
     ctx = request.app.state.ctx
     tf = timeframe or getattr(ctx.settings.general, "last_timeframe", "") or ""
@@ -254,6 +259,7 @@ async def get_next_close(
             "timeframe": tf,
             "next_close_ts": None,
             "seconds_remaining": None,
+            "market_closed": False,
         }
     forming = bars_raw[0]
     ts_open_ms = int(getattr(forming, "ts_open", 0))
@@ -263,16 +269,29 @@ async def get_next_close(
             "timeframe": tf,
             "next_close_ts": None,
             "seconds_remaining": None,
+            "market_closed": False,
+        }
+    # 休市检测：head bar 已收盘 → 无 forming bar，市场已收盘/休市
+    # 此时取模算法会返回错误的未来时间戳，必须短路返回
+    is_market_closed = bool(getattr(forming, "closed", False))
+    if is_market_closed:
+        return {
+            "symbol": symbol or getattr(ctx.settings.general, "last_symbol", ""),
+            "timeframe": tf,
+            "next_close_ts": None,
+            "seconds_remaining": None,
+            "market_closed": True,
         }
     seconds_remaining = seconds_until_bar_closes(ts_open_ms, tf)
-    # next_close_ts = ts_open + duration (ms)
-    from pa_agent.data.bar_close_wait import timeframe_to_seconds
+    # 统一使用 routes_bars_stream._compute_next_close_ts 计算 next_close_ts
+    # （SSE 和 REST 必须使用同一算法，避免时区偏移导致结果不一致）
+    from .routes_bars_stream import _compute_next_close_ts
 
-    duration_s = timeframe_to_seconds(tf)
-    next_close_ts = (ts_open_ms + duration_s * 1000) if duration_s else None
+    next_close_ts = _compute_next_close_ts(ts_open_ms, tf)
     return {
         "symbol": symbol or getattr(ctx.settings.general, "last_symbol", ""),
         "timeframe": tf,
         "next_close_ts": next_close_ts,
         "seconds_remaining": seconds_remaining,
+        "market_closed": False,
     }

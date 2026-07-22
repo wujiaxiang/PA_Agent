@@ -208,4 +208,15 @@ async def health_check():
 
 
 # Serve static frontend at /
-app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="static")
+# 自定义 StaticFiles：禁用浏览器/webview 缓存（TRAE 内置 webview 忽略 ?v=N query string，
+# 必须从响应头层面禁缓存才能确保前端代码改动立即生效）
+class _NoCacheStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+
+
+app.mount("/", _NoCacheStaticFiles(directory=str(_STATIC_DIR), html=True), name="static")

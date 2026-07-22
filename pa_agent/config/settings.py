@@ -161,15 +161,21 @@ class TushareSettings(BaseModel):
 class TradingViewSettings(BaseModel):
     """TradingView credentials persisted in settings.json.
 
-    Stored in plain text — TradingView login has no scoped-token concept.
-    When both fields are empty, the factory falls back to anonymous mode.
-    Env vars ``PA_AGENT_TRADINGVIEW_USERNAME`` / ``PA_AGENT_TRADINGVIEW_PASSWORD``
-    override these on a per-deployment basis (.env for headless servers).
+    Three authentication modes are supported, checked in order:
+    1. session_id: Direct cookie-based auth (most stable, avoids recaptcha).
+       Extract the `sessionid` cookie from a logged-in browser session.
+    2. username + password: Traditional login via /accounts/signin/.
+       May trigger TradingView's recaptcha risk control.
+    3. Anonymous mode: No credentials provided. Rate-limited for US equities.
+
+    Env vars ``PA_AGENT_TRADINGVIEW_SESSION_ID`` / ``PA_AGENT_TRADINGVIEW_USERNAME``
+    / ``PA_AGENT_TRADINGVIEW_PASSWORD`` override these on a per-deployment basis.
     """
     model_config = ConfigDict(extra="ignore")
 
     username: str = ""
     password: str = ""
+    session_id: str = ""
 
 
 class PushPlusSettings(BaseModel):

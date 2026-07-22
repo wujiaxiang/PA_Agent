@@ -87,12 +87,17 @@ def _format_bar(bar: Any) -> dict:
     return {"value": str(bar)}
 
 
-def _compute_next_close_ts(ts_open_ms: Any, timeframe: str) -> int | None:
+def _compute_next_close_ts(ts_open_ms: Any, timeframe: str, now_ms: int | None = None) -> int | None:
     """计算 forming bar 的下一根收盘时间戳（毫秒）。
 
     使用与 seconds_until_bar_closes 一致的算法：通过 elapsed % duration
     计算剩余时间，再加上当前时间，避免时区偏移导致的计算错误。
     timeframe 无法解析或 ts_open 无效时返回 None。
+
+    Args:
+        ts_open_ms: forming bar 的开盘时间戳（毫秒）
+        timeframe: K线周期，如 "5m", "1h"
+        now_ms: 当前时间戳（毫秒），用于测试注入。默认为 None，使用 time.time()
     """
     import time as _time
     try:
@@ -104,15 +109,15 @@ def _compute_next_close_ts(ts_open_ms: Any, timeframe: str) -> int | None:
     duration_s = timeframe_to_seconds(timeframe)
     if duration_s is None or duration_s <= 0:
         return None
-    now_ms = int(_time.time() * 1000)
+    now = int(now_ms) if now_ms is not None else int(_time.time() * 1000)
     duration_ms = duration_s * 1000
-    elapsed_ms = now_ms - ts_open
+    elapsed_ms = now - ts_open
     if elapsed_ms <= 0:
         return ts_open + duration_ms
     remainder_ms = elapsed_ms % duration_ms
     if remainder_ms == 0:
-        return now_ms + duration_ms
-    return now_ms + (duration_ms - remainder_ms)
+        return now + duration_ms
+    return now + (duration_ms - remainder_ms)
 
 
 # ── 后台 bar close 检测 Task ───────────────────────────────────────────────────
@@ -162,8 +167,15 @@ async def _push_bar_update(source: Any, symbol: str, timeframe: str) -> None:
 
 
 async def _push_bar_close(source: Any, symbol: str, timeframe: str) -> None:
-    """拉取最新 snapshot 并广播完整 bars 数组（bar_close 事件）。"""
+    """拉取最新 snapshot 并广播完整 bars 数组（bar_close 事件）。
+
+    在拉取前先清除数据源缓存，确保获取到最新的 bar 数据（包含刚收盘的新 bar
+    和新的 forming bar），避免 TTL 缓存返回过期数据导致序号和指标延迟更新。
+    """
     try:
+        # 强制清除缓存，确保拉取最新数据
+        if hasattr(source, 'clear_snapshot_cache'):
+            await asyncio.to_thread(source.clear_snapshot_cache)
         bars = await asyncio.to_thread(source.latest_snapshot, 100)
     except Exception as exc:  # noqa: BLE001
         logger.warning("bar_close latest_snapshot failed: %s", exc)
@@ -228,22 +240,49 @@ async def _background_bars_loop(app: Any) -> None:
                 await _broadcast({"event": "ping", "data": ""})
                 continue
 
+            # Check if market is closed: head bar is already closed (no forming bar)
+            is_market_closed = bool(getattr(forming_bar, "closed", False))
+
+            if is_market_closed:
+                # Market halted/closed: only send ping, do NOT push bar_close
+                # (pushing bar_close every 60s would trigger repeated analysis in 持续分析 mode)
+                await _broadcast({"event": "ping", "data": ""})
+                await asyncio.sleep(_FALLBACK_WAIT_S)
+                continue
+
+            # Normal flow: forming bar exists, compute wait time
             wait_seconds = seconds_until_bar_closes(ts_open_ms, timeframe)
             if wait_seconds is None or wait_seconds <= 0:
-                # 已收盘或无法计算，稍后重试
                 wait_seconds = _FALLBACK_WAIT_S
 
             # 在 wait_seconds 内每 _UPDATE_INTERVAL_S 秒推送 forming bar 增量
+            # 同时监测 timeframe / symbol 变化（用户切换时立即 break 重新初始化，
+            # 避免内层循环用旧 timeframe 导致 next_close_ts 错误、bar_close 永不触发）
             remaining = wait_seconds
+            reinit_needed = False
             while remaining > 0:
                 sleep_for = min(_UPDATE_INTERVAL_S, remaining)
                 await asyncio.sleep(sleep_for)
                 remaining -= sleep_for
+
+                # 每次推送前重新读取 timeframe/symbol，感知用户切换
+                new_symbol, new_timeframe = _resolve_symbol_timeframe(ctx, source)
+                if new_symbol != symbol or new_timeframe != timeframe:
+                    logger.info(
+                        "bars_stream: symbol/timeframe changed during inner loop "
+                        "(symbol=%s->%s, timeframe=%s->%s), reinit",
+                        symbol, new_symbol, timeframe, new_timeframe,
+                    )
+                    reinit_needed = True
+                    break  # 回到外层重新初始化
+
                 if remaining > 0:
                     await _push_bar_update(source, symbol, timeframe)
 
-            # 推送 bar_close 事件
-            await _push_bar_close(source, symbol, timeframe)
+            # 推送 bar_close 事件（仅在内层循环正常结束时；
+            # 用户切换 timeframe 时跳过，避免用旧 timeframe 推送错误的 bar_close）
+            if not reinit_needed:
+                await _push_bar_close(source, symbol, timeframe)
     except asyncio.CancelledError:
         logger.info("Background bars stream loop cancelled")
         raise

@@ -35,7 +35,7 @@
 - 📝 完整落盘：Prompt、原始响应、诊断/决策 JSON、Token 用量、追问记录
 - 🛡️ 可配置校验体系：JSON 校验、一致性检查、语义校验、截断修复、失败自动重试
 
-完整功能说明见原项目文档 [`PA_Agent使用文档.md`](PA_Agent使用文档.md)，配置字段说明见 [`config/README.md`](config/README.md)。
+完整功能说明见原项目文档 [`PA_Agent使用文档.md`](docs/PA_Agent使用文档.md)，配置字段说明见 [`config/README.md`](config/README.md)。
 
 ### 文档索引
 
@@ -45,7 +45,7 @@
 
 | 文档 | 内容 | 适用模式 |
 | --- | --- | --- |
-| [PA_Agent使用文档.md](PA_Agent使用文档.md) | 原项目完整功能说明（桌面 GUI 为主） | 桌面 GUI |
+| [PA_Agent使用文档.md](docs/PA_Agent使用文档.md) | 原项目完整功能说明（桌面 GUI 为主） | 桌面 GUI |
 | [docs/获取数据功能说明.md](docs/获取数据功能说明.md) | 数据源连接、刷新机制、切换逻辑、错误处理 | 双模式 |
 | [docs/图表K线与分析快照说明.md](docs/图表K线与分析快照说明.md) | K 线序号 K1…KN、forming bar、休市模式行为 | 双模式 |
 | [config/README.md](config/README.md) | `settings.json` 全字段说明、安全提醒 | 双模式 |

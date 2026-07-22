@@ -10,7 +10,7 @@
 - [README.md](README.md) — 项目总览、快速开始、已知坑库
 - [AGENTS.md](AGENTS.md) — 项目改动日志（与 TODO 互补：TODO 是「待办」，AGENTS 是「已办」）
 - [CONTRIBUTING.md](CONTRIBUTING.md) — 开发环境与提交规范
-- [PA_Agent使用文档.md](PA_Agent使用文档.md) — 完整功能说明
+- [PA_Agent使用文档.md](docs/PA_Agent使用文档.md) — 完整功能说明
 - [docs/](docs/) — 技术细节文档
 
 ---
@@ -416,4 +416,4 @@ curl http://localhost:8000/api/health/check    # 完整健康检查（模型 API
 - [README.md](README.md) — 项目总览 + 开发者指南 + 已知坑与修复记录
 - [CONTRIBUTING.md](CONTRIBUTING.md) — 参与贡献指南（含开发环境、启动方式、PR 建议）
 - [AGENTS.md](AGENTS.md) — 项目改动记录（按日期索引，记录每次迭代的细节）
-- [PA_Agent使用文档.md](PA_Agent使用文档.md) — 原项目完整功能说明（PyQt6 桌面 GUI）
+- [PA_Agent使用文档.md](docs/PA_Agent使用文档.md) — 原项目完整功能说明（PyQt6 桌面 GUI）

@@ -8,7 +8,7 @@
 
 - [README.md](../README.md) — 项目总览、快速开始、三层覆盖优先级说明
 - [.env.example](../.env.example) — 环境变量模板（与 `settings.json` 配合使用）
-- [PA_Agent使用文档.md](../PA_Agent使用文档.md) — 完整功能说明
+- [PA_Agent使用文档.md](../docs/PA_Agent使用文档.md) — 完整功能说明
 - [CONTRIBUTING.md](../CONTRIBUTING.md) — 开发者环境搭建
 
 ## 首次使用

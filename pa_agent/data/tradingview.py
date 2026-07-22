@@ -111,6 +111,7 @@ _tv_auth_patched = False
 import hashlib
 import json as _json
 import os as _os
+import re as _re
 import time as _time
 from pathlib import Path as _Path
 
@@ -460,12 +461,62 @@ TV_SYMBOL_NAMES: dict[str, str] = {
 }
 
 
+# ── Session ID → auth_token extraction ──────────────────────────────────────
+
+_TV_CHART_URL = "https://www.tradingview.com/chart/"
+_TV_AUTH_TOKEN_PATTERN = _re.compile(r'"auth_token"\s*:\s*"([^"]+)"')
+
+
+def _fetch_auth_token_via_session(session_id: str) -> str | None:
+    """Extract TradingView ``auth_token`` (JWT) using a ``sessionid`` cookie.
+
+    Instead of POSTing to ``/accounts/signin/`` (which triggers reCAPTCHA),
+    we GET the chart page with the ``sessionid`` cookie and extract the
+    ``auth_token`` from the embedded JSON. This works because TradingView's
+    server-side rendering includes the auth_token when the user is logged in.
+
+    Returns the JWT string (typically ~846 chars) or ``None`` on failure.
+    """
+    import requests as _requests
+
+    session = _requests.Session()
+    session.headers.update({
+        "User-Agent": _TV_AUTH_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    session.cookies.set("sessionid", session_id, domain=".tradingview.com", path="/")
+
+    try:
+        resp = session.get(_TV_CHART_URL, timeout=15, allow_redirects=True)
+        if resp.status_code != 200:
+            logger.warning(
+                "session_id auth: chart page returned status %d", resp.status_code
+            )
+            return None
+
+        match = _TV_AUTH_TOKEN_PATTERN.search(resp.text)
+        if match:
+            token = match.group(1)
+            if len(token) > 100:  # sanity check: JWT should be 800+ chars
+                return token
+            logger.warning("session_id auth: extracted token too short (%d chars)", len(token))
+            return None
+
+        logger.warning("session_id auth: auth_token not found in chart page HTML")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("session_id auth: request failed: %s", exc)
+        return None
+
+
 class TradingViewSource(DataSource):
     """Live K-line data from TradingView via tvdatafeed."""
 
-    def __init__(self, username: str = "", password: str = "") -> None:
+    def __init__(self, username: str = "", password: str = "", session_id: str = "") -> None:
         self._username = username
         self._password = password
+        self._session_id = session_id
         self._tv = None          # tvDatafeed instance
         self._connected: bool = False
         self._symbol: str = ""
@@ -498,7 +549,19 @@ class TradingViewSource(DataSource):
             from tvDatafeed import TvDatafeed  # type: ignore[import]
             _patch_tvdatafeed_ws_headers()
             _patch_tvdatafeed_auth()
-            if self._username and self._password:
+            if self._session_id:
+                # Use sessionid cookie to extract auth_token from chart page HTML.
+                # This bypasses /accounts/signin/ entirely — no reCAPTCHA risk.
+                auth_token = _fetch_auth_token_via_session(self._session_id)
+                if auth_token:
+                    self._tv = TvDatafeed()
+                    self._tv.token = auth_token
+                    self._tv.authenticated = True
+                    logger.info("TradingViewSource connected (session_id → auth_token, length=%d)", len(auth_token))
+                else:
+                    logger.warning("session_id auth failed (could not extract auth_token), falling back to anonymous")
+                    self._tv = TvDatafeed()
+            elif self._username and self._password:
                 self._tv = TvDatafeed(self._username, self._password)
             else:
                 self._tv = TvDatafeed()  # anonymous
@@ -507,7 +570,8 @@ class TradingViewSource(DataSource):
             except Exception:  # noqa: BLE001
                 logger.debug("Could not override tvDatafeed ws timeout", exc_info=True)
             self._connected = True
-            logger.info("TradingViewSource connected (anonymous=%s)", not self._username)
+            auth_mode = "session_id" if self._session_id else ("credentials" if self._username else "anonymous")
+            logger.info("TradingViewSource connected (%s)", auth_mode)
         except ImportError as exc:
             self._connected = False
             msg = str(exc)
@@ -710,6 +774,13 @@ class TradingViewSource(DataSource):
         raise DataSourceTransientError(
             f"TradingView 自动探测失败（{symbol}）：已尝试 {', '.join(tried)} 均无 K 线"
         )
+
+    def clear_snapshot_cache(self) -> None:
+        """Clear the TTL snapshot cache to force a fresh fetch on next call."""
+        with self._snapshot_lock:
+            self._snap_cache_bars = None
+            self._snap_cache_n = 0
+            self._snap_cache_ts = 0.0
 
     def latest_snapshot(self, n: int) -> list[KlineBar]:
         """Return *n* bars newest-first; bars[0] is the forming (unclosed) bar.

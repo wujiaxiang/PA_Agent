@@ -69,7 +69,11 @@ _ENV_MAPPING: dict[str, tuple[str, str, str | None]] = {
 
 # TradingView credentials are read directly by the factory, not stored in Settings.
 # Listed here only for .env.example documentation completeness.
-_TV_ENV_VARS = ("PA_AGENT_TRADINGVIEW_USERNAME", "PA_AGENT_TRADINGVIEW_PASSWORD")
+_TV_ENV_VARS = (
+    "PA_AGENT_TRADINGVIEW_USERNAME",
+    "PA_AGENT_TRADINGVIEW_PASSWORD",
+    "PA_AGENT_TRADINGVIEW_SESSION_ID",
+)
 
 
 def _bool_from_str(s: str) -> bool:
@@ -184,24 +188,34 @@ def apply_env_overrides(settings: Any) -> None:
         logger.info("Applied %d env overrides from .env / process env", applied)
 
 
-def get_tv_credentials(settings: "object | None" = None) -> tuple[str, str]:
-    """Return (username, password) for TradingView.
+def get_tv_credentials(settings: "object | None" = None) -> tuple[str, str, str]:
+    """Return (session_id, username, password) for TradingView.
 
     Resolution order: ``settings.tradingview`` (UI-managed) → env vars
-    ``PA_AGENT_TRADINGVIEW_USERNAME`` / ``PA_AGENT_TRADINGVIEW_PASSWORD``
-    (headless server / .env deployment).
+    ``PA_AGENT_TRADINGVIEW_SESSION_ID`` / ``PA_AGENT_TRADINGVIEW_USERNAME``
+    / ``PA_AGENT_TRADINGVIEW_PASSWORD`` (headless server / .env deployment).
 
-    Returns ("", "") when neither source is configured — callers use this
-    to decide anonymous vs authenticated mode.
+    Three authentication modes are checked in order:
+    1. session_id: Direct cookie-based auth (most stable, avoids recaptcha)
+    2. username + password: Traditional login (may trigger recaptcha)
+    3. Anonymous: Empty tuple (rate-limited for US equities)
+
+    Returns ("", "", "") when no credentials are configured.
     """
-    s_user = s_pass = ""
+    s_session_id = s_user = s_pass = ""
     if settings is not None:
         tv = getattr(settings, "tradingview", None)
         if tv is not None:
+            s_session_id = (getattr(tv, "session_id", "") or "").strip()
             s_user = (getattr(tv, "username", "") or "").strip()
             s_pass = (getattr(tv, "password", "") or "").strip()
+    if s_session_id:
+        return (s_session_id, s_user, s_pass)
     if s_user and s_pass:
-        return (s_user, s_pass)
+        return ("", s_user, s_pass)
+    env_session_id = get_env_str("PA_AGENT_TRADINGVIEW_SESSION_ID")
     env_user = get_env_str("PA_AGENT_TRADINGVIEW_USERNAME")
     env_pass = get_env_str("PA_AGENT_TRADINGVIEW_PASSWORD")
-    return (s_user or env_user, s_pass or env_pass)
+    if env_session_id:
+        return (env_session_id, env_user, env_pass)
+    return ("", s_user or env_user, s_pass or env_pass)

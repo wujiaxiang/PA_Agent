@@ -141,12 +141,15 @@ let sseReconnectTimer = null;  // SSE 重连定时器（10s 退避）
 let sseFallbackPolling = false;// SSE 失败后是否降级为轮询模式
 let sseLastBarUpdateTs = 0;    // 最近一次 SSE bar_update/bar_close 事件的时间戳（ms）
 let sseNextCloseTs = 0;        // 当前 forming bar 的下一收盘时间戳（ms，来自后端 next_close_ts）
+let keepAnalysisLastClosedTs = 0;  // 持续分析哨兵：上次处理的收盘 bar ts_open，防止同一根 bar 重复触发分析
+let chartUpdatePaused = false;  // 分析期间暂停图表实时更新
 let sseStatusExpiryTimer = null;  // updateSSEStatusWithExpiry 定时器句柄
 let nextClosePollingTimer = null;  // 低频拉取 next_close_ts 定时器（fallback/纯轮询模式下使用）
 let nextClosePollingInFlight = false;  // 防止并发 fetch
 let displayTimezone = "Asia/Shanghai";  // 显示时区（IANA 名称），与 chart.js _displayTimezone 同步
-let isAnalyzing = false;                // 是否有分析进行中（供「持续跟踪」开关判断）
-let waitCloseCountdownTimer = null;     // 等待收盘 setInterval 句柄
+let isAnalyzing = false;                // 是否有分析进行中（供「持续分析」开关判断）
+let waitCloseCountdownTimer = null;     // 等待收盘 setInterval 句柄（仅 SSE 不活跃时使用）
+let waitCloseCountdownResolver = null;  // SSE 活跃时倒计时归零的 resolve 回调（由 updateSSEStatusWithExpiry 触发）
 
 // ── 追问嵌入实时 tab（Phase C Task 3） ──────────────────────────────────
 // chatAbortController: 追问 SSE 的 AbortController，非 null 表示发送中
@@ -247,6 +250,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   const { chart: c, candleSeries: cs, emaSeries: es, emaSeriesMap: em } = createChart($('#chart-main'));
   chart = c; candleSeries = cs; emaSeries = es; emaSeriesMap = em;
 
+  // 🔑 关键：先注册 UI 事件 handler，再做数据加载
+  // 原因：loadBars() 在异常时会重新抛出（throw e），如果 bindEvents 在 await 之后调用，
+  // 任何数据加载失败都会导致 bindEvents 永远不执行 — 所有按钮失去响应。
+  // 将 bindEvents 提前到 await 之前，确保 UI 在任何数据加载失败时也可交互。
+  bindEvents();
+
   await loadSettings();      // 先加载 settings，回填交易所/品种/周期
   await loadExchanges();     // 再加载交易所下拉（并选中当前值）
   await loadSymbols();       // 根据当前交易所加载品种列表
@@ -255,7 +264,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   loadHistoryList();         // 拉当前 (exchange, symbol, timeframe) 的历史分析记录
   refreshIncrementalButtonState();  // 初始化增量分析按钮可用性
 
-  bindEvents();
   // 注册指标库上下文（主图 + 副图容器），恢复已保存的指标
   if (window._indicatorsAPI) {
     const oscWrap = document.getElementById('chart-osc-wrap');
@@ -299,7 +307,8 @@ function resizeChart() {
 // ── Data loading ───────────────────────────────────────────────────────
 async function loadBars() {
   try {
-    const data = await API.get('/api/bars?count=100');
+    const barCount = parseInt($('#ds-bar-count')?.value) || 100;
+    const data = await API.get(`/api/bars?count=${barCount}`);
     lastBars = data.bars || [];
     setBars(candleSeries, lastBars);
     setSeqMarkers(candleSeries, lastBars);
@@ -307,6 +316,11 @@ async function loadBars() {
     if (lastBars.length) {
       const sorted = [...lastBars].sort((a, b) => a.ts_open - b.ts_open);
       window.__PA_LAST_BAR_TIME__ = sorted[sorted.length - 1].ts_open / 1000;
+    }
+    // 休市检测：bars[0].closed == true 表示无 forming bar（市场已收盘）
+    // 清空 sseNextCloseTs 避免取模算法返回错误未来值，触发「休市中」显示
+    if (lastBars.length && lastBars[0] && lastBars[0].closed === true) {
+      sseNextCloseTs = 0;
     }
     // 通知指标库重新计算并渲染（含 EMA/SMA/BOLL/RSI/MACD/KDJ 等）
     if (window._indicatorsAPI) window._indicatorsAPI.onBarsUpdated(lastBars);
@@ -406,8 +420,10 @@ async function loadSettings() {
     $('#s-tushare-token').value = ts.token || '';
     // TradingView 凭证
     const tv = s.tradingview || {};
+    const tvSessionIdEl = $('#s-tv-session-id');
     const tvUserEl = $('#s-tv-username');
     const tvPassEl = $('#s-tv-password');
+    if (tvSessionIdEl) tvSessionIdEl.value = tv.session_id || '';
     if (tvUserEl) tvUserEl.value = tv.username || '';
     if (tvPassEl) tvPassEl.value = tv.password || '';
     // API Key 未配置警告：检查 provider.api_key_encrypted 是否为空字符串
@@ -512,6 +528,15 @@ let currentAnalysisStream = null;
 
 function bindEvents() {
   $('#btn-refresh').addEventListener('click', loadBars);
+  // 恢复图表按钮：自适应缩放显示所有数据
+  const btnFitView = $('#btn-fit-view');
+  if (btnFitView) {
+    btnFitView.addEventListener('click', () => {
+      if (typeof chart !== 'undefined' && chart && chart.timeScale) {
+        chart.timeScale().fitContent();
+      }
+    });
+  }
   // 合并分析按钮：根据当前状态决定是「开始分析」还是「取消分析」
   const btnAnalyzeToggle = $('#btn-analyze-toggle');
   if (btnAnalyzeToggle) {
@@ -735,15 +760,32 @@ function bindEvents() {
       if (!e.target.checked) {
         stopWaitCloseCountdown();
       }
+      // 同步分析按钮样式（waiting ⇄ idle）
+      refreshAnalyzeButtonWaitingState();
     });
   }
 
-  // 持续跟踪开关：状态变化时更新状态栏文本
+  // 持续分析开关：开启时锁定实时+等待收盘，关闭时恢复可编辑
   const cbKeepAnalysis = $('#cb-keep-analysis');
   if (cbKeepAnalysis) {
     cbKeepAnalysis.addEventListener('change', () => {
-      // SSE 活跃时由 updateSSEStatusWithExpiry 接管文案（含持续跟踪后缀），
-      // 否则交给 updateLiveRefreshStatus
+      const cbLive = $('#cb-live-refresh');
+      const cbWait = $('#cb-wait-close');
+      if (cbKeepAnalysis.checked) {
+        // 持续分析依赖 SSE 实时流的 bar_close 事件 + 等待收盘
+        // 强制勾选并锁定「实时」+「等待收盘」
+        if (cbLive) { cbLive.checked = true; cbLive.disabled = true; }
+        if (cbWait) { cbWait.checked = true; cbWait.disabled = true; }
+        // 如果实时之前未开，现在开启 SSE
+        if (!sseBarsStream) startSSEBarsStream();
+      } else {
+        // 关闭持续分析：恢复「实时」「等待收盘」可编辑状态
+        if (cbLive) cbLive.disabled = false;
+        if (cbWait) cbWait.disabled = false;
+      }
+      // 同步分析按钮样式（waiting ⇄ idle）
+      refreshAnalyzeButtonWaitingState();
+      // 更新状态栏文案
       if (sseBarsStream && !sseFallbackPolling) {
         updateSSEStatusWithExpiry();
       } else {
@@ -876,7 +918,9 @@ async function saveSettingsHandler() {
         token: $('#s-tushare-token').value,
       },
       // TradingView 凭证（空字符串=匿名访问；保存到 settings.json 后下次切换生效）
+      // 优先使用 session_id（从浏览器获取），其次使用账号密码
       tradingview: {
+        session_id: ($('#s-tv-session-id')?.value || '').trim(),
         username: ($('#s-tv-username')?.value || '').trim(),
         password: ($('#s-tv-password')?.value || '').trim(),
       },
@@ -996,6 +1040,17 @@ async function applySubscribe() {
   };
 
   try {
+    // 如果用户修改了 K线数量，先保存到后端，避免 loadSettings() 覆盖回旧值
+    const newBarCount = parseInt($('#ds-bar-count').value) || 100;
+    const oldBarCount = currentSettings?.general?.analysis_bar_count || 100;
+    if (newBarCount !== oldBarCount) {
+      try {
+        await API.put('/api/settings', { general: { analysis_bar_count: newBarCount } });
+      } catch (e) {
+        console.error('applySubscribe: failed to save analysis_bar_count', e);
+      }
+    }
+
     await API.post('/api/subscribe', {
       kind: 'tradingview',
       symbol,
@@ -1018,7 +1073,7 @@ async function applySubscribe() {
       refreshIncrementalButtonState(),
     ]);
 
-    // 切换品种/周期时自动取消持续跟踪
+    // 切换品种/周期时自动取消持续分析
     const cbKeep = $('#cb-keep-analysis');
     if (cbKeep) cbKeep.checked = false;
     updateLiveRefreshStatus();
@@ -1381,7 +1436,7 @@ function updateLiveRefreshStatus() {
     return;
   }
   const cbKeep = $('#cb-keep-analysis');
-  const keepSuffix = (cbKeep && cbKeep.checked) ? ' · 持续跟踪中' : '';
+  const keepSuffix = (cbKeep && cbKeep.checked) ? ' · 持续分析中' : '';
   const el = $('#live-refresh-status');
   if (!el) return;
 
@@ -1393,22 +1448,22 @@ function updateLiveRefreshStatus() {
     if (tfSecs > 0) {
       const remaining = Math.max(0, (sseNextCloseTs - Date.now()) / 1000);
       if (remaining <= tfSecs) {
-        closeText = ` · 距下次收盘 ${remaining.toFixed(0)}s`;
+        closeText = ` · 距下次收盘 ${formatCountdownHMS(remaining)}`;
       }
     }
   }
 
   if (sseFallbackPolling) {
-    // SSE 失败已降级轮询：显示降级提示 + 距上次刷新 + 倒计时 + 持续跟踪
+    // SSE 失败已降级轮询：显示降级提示 + 距上次刷新 + 倒计时 + 持续分析
     const elapsed = liveRefreshLastTs ? Math.max(0, (Date.now() - liveRefreshLastTs) / 1000) : 0;
     el.textContent = `⚠ 降级轮询 · 距上次刷新 ${elapsed.toFixed(1)}s${closeText}${keepSuffix}`;
     el.style.color = '#ef5350';
     return;
   }
   if (sseBarsStream) {
-    // SSE 连接中（尚未收到事件）：保留原文案，仅追加持续跟踪后缀
+    // SSE 连接中（尚未收到事件）：保留原文案，仅追加持续分析后缀
     const base = el.textContent || '';
-    const stripped = keepSuffix ? base.replace(/ · 持续跟踪中$/, '') : base;
+    const stripped = keepSuffix ? base.replace(/ · 持续分析中$/, '') : base;
     el.textContent = keepSuffix ? (stripped + keepSuffix) : stripped;
     return;
   }
@@ -1437,13 +1492,14 @@ function startSSEBarsStream() {
       try {
         const data = JSON.parse(e.data);
         const bars = data.bars || [];
+        // sorted 提前定义，避免 bars 为空时 L1518 引用未定义变量
+        const sorted = bars.length ? [...bars].sort((a, b) => a.ts_open - b.ts_open) : [];
         if (bars.length) {
           lastBars = bars;
           setBars(candleSeries, bars);
           setSeqMarkers(candleSeries, bars);
           if (window._indicatorsAPI) window._indicatorsAPI.onBarsUpdated(bars);
           // 更新最新一根 bar 的时间锚点
-          const sorted = [...bars].sort((a, b) => a.ts_open - b.ts_open);
           if (sorted.length) window.__PA_LAST_BAR_TIME__ = sorted[sorted.length - 1].ts_open / 1000;
         }
         // 解析后端附带的 next_close_ts（新 forming bar 的收盘时间戳，ms）
@@ -1466,10 +1522,21 @@ function startSSEBarsStream() {
         startSSEStatusExpiryTimer();
         // SSE 活跃时由 updateSSEStatusWithExpiry 接管文案（含 elapsed/remaining）
         updateSSEStatusWithExpiry();
-        // 持续跟踪：K 线收盘后自动触发新一轮分析（分析期间不重复触发）
+        // 持续分析：K 线收盘后自动触发新一轮分析（分析期间不重复触发）
+        // 哨兵去重：仅当新收盘 bar 的 ts_open 与上次处理的不同时才触发
         const cbKeep = $('#cb-keep-analysis');
         if (cbKeep && cbKeep.checked && !isAnalyzing) {
-          startAnalysis();
+          const newClosedTs = sorted.length ? sorted[sorted.length - 1].ts_open : 0;
+          if (newClosedTs && newClosedTs !== keepAnalysisLastClosedTs) {
+            keepAnalysisLastClosedTs = newClosedTs;
+            // 自动增量：有增量基础记录时用增量分析，否则完整分析
+            const btnInc = $('#btn-incremental');
+            if (btnInc && !btnInc.disabled) {
+              startIncrementalAnalysis();
+            } else {
+              startAnalysis();
+            }
+          }
         }
       } catch (err) {
         console.error('bar_close event error:', err);
@@ -1480,6 +1547,18 @@ function startSSEBarsStream() {
     sseBarsStream.addEventListener('bar_update', (e) => {
       try {
         const data = JSON.parse(e.data);
+        // 分析期间暂停图表更新（仅暂停 K线渲染，仍更新 next_close_ts 和状态栏）
+        if (chartUpdatePaused) {
+          if (data.next_close_ts != null && data.next_close_ts > 0) {
+            sseNextCloseTs = Number(data.next_close_ts);
+          } else {
+            sseNextCloseTs = 0;
+          }
+          sseLastBarUpdateTs = Date.now();
+          liveRefreshLastTs = sseLastBarUpdateTs;
+          updateSSEStatusWithExpiry();
+          return;
+        }
         const bar = data.last_bar;
         if (bar) {
           // 仅更新最后一根（forming）bar
@@ -1619,10 +1698,12 @@ function stopSSEStatusExpiryTimer() {
 
 // 异步拉取 /api/bars/next-close 更新 sseNextCloseTs（用于 fallback/纯轮询模式下显示倒计时）
 // 幂等；并发请求时直接 return。失败静默（下次定时器再试）。
-async function fetchAndUpdateNextCloseTs() {
+// force=true 时绕过 SSE 活跃检查（用于 sanity check 失败后强制拉取正确值）
+async function fetchAndUpdateNextCloseTs(force = false) {
   if (nextClosePollingInFlight) return;
   // SSE 活跃时 next_close_ts 由 bar_update/bar_close 事件推送，无需 fetch
-  if (sseBarsStream && !sseFallbackPolling) return;
+  // 除非 force=true（SSE 推送的 next_close_ts 异常时强制拉取正确值）
+  if (!force && sseBarsStream && !sseFallbackPolling) return;
   nextClosePollingInFlight = true;
   try {
     const symbol = $('#ds-symbol')?.value || currentSettings?.general?.last_symbol || '';
@@ -1631,8 +1712,14 @@ async function fetchAndUpdateNextCloseTs() {
     if (!symbol || !tf) return;
     const url = `/api/bars/next-close?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(tf)}&exchange=${encodeURIComponent(ex)}`;
     const data = await API.get(url);
-    if (data && data.next_close_ts > 0) {
+    if (data && data.market_closed) {
+      // 休市：清空 sseNextCloseTs，触发「休市中」显示，避免取模算法返回错误未来值
+      sseNextCloseTs = 0;
+    } else if (data && data.next_close_ts > 0) {
       sseNextCloseTs = Number(data.next_close_ts);
+    } else {
+      // 后端返回 null（无 forming bar 或 timeframe 无效），清空避免残留旧值
+      sseNextCloseTs = 0;
     }
   } catch (e) {
     // 静默失败，下次定时器再试
@@ -1673,6 +1760,16 @@ function timeframeToSeconds(tf) {
   return 0;
 }
 
+// 将秒数格式化为 HH:MM:SS 时分秒格式（不足 1 小时显示 00 开头）
+function formatCountdownHMS(seconds) {
+  const s = Math.max(0, Math.floor(Number(seconds) || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(h)}:${pad(m)}:${pad(sec)}`;
+}
+
 // 计算并更新 #live-refresh-status 文案：● SSE 实时 · 距上次刷新 Ns · 距下次收盘 Ms
 // 仅在 SSE 活跃（sseBarsStream 非 null 且非 fallback）时由定时器调用
 function updateSSEStatusWithExpiry() {
@@ -1689,24 +1786,85 @@ function updateSSEStatusWithExpiry() {
   const tfSecs = timeframeToSeconds(dsTf || currentSettings?.general?.last_timeframe || '');
   let remaining = 0;
   let closeText = '';
+  let isMarketClosed = false;
   if (sseNextCloseTs > 0 && tfSecs > 0) {
     remaining = Math.max(0, (sseNextCloseTs - Date.now()) / 1000);
     // 若 remaining 超过 1 个 timeframe duration，说明 next_close_ts 已过期或错误，丢弃
     if (remaining > tfSecs) {
-      console.warn('[SSE] next_close_ts sanity check failed:', {
+      console.warn('[SSE] next_close_ts sanity check failed, fetching /api/bars/next-close:', {
         sseNextCloseTs, tfSecs, remaining,
         now: Date.now()
       });
+      // fallback: 强制拉取正确的 next_close_ts（绕过 SSE 活跃检查）
+      fetchAndUpdateNextCloseTs(true);
+      sseNextCloseTs = 0;  // 清除错误值，等待 fallback 更新
     } else {
-      closeText = ` · 距下次收盘 ${remaining.toFixed(0)}s`;
+      closeText = ` · 距下次收盘 ${formatCountdownHMS(remaining)}`;
+    }
+  }
+  // 休市检测：next_close_ts 已过期（SSE 推送的旧值）或为 0 且长时间无 bar 数据更新
+  // 休市时后端只推 ping 不推 bar_update，sseNextCloseTs 不会被 SSE 更新，
+  // 需要主动调 REST /api/bars/next-close 检测 market_closed 状态
+  if (!closeText && tfSecs > 0) {
+    const sinceUpdate = sseLastBarUpdateTs ? (Date.now() - sseLastBarUpdateTs) / 1000 : 0;
+    if (sseNextCloseTs === 0) {
+      // sseNextCloseTs 已清零：可能是休市（REST 返回 market_closed:true）或 SSE 还没推第一个事件
+      // sinceUpdate > tfSecs（1 个周期无更新）→ 确认休市
+      if (sinceUpdate > tfSecs) {
+        isMarketClosed = true;
+        closeText = ' · 休市中';
+      }
+    } else if (sseNextCloseTs > 0 && sseNextCloseTs < Date.now()) {
+      // sseNextCloseTs 已过期但非 0：SSE 推送的旧值未纠正，主动调 REST 检测休市
+      // 这是休市时的典型场景：SSE 只推 ping，sseNextCloseTs 保留旧值
+      fetchAndUpdateNextCloseTs(true);
+      sseNextCloseTs = 0;  // 清除过期值，等待 REST 返回正确状态
     }
   }
   let text = `● SSE 实时 · 距上次刷新 ${elapsed.toFixed(1)}s${closeText}`;
-  // 持续跟踪后缀
+  // 持续分析后缀
   const cbKeep = $('#cb-keep-analysis');
-  if (cbKeep && cbKeep.checked) text += ' · 持续跟踪中';
+  if (cbKeep && cbKeep.checked) text += ' · 持续分析中';
   el.textContent = text;
   el.style.color = '#26a69a';
+
+  // 共享倒计时：同时更新「等待收盘」按钮（与状态栏同一 tick、同一 remaining，
+  // 彻底消除两个独立 setInterval 导致的不同步和算法不一致问题）
+  if (waitCloseCountdownResolver) {
+    const btn = $('#btn-analyze-toggle');
+    if (!btn || btn.dataset.state !== 'waiting') return;
+    // 用户中途取消「等待收盘」勾选 → resolve(false) 终止等待
+    const cb = $('#cb-wait-close');
+    if (cb && !cb.checked) {
+      const r = waitCloseCountdownResolver;
+      waitCloseCountdownResolver = null;
+      stopWaitCloseCountdown();
+      r(false);
+      return;
+    }
+    // 倒计时归零（sseNextCloseTs 已到当前时间）→ 刷新 K线后 resolve(true) 触发分析
+    if (sseNextCloseTs > 0 && remaining <= 0) {
+      const r = waitCloseCountdownResolver;
+      waitCloseCountdownResolver = null;
+      stopWaitCloseCountdown();
+      loadBars()
+        .then(() => {
+          // 更新持续分析去重哨兵（与 SSE bar_close handler 使用相同公式）
+          if (lastBars && lastBars.length) {
+            const sorted = [...lastBars].sort((a, b) => a.ts_open - b.ts_open);
+            const newClosedTs = sorted.length ? sorted[sorted.length - 1].ts_open : 0;
+            if (newClosedTs) keepAnalysisLastClosedTs = newClosedTs;
+          }
+        })
+        .catch((e) => console.error('waitCloseCountdown loadBars:', e))
+        .finally(() => { if (r) r(true); });
+      return;
+    }
+    // 仍在等待：用同一个 remaining 更新按钮文本（与状态栏完全同步）
+    if (remaining > 0) {
+      updateWaitingButtonCountdown(Math.ceil(remaining));
+    }
+  }
 }
 
 // 更新 SSE 状态指示器（#live-refresh-status）
@@ -1738,19 +1896,20 @@ function updateSSEStatus(state) {
       el.style.color = '';
       break;
   }
-  // 追加持续跟踪标记
+  // 追加持续分析标记
   const cbKeep = $('#cb-keep-analysis');
   if (cbKeep && cbKeep.checked && base) {
-    base = base + ' · 持续跟踪中';
+    base = base + ' · 持续分析中';
   }
   el.textContent = base;
 }
 
 // ── Analysis ───────────────────────────────────────────────────────────
 
-// 分析按钮状态机：idle → analyzing → idle
-//   idle: 蓝色 ▶ 分析（点击开始）
+// 分析按钮状态机：idle → analyzing → idle / waiting
+//   idle:      蓝色 ▶ 分析（点击开始）
 //   analyzing: 红色 ⏹ 取消（脉动动画，点击中止）
+//   waiting:   青绿色 ⏳ 等待收盘（等待收盘/持续分析启用时的视觉提示，仅样式变化，点击仍触发分析）
 function setAnalyzeButtonState(state) {
   const btn = $('#btn-analyze-toggle');
   if (!btn) return;
@@ -1767,7 +1926,34 @@ function setAnalyzeButtonState(state) {
     btn.title = '点击取消当前分析';
     if (iconEl) iconEl.textContent = '⏹';
     if (textEl) textEl.textContent = '取消';
+  } else if (state === 'waiting') {
+    // 等待收盘状态：仅样式变化，按钮仍可点击手动触发分析
+    btn.disabled = false;
+    btn.title = '等待 K 线收盘后自动分析（可点击立即手动分析）';
+    if (iconEl) iconEl.textContent = '⏳';
+    if (textEl) textEl.textContent = '等待收盘';
   }
+}
+
+// 更新等待按钮的倒计时文本
+function updateWaitingButtonCountdown(remainingSeconds) {
+  const btn = $('#btn-analyze-toggle');
+  if (!btn || btn.dataset.state !== 'waiting') return;
+  const textEl = btn.querySelector('.btn-analyze-text');
+  if (textEl) {
+    textEl.textContent = `等待收盘 ${formatCountdownHMS(remainingSeconds)}`;
+  }
+}
+
+// 根据「等待收盘」/「持续分析」开关状态刷新分析按钮样式
+// 当任一开关启用且当前未在分析中时，按钮切换为 waiting 样式
+// 否则恢复 idle 样式
+function refreshAnalyzeButtonWaitingState() {
+  if (isAnalyzing) return;  // 分析中保持 analyzing 状态
+  const cbWait = $('#cb-wait-close');
+  const cbKeep = $('#cb-keep-analysis');
+  const waiting = (cbWait && cbWait.checked) || (cbKeep && cbKeep.checked);
+  setAnalyzeButtonState(waiting ? 'waiting' : 'idle');
 }
 
 // ── FlowBar 5 步进度条（Phase J Task 20） ─────────────────────────────
@@ -1812,18 +1998,46 @@ function hideFlowBar() {
 function setSidebarCollapsed(collapsed) {
   const sb = $('#sidebar');
   const fab = $('#sidebar-expand-fab');
+  const btnToggle = $('#btn-sidebar-toggle');
   if (!sb) return;
   if (collapsed) {
     sb.classList.add('collapsed');
     if (fab) fab.classList.add('visible');
+    // 按钮图标联动：折叠后显示「展开」图标 + 提示
+    if (btnToggle) {
+      btnToggle.textContent = '📥';
+      btnToggle.title = '展开侧边栏';
+      btnToggle.classList.add('is-collapsed');
+    }
   } else {
     sb.classList.remove('collapsed');
     if (fab) fab.classList.remove('visible');
+    // 按钮图标联动：展开后显示「收起」图标 + 提示
+    if (btnToggle) {
+      btnToggle.textContent = '📊';
+      btnToggle.title = '隐藏侧边栏';
+      btnToggle.classList.remove('is-collapsed');
+    }
   }
-  // 用 requestAnimationFrame 确保 CSS transition 完成后 resize
-  requestAnimationFrame(() => {
-    setTimeout(() => resizeChart(), 280);
-  });
+  // CSS transition 时长 50ms（极短，避免 TRAE webview 的 rAF throttle 问题）；
+  // rAF 循环跑 150ms 兜底，确保 chart 跟上最终宽度。
+  // 另外在每次 resizeChart 前强制 reflow（读 offsetWidth 触发布局同步），
+  // 确保即使 webview throttle rAF，chart 也能拿到最新宽度。
+  const TRANSITION_MS = 150;
+  const start = performance.now();
+  function tick() {
+    // 强制同步布局：读 offsetWidth 会触发 reflow，确保后续 clientWidth 读到最新值
+    const pane = document.getElementById('chart-pane');
+    if (pane) void pane.offsetWidth;
+    if (typeof resizeChart === 'function') resizeChart();
+    if (performance.now() - start < TRANSITION_MS) {
+      requestAnimationFrame(tick);
+    } else {
+      // 最后一次确保最终尺寸对齐
+      if (typeof resizeChart === 'function') resizeChart();
+    }
+  }
+  requestAnimationFrame(tick);
 }
 
 async function startAnalysis() {
@@ -1840,6 +2054,7 @@ async function startAnalysis() {
 
   setAnalyzeButtonState('analyzing');
   isAnalyzing = true;
+  chartUpdatePaused = true;
   showFlowBar();
 
   // Phase A Task 2.3：清除历史回看 banner，避免与新流式输出混淆
@@ -2014,9 +2229,13 @@ async function startAnalysis() {
       $('#stage-badge').textContent = `❌ 连接错误: ${e.message}`;
     }
   } finally {
-    setAnalyzeButtonState('idle');
     currentAnalysisStream = null;
+    chartUpdatePaused = false;
+    // 分析结束后刷新一次完整数据
+    loadBars();
     isAnalyzing = false;
+    // 根据开关状态恢复按钮样式（waiting / idle）
+    refreshAnalyzeButtonWaitingState();
   }
 }
 
@@ -2025,49 +2244,82 @@ async function startAnalysis() {
 // #wait-close-countdown 文案「等待收盘：还剩 Ns」；归零后 clearInterval 并
 // 返回 true 表示可以继续发起分析。用户中途取消勾选则返回 false。
 async function startWaitCloseCountdown() {
-  // 先清掉旧 timer（如有）
   stopWaitCloseCountdown();
-  const span = $('#wait-close-countdown');
-  if (!span) return false;
-  let remaining = 0;
-  try {
-    const symbol = $('#ds-symbol').value || currentSettings?.general?.last_symbol || '';
-    const timeframe = $('#ds-timeframe').value || currentSettings?.general?.last_timeframe || '';
-    const exchange = $('#ds-exchange').value || currentSettings?.general?.last_tradingview_exchange || '';
-    const data = await API.get(
-      `/api/bars/next-close?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&exchange=${encodeURIComponent(exchange)}`
-    );
-    remaining = data.seconds_remaining;
-    if (remaining == null || remaining <= 0) {
-      // 已收盘或无法计算 → 直接继续分析
-      return true;
-    }
-  } catch (e) {
-    console.error('startWaitCloseCountdown:', e);
-    // 后端调用失败 → 不阻塞分析，直接继续
-    return true;
+
+  // SSE 不可用时（sseNextCloseTs 为 0 或已过期），先走一次 REST fallback
+  // 拉取 next_close_ts 写入 sseNextCloseTs；失败也不退出，倒计时循环每秒
+  // 会重新读取 sseNextCloseTs，SSE 连上后自动恢复同源
+  if (!sseNextCloseTs || sseNextCloseTs <= Date.now()) {
+    await fetchAndUpdateNextCloseTs(true);
   }
-  // 禁用分析按钮，避免在等待期间重复提交
-  const btnAnalyze = $('#btn-analyze-toggle');
-  if (btnAnalyze) btnAnalyze.disabled = true;
-  span.textContent = `等待收盘：还剩 ${remaining}s`;
-  span.removeAttribute('hidden');
+
+  // SSE 活跃：复用 sseStatusExpiryTimer（与状态栏共享同一 tick、同一 remaining），
+  // 不创建独立 setInterval，彻底消除两个定时器不同步和算法不一致的问题。
+  // 由 updateSSEStatusWithExpiry 在 remaining <= 0 时调用 resolver 触发分析。
+  if (sseBarsStream && !sseFallbackPolling) {
+    startSSEStatusExpiryTimer();
+    // 立即更新一次按钮文本（不等下一个 tick，避免首次显示延迟）
+    if (sseNextCloseTs > 0) {
+      const remMs = sseNextCloseTs - Date.now();
+      const rem = remMs <= 0 ? 0 : Math.ceil(remMs / 1000);
+      if (rem > 0) updateWaitingButtonCountdown(rem);
+    }
+    return new Promise((resolve) => {
+      waitCloseCountdownResolver = resolve;
+    });
+  }
+
+  // SSE 不活跃（fallback 轮询 / 纯轮询模式）：走独立 setInterval
+  // updateSSEStatusWithExpiry 在此模式下不跑，需要自己维护倒计时
+  const computeRemaining = () => {
+    if (!sseNextCloseTs || sseNextCloseTs <= 0) return -1;
+    const remMs = sseNextCloseTs - Date.now();
+    return remMs <= 0 ? 0 : Math.ceil(remMs / 1000);
+  };
+
+  let tickCount = 0;
+  let remaining = computeRemaining();
+  if (remaining > 0) {
+    updateWaitingButtonCountdown(remaining);
+  }
+
   return await new Promise((resolve) => {
     waitCloseCountdownTimer = setInterval(() => {
-      // 用户取消勾选 → 中止等待
       const cb = $('#cb-wait-close');
       if (cb && !cb.checked) {
         stopWaitCloseCountdown();
         resolve(false);
         return;
       }
-      remaining -= 1;
-      if (remaining <= 0) {
-        stopWaitCloseCountdown();
-        resolve(true);
+      remaining = computeRemaining();
+      // SSE 未就绪：周期性拉取 REST 等待恢复，不归零触发
+      if (remaining < 0) {
+        tickCount++;
+        if (tickCount % 5 === 0) {
+          fetchAndUpdateNextCloseTs(true);
+        }
         return;
       }
-      span.textContent = `等待收盘：还剩 ${remaining}s`;
+      if (remaining <= 0) {
+        stopWaitCloseCountdown();
+        // 倒计时归零，await loadBars 刷新 K线（含新 bar 的 seq/指标）后再触发分析
+        loadBars()
+          .then(() => {
+            // 更新持续分析去重哨兵为最新 forming bar 的 ts_open（与 SSE bar_close
+            // 处理器使用相同的 sorted[last].ts_open 计算），防止 SSE 重复触发分析
+            if (lastBars && lastBars.length) {
+              const sorted = [...lastBars].sort((a, b) => a.ts_open - b.ts_open);
+              const newClosedTs = sorted.length ? sorted[sorted.length - 1].ts_open : 0;
+              if (newClosedTs) {
+                keepAnalysisLastClosedTs = newClosedTs;
+              }
+            }
+          })
+          .catch((e) => console.error('startWaitCloseCountdown loadBars:', e))
+          .finally(() => resolve(true));
+        return;
+      }
+      updateWaitingButtonCountdown(remaining);
     }, 1000);
   });
 }
@@ -2077,13 +2329,14 @@ function stopWaitCloseCountdown() {
     clearInterval(waitCloseCountdownTimer);
     waitCloseCountdownTimer = null;
   }
-  const span = $('#wait-close-countdown');
-  if (span) {
-    span.setAttribute('hidden', '');
-    span.textContent = '';
+  // 清理 SSE 活跃模式下的 resolver（防止泄漏：用户取消等待或切换页面时）
+  waitCloseCountdownResolver = null;
+  // 重置等待按钮文本为「等待收盘」
+  const btn = $('#btn-analyze-toggle');
+  if (btn && btn.dataset.state === 'waiting') {
+    const textEl = btn.querySelector('.btn-analyze-text');
+    if (textEl) textEl.textContent = '等待收盘';
   }
-  const btnAnalyze = $('#btn-analyze-toggle');
-  if (btnAnalyze) btnAnalyze.disabled = false;
 }
 
 // ── 增量分析（基于上次成功记录） ──────────────────────────────────────
@@ -2097,6 +2350,7 @@ async function startIncrementalAnalysis() {
 
   setAnalyzeButtonState('analyzing');
   isAnalyzing = true;
+  chartUpdatePaused = true;
   showFlowBar();
 
   resetStageBlock(1);
@@ -2245,9 +2499,13 @@ async function startIncrementalAnalysis() {
       $('#stage-badge').textContent = `❌ 连接错误: ${e.message}`;
     }
   } finally {
-    setAnalyzeButtonState('idle');
     currentAnalysisStream = null;
+    chartUpdatePaused = false;
+    // 分析结束后刷新一次完整数据
+    loadBars();
     isAnalyzing = false;
+    // 根据开关状态恢复按钮样式（waiting / idle）
+    refreshAnalyzeButtonWaitingState();
   }
 }
 
@@ -4270,26 +4528,28 @@ function exportRecordJson() {
 
 // 临时 Toast 提示（不依赖 toast-container，使用简易浮层）
 function showToast(message, type) {
-  // 复用已有 toast-container（Phase E 引入）；不存在则创建临时浮层
+  // 复用已有 toast-container（HTML 中已定义，CSS 定位在右下角 z-index:9999）
   // type: 'success' | 'warning' | 'error' | undefined（默认中性灰）
   let container = document.getElementById('toast-container');
   if (!container) {
     container = document.createElement('div');
     container.id = 'toast-container';
-    container.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:200;display:flex;flex-direction:column;gap:8px;';
+    container.className = 'toast-container';
     document.body.appendChild(container);
   }
   const toast = document.createElement('div');
-  toast.className = 'toast-card';
-  // 按 type 选择背景色（与 app 中 success/error 视觉约定一致）
-  let bg = '#1e222d';   // default
-  if (type === 'success') bg = '#1e3a2e';
-  else if (type === 'warning') bg = '#3a2e1e';
-  else if (type === 'error') bg = '#3a1e1e';
-  toast.style.cssText = `background:${bg};color:#d1d4dc;border:1px solid #363c4e;border-radius:6px;padding:8px 14px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,0.4);max-width:280px;`;
+  // 不使用 toast-card class，避免 CSS 动画导致 opacity 卡在 0
+  // 直接用行内样式确保可见
+  let bg = '#1e222d';
+  let borderColor = '#363c4e';
+  if (type === 'success') { bg = '#1e3a2e'; borderColor = '#26a69a'; }
+  else if (type === 'warning') { bg = '#3a2e1e'; borderColor = '#ff9800'; }
+  else if (type === 'error') { bg = '#3a1e1e'; borderColor = '#ef5350'; }
+  toast.style.cssText = `background:${bg};color:#d1d4dc;border:1px solid ${borderColor};border-radius:6px;padding:10px 16px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,0.5);max-width:300px;opacity:1;transform:none;pointer-events:auto;`;
   toast.textContent = message;
   container.appendChild(toast);
-  const ttl = type === 'error' ? 4000 : 2000;
+  // success/warning 显示 3 秒，error 显示 5 秒
+  const ttl = type === 'error' ? 5000 : 3000;
   setTimeout(() => {
     if (toast.parentNode) toast.parentNode.removeChild(toast);
   }, ttl);
