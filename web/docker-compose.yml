@@ -1,8 +1,9 @@
 services:
   pa-agent-web:
-    build:
-      context: ..
-      dockerfile: web/Dockerfile
+    # Pre-built image — Dockerfile builds fail on this LXC host due to
+    # AppArmor, so we build manually via `docker run --security-opt apparmor=unconfined`
+    # then commit.  See web/Dockerfile for the recipe.
+    image: pa-agent-web:latest
     ports:
       - "8005:8000"
     volumes:
