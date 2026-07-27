@@ -397,6 +397,8 @@ class EastMoneySource(DataSource):
             apply_session_quote_to_forming_row(last, price=price, daily=True)
             return
 
+        from pa_agent.data.eastmoney_client import fetch_spot_price
+
         price = fetch_spot_price(self._symbol)
         if price is None:
             return

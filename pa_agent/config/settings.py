@@ -13,7 +13,7 @@ class AIProviderSettings(BaseModel):
     """AI provider connection and behaviour settings."""
     model_config = ConfigDict(extra="ignore")
 
-    model: str = "openclaw_wb/deepseek-v4-flash"
+    model: str = "deepseek-v4-flash"
     base_url: str = "https://api.deepseek.com"
     api_key: str = ""
     api_key_encrypted: str = ""

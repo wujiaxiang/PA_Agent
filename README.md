@@ -109,6 +109,27 @@ curl http://localhost:8000/api/settings
 
 环境要求：Python 3.11+；Windows/macOS/Linux。`.env` 模板与三层覆盖优先级说明见 [`.env.example`](.env.example)。
 
+### uv 隔离环境（可选）
+
+项目也支持使用 [uv](https://docs.astral.sh/uv/) 进行环境隔离，依赖版本通过 `uv.lock` 锁定，保证可复现安装，且不会污染系统 Python。
+
+```cmd
+# 1. 安装 uv（仅需一次）
+pip install uv
+# 或官方脚本：curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. 首次运行或依赖变更时，make 自动创建 .venv 并同步依赖
+make uv-run
+
+# 3. 之后每次启动
+make uv-run
+# 或手动：uv run python -m pa_agent.main
+```
+
+> 运行测试：`make uv-test`，代码检查：`make uv-lint`。
+
+---
+
 #### Windows 一键启动
 
 Windows 用户可双击 [`start_pa_agent.bat`](start_pa_agent.bat)，脚本会自动切换到项目根目录并启动 Web 后端（默认端口 8000）。
