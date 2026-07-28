@@ -1,12 +1,3 @@
-# syntax=docker/dockerfile:1
-#
-# For LXC-based Docker hosts (PVE CT), build via:
-#   docker run --security-opt apparmor=unconfined -v $(pwd):/mnt/source:ro \
-#     python:3.11-slim sh -c 'apt-get update && ... && pip install ...'
-#   docker commit <id> pa-agent-web:latest
-#
-# This Dockerfile documents the steps; it works on hosts where docker build succeeds.
-
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -34,7 +25,7 @@ COPY pa_agent/ ./pa_agent/
 COPY prompt_engineering/ ./prompt_engineering/
 COPY experience/ ./experience/
 COPY config/ ./config/
-COPY recordds/ ./records/
+COPY records/ ./records/
 COPY logs/ ./logs/
 COPY tools/ ./tools/
 COPY scripts/ ./scripts/
