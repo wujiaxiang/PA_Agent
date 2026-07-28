@@ -20,10 +20,6 @@ dependencies = [
     "MetaTrader5>=5.0; sys_platform == 'win32'",
     "cryptography>=42",
     "pywin32>=306; sys_platform == 'win32'",
-    "akshare>=1.14",
-    "baostock>=0.8",
-    "curl_cffi>=0.13",
-    "tushare>=1.4",
     "httpx[socks]>=0.27",
 ]
 
@@ -39,6 +35,12 @@ web = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "sse-starlette>=2.0",
+]
+cn-stocks = [
+    "akshare>=1.14",
+    "baostock>=0.8",
+    "curl_cffi>=0.13",
+    "tushare>=1.4",
 ]
 
 [project.scripts]
