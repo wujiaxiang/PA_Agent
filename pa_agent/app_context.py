@@ -53,10 +53,14 @@ class AppContext:
         from pa_agent.ai.qclaw_connector import sync_qclaw_agent_provider_on_load
         from pa_agent.ai.workbuddy_connector import sync_workbuddy_provider_on_load
         from pa_agent.ai.cursor_connector import sync_cursor_provider_on_load
+        from pa_agent.ai.trae_connector import sync_trae_cn_provider_on_load
+        from pa_agent.ai.qoder_connector import sync_qoder_cn_provider_on_load
 
         sync_qclaw_agent_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
         sync_workbuddy_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
         sync_cursor_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
+        sync_trae_cn_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
+        sync_qoder_cn_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
 
         # Apply .env / process env overrides (TODO P1.2). Web mode typically
         # uses .env for secrets; GUI mode leaves .env absent and this is no-op.
@@ -77,7 +81,7 @@ class AppContext:
 
         apply_kline_adjust_from_settings(settings)
         ds_kind = normalize_data_source_kind(
-            getattr(settings.general, "last_data_source", "mt5")
+            getattr(settings.general, "last_data_source", "eastmoney")
         )
         data_source = create_data_source(ds_kind)
 
