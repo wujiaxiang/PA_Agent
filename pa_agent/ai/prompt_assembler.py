@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from pa_agent.ai.decision_stance import build_decision_stance_guidance, normalize_stance
+from pa_agent.ai.incremental_shift import shift_kline_refs, shift_kline_refs_in_text
 from pa_agent.ai.pattern_routing import (
     STAGE1_DETECTED_PATTERNS_GUIDE,
     STAGE1_PATTERN_BRIEFS_BLOCK,
@@ -1058,13 +1059,21 @@ class PromptAssembler:
     def _normalize_prev_stage1_assistant_for_incremental(
         previous_record: AnalysisRecord,
         raw_content: str,
+        *,
+        shift_n: int = 0,
     ) -> str:
-        """Use validated diagnosis JSON in incremental context, not prose/markdown replies."""
+        """Use validated diagnosis JSON in incremental context, not prose/markdown replies.
+
+        When *shift_n* > 0, all K-line references in the previous diagnosis are
+        mechanically shifted by +shift_n so that the numbers match this run's
+        re-indexed K-line table (new bars occupy K1…K{shift_n}).
+        """
         from pa_agent.ai.json_validator import format_model_json_for_context
 
         diag = getattr(previous_record, "stage1_diagnosis", None) or {}
         if isinstance(diag, dict) and diag:
-            return json.dumps(diag, ensure_ascii=False, indent=2)
+            shifted = shift_kline_refs(diag, shift_n) if shift_n > 0 else diag
+            return json.dumps(shifted, ensure_ascii=False, indent=2)
 
         formatted = format_model_json_for_context(raw_content)
         if formatted:
@@ -1089,39 +1098,27 @@ class PromptAssembler:
         """Build Stage 1 as a continuation-based incremental update.
 
         Structure:
-          [0] system    — Stage 1 system prompt (same as full Stage 1)
-          [1] user      — Previous full Stage 1 user prompt (with K-line table)
-          [2] assistant — Previous Stage 1 reply
-          [3] user      — Incremental task (new K-lines only, no full table)
+          [0] system    - Stage 1 system prompt (same as full Stage 1)
+          [1] user      - FULL Stage 1 user prompt rebuilt from the CURRENT frame
+                          (complete re-indexed K-line table; K1 = newest closed bar)
+          [2] assistant - Previous Stage 1 reply (K-refs shifted by +new_bar_count)
+          [3] user      - Incremental task (new K-lines only, no full table)
 
-        Benefits vs old 2-message incremental:
-        - [system, user(S1)] prefix is IDENTICAL to full Stage 1 → prefix cache hit
-        - Full K-line table is in [1], not re-sent in [3] → saves ~14.5K tokens
-        - Stage 2 continuation can also cache-hit this prefix chain
+        Why [1] is rebuilt every round instead of reusing the previous record's
+        stored user message: the stored message freezes the K-line table at the
+        FIRST full analysis, so from the second incremental round onward the
+        model would see the initial snapshot plus only the newest bar, losing
+        every bar closed in between. Rebuilding costs the prefix cache hit but
+        guarantees the table the model reads always matches current reality and
+        the re-indexed coordinate system the incremental prompt describes.
         """
-        prev_s1_messages = getattr(previous_record, "stage1_messages", None) or []
         prev_s1_response = getattr(previous_record, "stage1_response", None) or {}
-
-        # Extract previous Stage 1 user message
-        prev_user_content = ""
-        for msg in prev_s1_messages:
-            if msg.get("role") == "user":
-                prev_user_content = msg["content"]
-                break
 
         # Extract previous Stage 1 assistant reply content
         prev_assistant_content = ""
         if isinstance(prev_s1_response, dict):
             prev_assistant_content = prev_s1_response.get("content", "") or ""
 
-        if not prev_user_content:
-            raise ValueError(
-                f"build_incremental_stage1: previous_record.stage1_messages "
-                f"contains no user message. "
-                f"stage1_messages has {len(prev_s1_messages)} items, "
-                f"roles={[m.get('role') for m in prev_s1_messages]}. "
-                f"record.meta: {getattr(previous_record, 'meta', '<missing>')!r}"
-            )
         prev_diag = getattr(previous_record, "stage1_diagnosis", None) or {}
         if not prev_assistant_content and not (
             isinstance(prev_diag, dict) and prev_diag
@@ -1137,9 +1134,10 @@ class PromptAssembler:
         prev_assistant_content = self._normalize_prev_stage1_assistant_for_incremental(
             previous_record,
             prev_assistant_content,
+            shift_n=int(new_bar_count or 0),
         )
 
-        prev_user_content = self._inject_market_features_block(prev_user_content, frame)
+        current_user_content = self._build_stage1_user_prompt(frame, analysis_mode=analysis_mode)
 
         prev_reasoning = ""
         if isinstance(prev_s1_response, dict):
@@ -1173,7 +1171,7 @@ class PromptAssembler:
 
         return [
             {"role": "system",    "content": system_content},
-            {"role": "user",      "content": prev_user_content},
+            {"role": "user",      "content": current_user_content},
             assistant_turn,
             {"role": "user",      "content": incremental_user_content},
         ]
@@ -1351,10 +1349,16 @@ class PromptAssembler:
         full_kline_table = self._render_kline_table(frame)
         full_feature_table = self._render_kline_feature_table(frame)
         simple_features_block = self._render_simple_market_features_block(frame)
+        prev_stage1_shifted = shift_kline_refs(
+            previous_record.stage1_diagnosis or {}, new_count
+        )
+        prev_stage2_shifted = shift_kline_refs(
+            previous_record.stage2_decision or {}, new_count
+        )
         previous_summary = {
             "meta": previous_record.meta.model_dump(),
-            "stage1_diagnosis": previous_record.stage1_diagnosis or {},
-            "stage2_decision": previous_record.stage2_decision or {},
+            "stage1_diagnosis": prev_stage1_shifted,
+            "stage2_decision": prev_stage2_shifted,
             "strategy_files_used": previous_record.strategy_files_used or [],
         }
         return (
@@ -1380,6 +1384,9 @@ class PromptAssembler:
             f"品种:{frame.symbol} 周期:{frame.timeframe} K线数量:{n_bars} 新增已收盘K线:{new_count}\n"
             f"（K线序号：1=最新已收盘，最大 K{n_bars}；"
             f"每个决策节点的 bar_range 由你自行选择子区间，勿超出 K{n_bars}-K1）\n\n"
+            f"⚠ 序号平移说明：本轮新增 {new_count} 根已收盘K线，上一轮所有 K 线序号整体 +{new_count}"
+            f"（上一轮 K1 在本轮为 K{new_count + 1}）。下方「上一轮已完成分析」中所有 K 引用"
+            f"（bar_range、reason、key_signals 等）均已由程序平移成本轮坐标，可直接引用，无需再换算。\n\n"
             "## 上一轮已完成分析（仅作为延续上下文）\n\n"
             f"```json\n{json.dumps(previous_summary, ensure_ascii=False, indent=2)}\n```\n\n"
             f"## 新增 K线数据(共{new_count}根，序号1=最新已收盘；含阳阴列)\n\n"
@@ -1421,17 +1428,28 @@ class PromptAssembler:
         new_count = max(0, min(new_bar_count, n_bars))
         new_kline_table = self._render_kline_table(frame, limit=new_count)
         new_feature_table = self._render_kline_feature_table(frame, limit=new_count)
+        shift_n = max(0, min(new_bar_count, n_bars))
+        prev_stage1_shifted = shift_kline_refs(
+            previous_record.stage1_diagnosis or {}, shift_n
+        )
+        prev_stage2_shifted = shift_kline_refs(
+            previous_record.stage2_decision or {}, shift_n
+        )
         previous_summary = {
             "meta": previous_record.meta.model_dump(),
-            "stage1_diagnosis": previous_record.stage1_diagnosis or {},
-            "stage2_decision": previous_record.stage2_decision or {},
+            "stage1_diagnosis": prev_stage1_shifted,
+            "stage2_decision": prev_stage2_shifted,
             "strategy_files_used": previous_record.strategy_files_used or [],
         }
         return (
             "## 阶段一增量更新任务\n\n"
             "上方是你上一轮完成的阶段一诊断。现在基于新增 K 线，更新诊断与闸门判断。\n"
             "完整 K 线数据已包含在上方阶段一用户消息中（K线序号已重新编号，"
-            "K1=当前最新已收盘K线），你可以回溯查看任何历史 K 线。\n\n"
+            "K1=当前最新已收盘K线），你可以回溯查看任何历史 K 线。\n"
+            "⚠ 序号平移说明：本轮新增了 " + str(shift_n) + " 根已收盘K线，"
+            "上一轮所有 K 线序号整体 +" + str(shift_n) + "（上一轮 K1 在本轮为 K" + str(shift_n + 1) + "）。"
+            "你上方看到的「上一轮阶段一诊断」中所有 K 引用（bar_range、reason、key_signals 等）"
+            "均已由程序平移成本轮坐标，可直接引用，无需再换算。\n\n"
             "⚠ 反锚定要求——这是增量分析最重要的原则：\n"
             "- 不要因为上一轮已得出结论就倾向于延续它；上一轮结论只是参考起点，不是约束。\n"
             "- 如果新增 K 线改变了市场结构（突破、反转、趋势加速/衰竭），必须果断推翻上一轮结论，而非在旧结论上微调。\n"

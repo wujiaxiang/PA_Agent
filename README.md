@@ -88,6 +88,8 @@ python -m pa_agent.main
 
 首次启动后在**设置**中填写 **Base URL**、**模型名** 与 **API Key**。
 
+**安装内容**：PyQt6（GUI 框架）+ pyqtgraph（K 线图表绘图）+ numpy/pandas（数据处理）+ openai（AI API 客户端）+ json 校验、模型定义等全套依赖。
+
 ### Web 后端（本仓库二次开发新增，云端调试主入口）
 
 ```bash

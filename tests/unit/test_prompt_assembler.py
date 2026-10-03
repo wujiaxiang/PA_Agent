@@ -11,11 +11,11 @@ from pa_agent.ai.prompt_assembler import PromptAssembler
 from pa_agent.data.base import KlineBar, KlineFrame, IndicatorBundle
 
 
-def _make_frame(n: int = 5) -> KlineFrame:
+def _make_frame(n: int = 5, base_ts: float = 1_700_000_000) -> KlineFrame:
     bars = tuple(
         KlineBar(
             seq=i + 1,
-            ts_open=float(1_700_000_000 - i * 3600),
+            ts_open=float(base_ts - i * 3600),
             open=2600.0 + i,
             high=2610.0 + i,
             low=2590.0 + i,
@@ -394,8 +394,10 @@ def test_incremental_stage1_prompt_includes_previous_record_and_new_bars(
     from pa_agent.records.schema import AnalysisRecord, RecordMeta
 
     frame = _make_frame(5)
-    # Build a full Stage 1 to get realistic messages/response for the previous record
-    full_s1_messages = assembler.build_stage1(frame)
+    # Previous record stores messages built from an OLDER frame (stale table);
+    # message [1] must be rebuilt from the CURRENT frame, not this stale copy.
+    prev_frame = _make_frame(5, base_ts=1_700_000_000 - 2 * 3600)
+    full_s1_messages = assembler.build_stage1(prev_frame)
     prev_user = next(m["content"] for m in full_s1_messages if m["role"] == "user")
     prev_assistant = '{"cycle_position":"normal_channel","gate_result":"proceed"}'
 
@@ -426,9 +428,12 @@ def test_incremental_stage1_prompt_includes_previous_record_and_new_bars(
 
     # 4-message continuation structure: system, user(prev S1), assistant(prev S1 reply), user(incremental)
     assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
-    # Message [1] is previous full Stage 1 user prompt, refreshed with market features
-    assert "程序结构辅助特征" in messages[1]["content"]
-    assert messages[1]["content"].startswith(prev_user.split("\n", 1)[0])
+    # Message [1] is the full Stage 1 user prompt rebuilt from the CURRENT frame
+    current_user = next(
+        m["content"] for m in assembler.build_stage1(frame) if m["role"] == "user"
+    )
+    assert messages[1]["content"] == current_user
+    assert messages[1]["content"] != prev_user  # stale table must NOT be reused
     # Message [2] is normalized bare JSON from validated stage1_diagnosis
     assert messages[2]["content"].startswith("{")
     assert "cycle_position" in messages[2]["content"]
@@ -508,11 +513,10 @@ def test_incremental_stage1_normalizes_fenced_previous_response(
     assert parsed["cycle_position"] == "trending_tr"
 
 
-def test_incremental_stage1_raises_without_previous_messages(
+def test_incremental_stage1_rebuilds_prompt_without_previous_messages(
     assembler: PromptAssembler,
 ):
-    """Incremental Stage 1 raises ValueError when previous record lacks messages."""
-    import pytest
+    """Empty stored stage1_messages must not raise; [1] is rebuilt from frame."""
     from pa_agent.records.schema import AnalysisRecord, RecordMeta
 
     frame = _make_frame(5)
@@ -527,8 +531,8 @@ def test_incremental_stage1_raises_without_previous_messages(
         ),
         kline_data=[],
         htf_text="",
-        stage1_messages=[],  # empty → must raise
-        stage1_response=None,  # None → must raise
+        stage1_messages=[],  # empty - must NOT raise anymore
+        stage1_response=None,
         stage1_diagnosis={"cycle_position": "normal_channel"},
         stage2_messages=[],
         stage2_response=None,
@@ -539,8 +543,12 @@ def test_incremental_stage1_raises_without_previous_messages(
         usage_total={},
     )
 
-    with pytest.raises(ValueError, match="stage1_messages contains no user message"):
-        assembler.build_incremental_stage1(frame, previous, 2)
+    messages = assembler.build_incremental_stage1(frame, previous, 2)
+    assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
+    current_user = next(
+        m["content"] for m in assembler.build_stage1(frame) if m["role"] == "user"
+    )
+    assert messages[1]["content"] == current_user
 
 
 def test_incremental_stage1_raises_without_previous_response(

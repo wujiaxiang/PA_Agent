@@ -37,6 +37,17 @@ logger = logging.getLogger(__name__)
 _WORKER_JOIN_TIMEOUT_MS = 5000
 
 
+def _format_price(price: float) -> str:
+    """格式化价格：大数加千分位、小币自适应小数位。"""
+    if price >= 1:
+        return f"{price:,.2f}"        # BTC → 78,840.52
+    if price >= 0.01:
+        return f"{price:.4f}"         # 中等价 → 0.1234
+    # 极小价币（如 PEPE）：最多 8 位小数，去掉尾部 0，避免科学计数法
+    s = f"{price:.8f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
 def _qobject_alive(obj: QObject | None) -> bool:
     """Return False when the underlying Qt C++ object has been destroyed."""
     if obj is None:
@@ -398,21 +409,21 @@ class MainWindow(QMainWindow):
         _last_symbol = "000001"
         _last_tf = "15m"
         if _settings is not None:
-            _last_symbol = getattr(_settings.general, "last_symbol", "000001") or "000001"
+            _last_symbol = getattr(_settings.general, "last_symbol", "XAUUSDm") or "XAUUSDm"
             _last_tf = getattr(_settings.general, "last_timeframe", "15m") or "15m"
 
         # Data source
         from pa_agent.data.factory import DATA_SOURCE_CHOICES, normalize_data_source_kind
 
-        _last_ds = "eastmoney"
+        _last_ds = "mt5"
         if _settings is not None:
             _last_ds = normalize_data_source_kind(
-                getattr(_settings.general, "last_data_source", "eastmoney")
+                getattr(_settings.general, "last_data_source", "mt5")
             )
-        # 如果上次保存的数据源不在 UI 可选列表中, 强制回退东方财富(A股)
+        # 如果上次保存的数据源不在 UI 可选列表中, 强制回退 MT5（默认数据源）
         _ui_kinds = {k for k, _ in DATA_SOURCE_CHOICES}
         if _last_ds not in _ui_kinds:
-            _last_ds = "eastmoney"
+            _last_ds = "mt5"
         self._active_data_source_kind = _last_ds
 
         ctrl_layout.addWidget(QLabel("数据来源:"))
@@ -424,8 +435,8 @@ class MainWindow(QMainWindow):
             self._data_source_combo.setCurrentIndex(ds_index)
         self._data_source_combo.setMinimumWidth(108)
         self._data_source_combo.setToolTip(
-            "K 线数据来源：东方财富(A股)（默认，HTTP 直连）、"
-            "MT5（需终端登录）、TradingView（tvDatafeed）"
+            "K 线数据来源：MT5（默认，需终端登录）、"
+            "TradingView（tvDatafeed）、东方财富(A股)（HTTP 直连）"
         )
         self._data_source_combo.currentIndexChanged.connect(
             self._on_data_source_combo_changed
@@ -530,6 +541,21 @@ class MainWindow(QMainWindow):
         ctrl_layout.addWidget(self._tf_combo)
         self._populate_timeframe_combo_for_source()
         self._sync_tv_exchange_visibility()
+
+        # 实时价格标签 — 仅显示当前品种最新价（涨红跌绿，加密货币惯例）
+        self._price_label = QLabel("")
+        self._price_label.setObjectName("livePriceLabel")
+        self._price_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self._price_label.setMinimumWidth(110)
+        self._price_label.setStyleSheet(
+            "font: 600 13px 'Cascadia Code','Consolas',monospace;"
+            "color: #8b949e; padding: 2px 10px 2px 16px;"
+            "border: none; background: transparent;"
+        )
+        self._price_label.setToolTip("当前品种最新 K 线价格（实时刷新，颜色=涨跌）")
+        ctrl_layout.addWidget(self._price_label)
 
         ctrl_layout.addStretch()
 
@@ -1791,6 +1817,34 @@ class MainWindow(QMainWindow):
         """Forward a new KlineFrame to the chart widget (throttled by 30 Hz timer)."""
         self._chart_widget.set_frame(frame)
 
+    def _update_live_price_label(self, bars: Any) -> None:
+        """更新控制栏实时价格标签：仅显示最新价（颜色暗示涨跌）。"""
+        label = getattr(self, "_price_label", None)
+        if label is None or not bars:
+            return
+        latest = bars[0]
+        price = float(getattr(latest, "close", 0.0))
+        if price <= 0:
+            return
+        price_str = _format_price(price)
+
+        # 仅用颜色暗示涨跌：涨红 / 跌绿 / 平灰
+        color = "#8b949e"
+        if len(bars) >= 2:
+            prev_close = float(getattr(bars[1], "close", 0.0))
+            if prev_close > 0:
+                if price > prev_close:
+                    color = "#ef4444"
+                elif price < prev_close:
+                    color = "#3fb950"
+
+        label.setText(price_str)
+        label.setStyleSheet(
+            "font: 600 13px 'Cascadia Code','Consolas',monospace;"
+            f"color: {color}; padding: 2px 10px 2px 16px;"
+            "border: none; background: transparent;"
+        )
+
     def _on_refresh_frame_ready(self, bars: Any) -> None:
         """Handle frame_ready signal from RefreshLoop.
 
@@ -1799,6 +1853,7 @@ class MainWindow(QMainWindow):
         """
         if bars:
             self._last_frame_ready_bars = list(bars)
+            self._update_live_price_label(bars)
             from pa_agent.data.bar_close_wait import current_forming_ts
 
             ts = current_forming_ts(
