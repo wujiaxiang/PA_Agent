@@ -1185,6 +1185,17 @@ async function applySubscribe() {
     if (cbKeep) cbKeep.checked = false;
     updateLiveRefreshStatus();
 
+    // 该 (exchange, symbol, timeframe) 有历史成功记录 → 提示可用增量分析。
+    // 桌面 GUI 在此直接自动跑一次增量；Web 端改为提示，由用户一键触发 ——
+    // 每次分析都会调 LLM 且可能推送下单信号，自动触发会在浏览品种时反复烧
+    // token 并打扰通知渠道。
+    if (incrementalResult.status === 'fulfilled' && incrementalResult.value) {
+      showToast(
+        `${symbol} ${timeframe} 有历史记录，可点「增量」省约 14.5K tokens`,
+        'success'
+      );
+    }
+
     // loadBars 失败：K 线渲染失败，提示用户但其他模块已尝试完成
     if (barsResult.status === 'rejected') {
       throw barsResult.reason;
@@ -1288,9 +1299,18 @@ function showSwitchError(msg, type = 'connection') {
 // ── 增量分析按钮可用性检查 ────────────────────────────────────────────
 // 调 GET /api/records?exchange=&symbol=&timeframe=&limit=1 检查是否存在成功
 // 记录。无成功记录 → 禁用按钮 + tooltip 提示；有 → 启用按钮。
+/** Enable/disable the 增量 button for the current (exchange, symbol, timeframe).
+ *
+ *  Returns true when a prior successful record exists, i.e. an incremental run
+ *  is possible.  The desktop GUI (_check_auto_incremental) auto-*starts* an
+ *  incremental run on every symbol switch; we deliberately do not, because each
+ *  run costs an LLM call and can now push a Feishu/PushPlus order signal —
+ *  auto-firing while the user browses symbols would spend tokens and spam
+ *  notifications.  Instead callers surface a hint so the user can one-click it.
+ */
 async function refreshIncrementalButtonState() {
   const btn = $('#btn-incremental');
-  if (!btn) return;
+  if (!btn) return false;
   try {
     const exchange = $('#ds-exchange').value
       || currentSettings?.general?.last_tradingview_exchange || '';
@@ -1301,7 +1321,7 @@ async function refreshIncrementalButtonState() {
     if (!exchange || !symbol || !timeframe) {
       btn.disabled = true;
       btn.title = '缺少交易所/品种/周期信息';
-      return;
+      return false;
     }
     const data = await API.get(
       `/api/records?exchange=${encodeURIComponent(exchange)}&symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=1`
@@ -1309,13 +1329,15 @@ async function refreshIncrementalButtonState() {
     if (Array.isArray(data) && data.length > 0 && !data[0].has_exception) {
       btn.disabled = false;
       btn.title = '基于上次成功记录做增量分析';
-    } else {
-      btn.disabled = true;
-      btn.title = '无可用历史记录，请使用完整分析';
+      return true;
     }
+    btn.disabled = true;
+    btn.title = '无可用历史记录，请使用完整分析';
+    return false;
   } catch (e) {
     btn.disabled = true;
     btn.title = '无可用历史记录，请使用完整分析';
+    return false;
   }
 }
 
@@ -2163,6 +2185,28 @@ function setSidebarCollapsed(collapsed) {
   requestAnimationFrame(tick);
 }
 
+// 「重试后取消持续跟踪」开关（对齐桌面 GUI MainWindow._on_retry_occurred）。
+// 此前 Web 端只在保存设置时写盘，从未在重试事件里读取该开关 —— 界面上是一个
+// 完全不起作用的复选框。重试说明本轮数据/响应不稳定，继续自动跟随收盘重跑
+// 很可能连续失败并烧 token，故按开关自动关闭并持久化。
+async function applyCancelKeepAnalysisOnRetry(stageLabel) {
+  if (currentSettings?.general?.cancel_keep_analysis_on_retry !== true) return;
+  const cbKeep = $('#cb-keep-analysis');
+  const cbSetting = $('#s-keep-analysis');
+  if (!cbKeep || !cbKeep.checked) return;  // 未开启持续分析，无需处理
+
+  cbKeep.checked = false;
+  if (cbSetting) cbSetting.checked = false;
+  updateLiveRefreshStatus();
+  try {
+    await API.put('/api/settings', { general: { keep_analysis: false } });
+    if (currentSettings?.general) currentSettings.general.keep_analysis = false;
+    showToast(`持续跟踪分析已因${stageLabel || '模型'}重试自动关闭`, 'warning');
+  } catch (err) {
+    console.error('cancel keep_analysis on retry: persist failed', err);
+  }
+}
+
 async function startAnalysis(continuousMode = false) {
   // 等待收盘：若勾选了「等待收盘」复选框，先调 /api/bars/next-close 拿到剩余
   // 秒数，每秒更新倒计时，归零后再实际发起 /api/analyze/stream 请求。
@@ -2223,6 +2267,7 @@ async function startAnalysis(continuousMode = false) {
                 : '🔄 阶段一重试中…';
               if (evt.reason) stage += `（${evt.reason}）`;
               setStageStatus(1, `重试中（第 ${evt.attempt || '?'} 次）`, 'active');
+              applyCancelKeepAnalysisOnRetry('阶段一');
               break;
             case 'Stage1Done':
               stage = '⏳ 构建阶段二…';
@@ -2248,6 +2293,7 @@ async function startAnalysis(continuousMode = false) {
                 : '🔄 阶段二重试中…';
               if (evt.reason) stage += `（${evt.reason}）`;
               setStageStatus(2, `重试中（第 ${evt.attempt || '?'} 次）`, 'active');
+              applyCancelKeepAnalysisOnRetry('阶段二');
               break;
             case 'Stage2Done':
               stage = '✅ 分析完成';
@@ -2584,6 +2630,7 @@ async function startIncrementalAnalysis(continuousMode = false) {
             case 'Stage1Retry':
               stage = `🔄 阶段一第 ${evt.attempt || '?'} 次重试…`;
               setStageStatus(1, `重试中（第 ${evt.attempt || '?'} 次）`, 'active');
+              applyCancelKeepAnalysisOnRetry('阶段一');
               break;
             case 'Stage1Done':
               stage = '⏳ 构建阶段二…';
@@ -2605,6 +2652,7 @@ async function startIncrementalAnalysis(continuousMode = false) {
             case 'Stage2Retry':
               stage = `🔄 阶段二第 ${evt.attempt || '?'} 次重试…`;
               setStageStatus(2, `重试中（第 ${evt.attempt || '?'} 次）`, 'active');
+              applyCancelKeepAnalysisOnRetry('阶段二');
               break;
             case 'Stage2Done':
               stage = '✅ 增量分析完成';

@@ -455,6 +455,26 @@ def _run_analysis(
         record_payload = _serialize_record(record)
         # 保存最近记录引用，供追问（/api/chat/stream）路由使用
         ctx._last_record = record
+        # 下单机会：落 trade_records + 推 Feishu/PushPlus（后台线程，失败不影响主流程）。
+        # 桌面 GUI 的等价逻辑在 MainWindow._spawn_post_order_followup；此前 Web 端
+        # 完全没有调用方，导致服务端部署下告警与交易落盘都是死的。
+        try:
+            from web.api.order_followup import spawn_post_order_followup
+
+            if spawn_post_order_followup(
+                record=record,
+                frame=frame,
+                settings=ctx.settings,
+                symbol=ctx.settings.general.last_symbol,
+                timeframe=ctx.settings.general.last_timeframe,
+            ):
+                logger.info(
+                    "order signal dispatched for %s/%s",
+                    ctx.settings.general.last_symbol,
+                    ctx.settings.general.last_timeframe,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("post-order followup dispatch failed: %s", exc)
         # 脱敏：递归替换 payload 中出现的 api_key（含 raw_debug_payload 内的 prompt/response）
         api_key = ""
         try:
