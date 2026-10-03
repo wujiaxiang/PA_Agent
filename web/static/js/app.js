@@ -478,6 +478,12 @@ async function loadSettings() {
     if (tvSessionIdEl) tvSessionIdEl.value = tv.session_id || '';
     if (tvUserEl) tvUserEl.value = tv.username || '';
     if (tvPassEl) tvPassEl.value = tv.password || '';
+
+    // 后端把已配置的凭据以 abcd****wxyz 形式返回（GET /api/settings 脱敏）。
+    // 提示用户「已配置，留空不改」——保存时后端会识别占位值并保留原值，
+    // 用户无需重新输入即可保存其它设置。
+    markMaskedSecretFields();
+
     // API Key 未配置警告：检查 provider.api_key_encrypted 是否为空字符串
     updateApiKeyAlert(s);
     return s;
@@ -586,6 +592,28 @@ async function loadOrderOpportunityTypes() {
   } catch (e) {
     console.warn('loadOrderOpportunityTypes: 使用内置默认值', e);
   }
+}
+
+// 标记「已配置但已脱敏」的凭据输入框：加 CSS 类 + placeholder 提示。
+// 后端 GET /api/settings 只回传 abcd****wxyz，占位值在保存时会被后端忽略，
+// 因此用户保持占位值即可保存，不会清空真实凭据。
+const MASKED_FIELD_IDS = [
+  '#s-api-key', '#s-feishu-webhook', '#s-feishu-secret', '#s-feishu-app-secret',
+  '#s-pushplus-token', '#s-tushare-token', '#s-tv-session-id', '#s-tv-password',
+];
+
+function markMaskedSecretFields() {
+  MASKED_FIELD_IDS.forEach((sel) => {
+    const el = $(sel);
+    if (!el) return;
+    const masked = /\*{4}/.test(el.value || '');
+    el.classList.toggle('is-masked-secret', masked);
+    if (masked && !el.dataset.maskedHint) {
+      el.dataset.maskedHint = '1';
+      el.dataset.origPlaceholder = el.placeholder || '';
+      el.placeholder = '已配置（留空或保持不变即可）';
+    }
+  });
 }
 
 // ── Events ─────────────────────────────────────────────────────────────

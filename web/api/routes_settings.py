@@ -19,9 +19,42 @@ from pa_agent.util.logging import register_settings_secrets
 router = APIRouter(tags=["settings"])
 
 
+#: Credential fields masked in ``GET /api/settings``.
+#:
+#: Previously only ``provider.api_key`` was masked, so Feishu ``secret`` /
+#: ``app_secret`` / ``webhook_url``, the PushPlus token, the Tushare token and the
+#: TradingView password/session were returned in plaintext. Combined with
+#: ``allow_origins=["*"]`` and no authentication, any web page the user visited
+#: could read every one of them cross-origin.
+#:
+#: The settings form refills from this response and posts the value straight back,
+#: so :func:`_is_masked_key` + the ``_SECRET_FIELDS`` guard in ``put_settings``
+#: ensure a masked placeholder is never written back over the real value.
+_SECRET_FIELDS: tuple[tuple[str, str], ...] = (
+    ("provider", "api_key"),
+    ("feishu", "secret"),
+    ("feishu", "app_secret"),
+    ("feishu", "webhook_url"),
+    ("pushplus", "token"),
+    ("tushare", "token"),
+    ("tradingview", "password"),
+    ("tradingview", "session_id"),
+)
+
+
+def _mask_placeholder(value: str) -> str:
+    """Render *value* as a non-reversible placeholder that round-trips safely."""
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    v = value.strip()
+    if len(v) <= 8:
+        return "****"
+    return f"{v[:4]}****{v[-4:]}"
+
+
 @router.get("/settings")
 async def get_settings(request: Request):
-    """Return current settings with API key masked."""
+    """Return current settings with every credential masked."""
     ctx = request.app.state.ctx
     settings = await asyncio.to_thread(load_settings, SETTINGS_JSON_PATH)
     ctx.settings = settings  # sync live reference
@@ -29,33 +62,36 @@ async def get_settings(request: Request):
     # 否则新密钥会以明文写进 records/pending/*.json。
     register_settings_secrets(settings)
     d = settings.model_dump()
-    pk = d.get("provider", {})
-    if pk.get("api_key"):
-        pk["api_key"] = pk["api_key"][:4] + "****" + pk["api_key"][-4:] if len(pk["api_key"]) > 8 else "****"
-        d["provider"] = pk
-    # 飞书 secret/app_secret 保持明文返回以适配表单回填（与 PyQt6 行为一致）
+    for section, field in _SECRET_FIELDS:
+        bucket = d.get(section)
+        if isinstance(bucket, dict) and bucket.get(field):
+            bucket[field] = _mask_placeholder(bucket[field])
     # 禁止缓存：防止前端读到旧 bar_count（TODO P0.2）
     return JSONResponse(content=d, headers={"Cache-Control": "no-store"})
 
 
 def _is_masked_key(value) -> bool:
-    """True when *value* is a masked/placeholder API key rather than a real one.
+    """True when *value* is a masked placeholder emitted by ``GET /api/settings``.
 
-    ``GET /api/settings`` deliberately masks the provider key before returning it
-    (``abcd****wxyz``, or ``****`` for short keys). The settings form refills
-    itself from that response and posts the value straight back on save, so
-    without this guard a single "save settings" click overwrites the real key on
-    disk with the placeholder and every later model call fails with 401.
+    The GET handler renders every credential in :data:`_SECRET_FIELDS` through
+    :func:`_mask_placeholder`, which always contains the ``****`` marker. The
+    settings form refills from that response and posts the value straight back on
+    save, so without this guard one "save settings" click overwrites the real
+    credential on disk with the placeholder and every later call fails.
     """
-    if not isinstance(value, str):
-        return False
-    v = value.strip()
-    if not v:
+    return isinstance(value, str) and "****" in value
+
+
+def _should_keep_existing(section: str, field: str, value) -> bool:
+    """Whether a submitted value must be ignored to protect the stored one."""
+    if _is_masked_key(value):
         return True
-    if v == "****" or "****" in v:
-        return True
-    # Cheap structural guards: real keys are long and hex/base64-ish.
-    return len(v) < 16
+    # For the provider key an empty submission means "form had nothing", not
+    # "please wipe my key" — the form only ever sends back what it received.
+    if (section, field) == ("provider", "api_key"):
+        if isinstance(value, str) and not value.strip():
+            return True
+    return False
 
 
 @router.put("/settings")
@@ -70,8 +106,10 @@ async def put_settings(request: Request, body: dict):
             if target is not None:
                 for k, v in body[section].items():
                     if hasattr(target, k):
-                        # Never let a masked placeholder overwrite the stored key.
-                        if section == "provider" and k == "api_key" and _is_masked_key(v):
+                        # Never let a masked placeholder overwrite a stored
+                        # credential — applies to every field in _SECRET_FIELDS,
+                        # not just the provider key.
+                        if (section, k) in _SECRET_FIELDS and _should_keep_existing(section, k, v):
                             masked_key_dropped = True
                             continue
                         setattr(target, k, v)

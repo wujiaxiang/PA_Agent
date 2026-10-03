@@ -3426,3 +3426,10 @@ button.secondary:hover { background: var(--border); }
   opacity: 0.8;
 }
 .health-banner .close-btn:hover { opacity: 1; }
+
+/* 已配置但已脱敏的凭据输入框（GET /api/settings 只回传 abcd****wxyz）。
+   用户保持占位值保存时后端会识别并保留真实值，无需重新输入。 */
+.is-masked-secret {
+  border-style: dashed !important;
+  opacity: 0.85;
+}

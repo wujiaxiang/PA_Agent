@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -125,12 +126,32 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Cross-origin policy.
+#
+# The WebUI is served by this very app (static mount at "/" + /api), so it is
+# always same-origin and needs no CORS at all. The previous `allow_origins=["*"]`
+# meant any web page the operator visited could read /api/settings — which also
+# returned the Feishu/PushPlus/Tushare/TradingView credentials in plaintext —
+# and could drive POST /api/feishu/test and PUT /api/settings. There is no auth.
+#
+# Opt-in for a genuinely separate front-end via PA_AGENT_CORS_ORIGINS
+# (comma-separated exact origins); anything unlisted is denied.
+_CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("PA_AGENT_CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
+if _CORS_ORIGINS:
+    logger.warning(
+        "CORS enabled for %s — /api/settings credentials are readable by these origins",
+        _CORS_ORIGINS,
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_CORS_ORIGINS,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type"],
+    )
 
 
 @app.middleware("http")

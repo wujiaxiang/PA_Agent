@@ -70,22 +70,34 @@ def test_get_settings_masks_short_api_key(client):
 
 
 def test_get_settings_returns_feishu_fields(client):
-    """飞书 secret/app_secret 应明文返回以适配表单回填。"""
+    """飞书字段照常返回，但凭据一律脱敏。
+
+    此前 secret/app_secret/webhook_url 明文返回，配合 allow_origins=["*"] 且
+    无鉴权，任何网页都能跨域读到全部通知凭据。表单回填改为依赖 PUT 侧识别
+    占位值（见 _should_keep_existing），无需明文往返。
+    """
     s = Settings(
         feishu=FeishuSettings(
-            webhook_url="https://example.com/hook",
-            secret="my-secret",
+            webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/SECRET-HOOK-TOKEN-1234",
+            secret="my-secret-value-1234",
             app_id="cli_xxx",
-            app_secret="app-secret-val",
+            app_secret="app-secret-value-1234",
         )
     )
     with patch("web.api.routes_settings.load_settings", return_value=s):
         resp = client.get("/api/settings")
 
+    body = resp.text
     feishu = resp.json()["feishu"]
-    assert feishu["secret"] == "my-secret"
-    assert feishu["app_secret"] == "app-secret-val"
-    assert feishu["webhook_url"] == "https://example.com/hook"
+    # 非凭据字段照常返回
+    assert feishu["app_id"] == "cli_xxx"
+    assert feishu["enabled"] is True
+    # 凭据必须脱敏，且原值不得出现在响应体中
+    assert feishu["secret"] != s.feishu.secret and "****" in feishu["secret"]
+    assert feishu["app_secret"] != s.feishu.app_secret
+    assert feishu["webhook_url"] != s.feishu.webhook_url
+    for leaked in (s.feishu.secret, s.feishu.app_secret, s.feishu.webhook_url):
+        assert leaked not in body
 
 
 # ── PUT /api/settings ─────────────────────────────────────────────────────────
