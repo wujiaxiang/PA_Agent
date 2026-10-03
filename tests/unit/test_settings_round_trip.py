@@ -18,9 +18,10 @@ def test_defaults(tmp_path):
     assert s.provider.reasoning_effort == "high"
     assert s.provider.context_window == 2_000_000
     assert s.general.analysis_bar_count == 100
-    # 默认数据源为 MT5, 默认品种为现货黄金 XAUUSDm
-    assert s.general.last_data_source == "mt5"
-    assert s.general.last_symbol == "XAUUSDm"
+    # 本仓库 Web 后端为 TradingView-only（factory.py::DATA_SOURCE_CHOICES 只暴露
+    # tradingview）。上游默认 mt5/XAUUSDm 在 Linux/Docker 下会启动失败，故不使用。
+    assert s.general.last_data_source == "tradingview"
+    assert s.general.last_symbol == "XAUUSD"
     assert s.general.last_timeframe == "15m"
     assert s.general.decision_stance == "balanced"
     assert s.general.decision_flow_auto_play is True

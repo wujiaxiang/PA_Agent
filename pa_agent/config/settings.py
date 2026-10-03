@@ -72,12 +72,18 @@ class GeneralSettings(BaseModel):
     analysis_bar_count: int = Field(default=100, ge=2, le=5000)
     refresh_interval_ms: int = 1000
     context_warning_threshold_pct: float = 99_999_999.0
-    last_data_source: DataSourceKind = "mt5"
+    # 本仓库 Web 后端为 TradingView-only（见 data/factory.py::DATA_SOURCE_CHOICES，
+    # UI 只暴露 tradingview）。上游 1.31 把此默认值改为 "mt5"，但 MT5 仅在
+    # Windows 可用，Linux/Docker 下 create_data_source("mt5") 抛
+    # DataSourceTransientError 且被 AppContext.bootstrap() 的 except 吞掉，
+    # 导致全新部署静默启动但无任何数据源。此处保持 tradingview。
+    last_data_source: DataSourceKind = "tradingview"
     #: A-share K-line adjust for East Money / Baostock (qfq=前复权)
     kline_adjust: Literal["qfq", "hfq", "none"] = "qfq"
     #: TradingView 交易所；空字符串 =（自动）依次探测预设列表
     last_tradingview_exchange: str = ""
-    last_symbol: str = "XAUUSDm"
+    #: 同上：上游默认的 XAUUSDm 是 MT5 品种代码，Web 端改用 TradingView 黄金默认。
+    last_symbol: str = "XAUUSD"
     last_timeframe: str = "15m"
     #: K 线图显示所用时区（IANA 名称，如 Asia/Shanghai）
     display_timezone: str = "Asia/Shanghai"

@@ -28,11 +28,16 @@ def test_normalize_data_source_kind_hidden_sources():
 
 
 def test_mt5_in_ui_choices():
-    """MT5 为默认数据源, 必须在 UI 可选列表中且排首位。"""
+    """本仓库 Web 后端为 TradingView-only。
+
+    上游 1.31 曾把 MT5 设为默认且排到 UI 首位，但 MT5 仅 Windows 可用，
+    Linux/Docker 部署下 bootstrap 会失败，故 UI 只暴露 tradingview。
+    """
     ui_kinds = {k for k, _ in DATA_SOURCE_CHOICES}
-    assert "mt5" in ui_kinds
-    assert DATA_SOURCE_CHOICES[0][0] == "mt5"
-    # eastmoney / AkShare 仍是隐藏源
+    assert "tradingview" in ui_kinds
+    assert DATA_SOURCE_CHOICES[0][0] == "tradingview"
+    # MT5 / eastmoney / AkShare 均不在 UI 列表中
+    assert "mt5" not in ui_kinds
     assert "eastmoney" not in ui_kinds
     assert "akshare" not in ui_kinds
 
@@ -61,5 +66,11 @@ def test_default_tradingview_exchange_is_auto():
 
 
 def test_general_settings_last_data_source_default():
+    """默认数据源必须是 tradingview（本仓库 Web/TradingView-only）。
+
+    上游默认 "mt5" 在 Linux/Docker 下 create_data_source() 抛
+    DataSourceTransientError 且被 AppContext.bootstrap() 的 except 吞掉，
+    会导致全新部署静默启动但完全没有数据源。
+    """
     g = GeneralSettings()
-    assert g.last_data_source == "mt5"
+    assert g.last_data_source == "tradingview"
