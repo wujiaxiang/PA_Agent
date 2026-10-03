@@ -4,6 +4,30 @@
 
 ---
 
+## 2026-10-03
+
+### 1. 同步上游 1.31 ~ 1.39（11 个提交）
+
+- **目标**：把上游 `upstream/main`（`rosemarycox5334-debug/PA_Agent`）从 `bb7c7d3`（1.3）推进到 `cd0aca2`（1.39），共 11 个提交、28 个文件、+614/-242
+- **上游主要内容**：
+  1. `pa_agent/ai/rate_limit.py`（新增）：429 限流的指数退避重试 `call_with_rate_limit_backoff()`
+  2. `pa_agent/ai/incremental_shift.py`（新增）：增量分析时机械平移上一轮 JSON 的 K 线序号引用
+  3. `pa_agent/ai/deepseek_client.py`：B.AI 网关限流、Packy/DeepSeek 上限细化、RateLimit 错误分类
+  4. `pa_agent/ai/prompt_assembler.py`：增量场景 prompt 裁剪优化
+  5. `pa_agent/ai/session_ledger.py`、`pa_agent/data/akshare_source.py`、`ashare_common.py`、`pa_agent/gui/*` 等配套调整
+  6. 默认值调整：`GeneralSettings.last_data_source` → `mt5`、`last_symbol` → `XAUUSDm`、`context_warning_threshold_pct` → `99999999.0`
+- **合并前保护**：本地未提交工作先落到 `wip/local-work-20261003`，再合入同步分支，避免冲突中丢失
+- **冲突解决（3 处）**：
+  1. `pa_agent/ai/deepseek_client.py`：保留上游 `call_with_rate_limit_backoff` 包装 + 本仓库 `top_p` 例外注释
+  2. `config/settings.example.json`：采用上游 `context_warning_threshold_pct`（与已合并的 `settings.py` 代码默认值一致）；保留本仓库 Web 优先的 `tradingview`/`GATEIO`/`BTCUSDT` 默认与新增字段
+  3. `README.md`：上游把「安装内容：PyQt6...」误放进 Web 章节，已移回「桌面 GUI」章节；同时恢复上游 `b81cf2d` 误删的「### uv 隔离环境（可选）」小标题
+- **二次冲突（并入 WIP 时）**：`deepseek_client.py::_provider_max_output_tokens` 取两侧并集 —— 保留上游新增的 B.AI 8192 分支，叠加本仓库 OpenRouter 32768 分支；unknown 分支仍走上游 `_GLOBAL_MAX_OUTPUT_TOKENS`(384000) 全局 clamp；移除已无引用的 `_PRACTICAL_UNLIMITED_MAX_TOKENS` 与 `_UNKNOWN_PROVIDER_MAX_OUTPUT_TOKENS`
+- **附带修复**：`tests/unit/test_settings_round_trip.py::test_round_trip` —— 上游 1.31 重写该测试并断言 `BTCUSDT` 被迁移为 `XAUUSDm`，这是本仓库早已移除的行为（非黄金品种保留用户选择，见 AGENTS.md「品种迁移逻辑」），按本仓库约定更新断言
+- **验证**：与同步前 `main` 基线（worktree）逐条对比 `tests/unit`：**新增失败 0 个，修复 1 个**（上游修好了 `test_completion_max_tokens_packy_claude_cap`）。其余 32 失败 / 30 error 均为同步前既有（Linux 缺 MetaTrader5、缺 cursor-sdk、Qt 无显示环境等）
+- **分支**：`chore/sync-upstream-20261003`
+
+---
+
 ## 2026-07-22
 
 ### 7. closebar 时间错误修复 + 增量/持续分析标识
