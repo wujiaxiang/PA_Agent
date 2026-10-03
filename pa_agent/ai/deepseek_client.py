@@ -595,11 +595,16 @@ class DeepSeekClient:
         context_window: int | None = None,
         cancel_token: "CancelToken | None" = None,
         timeout_s: float = 600.0,
+        max_tokens: int | None = None,
     ) -> AIReply:
         """Send *messages* to the DeepSeek API and return a structured reply.
 
         Raises CancelledError if cancel_token is set before the call.
         Never sends temperature/top_p/presence_penalty/frequency_penalty.
+
+        *max_tokens* caps the computed completion budget. Use it for liveness
+        probes (``startup_health_check``) so a connectivity check does not
+        reserve/price a full 65k-token completion.
         """
         # Check cancellation before making the network call
         if cancel_token is not None and cancel_token.is_set():
@@ -616,6 +621,8 @@ class DeepSeekClient:
         _max_tokens = _completion_max_tokens(
             self._settings, extra_body=extra_body, effort=_effort
         )
+        if max_tokens is not None and max_tokens > 0:
+            _max_tokens = min(_max_tokens, int(max_tokens))
 
         masked_key = mask_secret(self._settings.api_key)
         self._log.debug(

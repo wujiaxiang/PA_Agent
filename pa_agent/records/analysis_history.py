@@ -81,12 +81,42 @@ def list_record_paths(
 
 
 def load_record(path: Path) -> AnalysisRecord | None:
-    """Load one AnalysisRecord, returning None for unreadable legacy files."""
+    """Load one AnalysisRecord, returning None for unreadable legacy files.
+
+    ``save_partial`` injects a ``_partial_reason`` marker that is not part of the
+    Pydantic schema (``extra="forbid"``), so it must be popped before validating —
+    otherwise *every* failed analysis record failed to load and was invisible in
+    history. ``routes_records`` already did this on its read path.
+    """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
+        raw.pop("_partial_reason", None)
         return AnalysisRecord.model_validate(raw)
     except Exception:
         return None
+
+
+def _scan_signature(root: Path, exchange: str, symbol: str, timeframe: str) -> tuple:
+    """Cheap change-detector for the directories a scan will touch.
+
+    Returns the sorted (dir_path, mtime) pairs for the narrow partition plus the
+    root, so a new record written into any leaf partition changes the signature.
+    """
+    entries: list[tuple[str, float]] = []
+    candidates = [root]
+    if exchange and symbol and timeframe:
+        candidates.append(
+            root
+            / _safe_path_segment(exchange)
+            / _safe_path_segment(symbol)
+            / _safe_path_segment(timeframe)
+        )
+    for d in candidates:
+        try:
+            entries.append((str(d), d.stat().st_mtime if d.is_dir() else 0.0))
+        except OSError:
+            entries.append((str(d), 0.0))
+    return tuple(sorted(entries))
 
 
 def find_latest_successful_record(
@@ -108,10 +138,13 @@ def find_latest_successful_record(
     """
     root = directory or RECORDS_PENDING_DIR
     cache_key = (str(root.resolve()), exchange, symbol, timeframe)
-    try:
-        dir_mtime = root.stat().st_mtime if root.is_dir() else 0.0
-    except OSError:
-        dir_mtime = 0.0
+    # Signature must reflect the directories that are ACTUALLY scanned. Records
+    # live in nested {exchange}/{symbol}/{timeframe}/ partitions, so writing a new
+    # record updates a leaf directory's mtime — never the root's. Keying on the
+    # root mtime therefore made the cache permanently stale (verified: a nested
+    # write does not change root.stat().st_mtime), so incremental analysis kept
+    # reusing an old record — or a cached None — forever.
+    dir_mtime = _scan_signature(root, exchange, symbol, timeframe)
     cached = _LATEST_RECORD_CACHE.get(cache_key)
     if cached is not None and cached[0] == dir_mtime:
         return cached[1]

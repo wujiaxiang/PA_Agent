@@ -65,8 +65,9 @@ def check_model_api(ctx: Any) -> ComponentHealth:
     Does NOT raise — callers receive the result and decide how to react.
 
     Strategy: call the client's ``chat`` method (DeepSeekClient.chat returns
-    an AIReply synchronously).  We don't pass max_tokens — the goal is just
-    to verify connectivity/auth, not limit tokens.
+    an AIReply synchronously).  ``max_tokens`` is capped to 1 and the request
+    timeout to 10s: this endpoint is unauthenticated, so it must not price or
+    occupy a full completion budget, nor hang the caller for the default 600s.
     """
     start = time.perf_counter()
     try:
@@ -75,7 +76,11 @@ def check_model_api(ctx: Any) -> ComponentHealth:
             return ComponentHealth("error", "AI client not initialized", 0.0)
         messages = [{"role": "user", "content": "ping"}]
         if hasattr(client, "chat"):
-            client.chat(messages)
+            try:
+                client.chat(messages, max_tokens=1, timeout_s=10.0)
+            except TypeError:
+                # Client without the newer kwargs — fall back, still bounded.
+                client.chat(messages)
         else:
             return ComponentHealth(
                 "error", "AI client has no chat method", 0.0

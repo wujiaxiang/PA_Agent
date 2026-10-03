@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -21,6 +22,8 @@ _executor = ThreadPoolExecutor(max_workers=2)
 # In-memory session cache: keyed by session_key -> {"session": FreeChatSession, "last_touch": ts}
 # 通过 TTL 机制（默认 30 分钟无活动）自动清理，避免内存泄漏
 _CHAT_SESSION_TTL_SEC = 30 * 60
+#: Per-request SSE queue depth (see routes_bars_stream for the same reasoning).
+_CHAT_QUEUE_MAXSIZE = 256
 _chat_sessions: dict[str, dict] = {}
 
 # 后台清理 task 句柄，避免重复启动
@@ -48,8 +51,17 @@ async def _ensure_chat_cleanup():
         _chat_cleanup_task = asyncio.create_task(_chat_cleanup_loop())
 
 
-def _touch_session(key: str, session: FreeChatSession) -> None:
-    _chat_sessions[key] = {"session": session, "last_touch": time.time()}
+def _touch_session(
+    key: str, session: FreeChatSession, lock: threading.Lock | None = None
+) -> None:
+    _chat_sessions[key] = {
+        "session": session,
+        "last_touch": time.time(),
+        # FreeChatSession.send() mutates _turn / _history_full without any internal
+        # lock, so two concurrent follow-ups on the same session would interleave
+        # history and duplicate turn numbers. One lock per session serialises them.
+        "lock": lock if lock is not None else threading.Lock(),
+    }
 
 
 def _get_session(key: str) -> FreeChatSession | None:
@@ -58,6 +70,34 @@ def _get_session(key: str) -> FreeChatSession | None:
         return None
     entry["last_touch"] = time.time()
     return entry["session"]
+
+
+def _record_matches_subscription(record, ctx) -> bool:
+    """True when *record* was produced for the (symbol, timeframe) now subscribed.
+
+    Without this check a follow-up asked after switching instruments silently
+    anchored to the *previous* symbol's analysis, so the AI answered about a
+    different market than the chart the user was looking at.
+    """
+    if record is None:
+        return False
+    meta = getattr(record, "meta", None)
+    general = getattr(getattr(ctx, "settings", None), "general", None)
+    if meta is None or general is None:
+        return True  # no way to compare — keep prior behaviour
+    # Only trust a comparison when both sides are real non-empty strings; any
+    # other value means we cannot reliably tell, so stay permissive.
+    def _mismatch(want: object, got: object) -> bool:
+        if not isinstance(want, str) or not isinstance(got, str):
+            return False
+        want, got = want.strip(), got.strip()
+        return bool(want) and bool(got) and want != got
+
+    if _mismatch(getattr(general, "last_symbol", ""), getattr(meta, "symbol", "")):
+        return False
+    if _mismatch(getattr(general, "last_timeframe", ""), getattr(meta, "timeframe", "")):
+        return False
+    return True
 
 
 def _kline_snapshot_fn(ctx):
@@ -83,17 +123,34 @@ async def chat_stream(
 ):
     """SSE endpoint for post-analysis free-chat."""
     ctx = request.app.state.ctx
-    event_queue: asyncio.Queue = asyncio.Queue()
+    # Bounded: a paused tab must not accumulate tokens forever (same reasoning as
+    # routes_bars_stream.SUBSCRIBER_QUEUE_MAXSIZE).
+    event_queue: asyncio.Queue = asyncio.Queue(maxsize=_CHAT_QUEUE_MAXSIZE)
     loop = asyncio.get_running_loop()
 
-    # Create or reuse a FreeChatSession anchored to the last analysis record
+    # Anchor the follow-up to an analysis of the *currently subscribed* instrument.
+    # ctx._last_record is only a hint: it survives symbol switches, so using it
+    # blindly answered questions about the previous market.
     record = getattr(ctx, "_last_record", None)
+    if not _record_matches_subscription(record, ctx):
+        record = None
+
     if record is None:
-        # Try to load latest from history. Offloaded: on a cache miss this
-        # rglobs + parses every record — blocking file I/O on the event loop.
+        # Try to load latest from history for the current instrument. Offloaded:
+        # on a cache miss this rglobs + parses records — blocking file I/O.
         from pa_agent.records.analysis_history import find_latest_successful_record
 
-        record = await asyncio.to_thread(find_latest_successful_record)
+        general = getattr(ctx.settings, "general", None)
+        record = await asyncio.to_thread(
+            find_latest_successful_record,
+            symbol=getattr(general, "last_symbol", "") or "",
+            timeframe=getattr(general, "last_timeframe", "") or "",
+            exchange=getattr(general, "last_tradingview_exchange", "") or "",
+        )
+        # Only promote to the shared hint when it is genuinely the newest one;
+        # previously any fallback clobbered a fresh in-memory record.
+        if record is not None:
+            ctx._last_record = record
 
     if record is None:
         event_queue.put_nowait({"type": "error", "message": "没有已完成的交易分析记录，请先进行一次分析"})
@@ -107,9 +164,22 @@ async def chat_stream(
                     continue
         return EventSourceResponse(_error_gen())
 
-    ctx._last_record = record
+    meta = getattr(record, "meta", None)
 
-    session_key = record_id or getattr(record, "_basename", "latest")
+    def _key_part(value: object) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    # Scope the session to the instrument so follow-ups on AAPL never inherit
+    # BTCUSDT's conversation, and include the snapshot flag so toggling
+    # attach_kline_snapshot actually takes effect instead of being ignored on reuse.
+    session_key = "|".join(
+        [
+            record_id or _key_part(getattr(record, "_basename", "")) or "latest",
+            _key_part(getattr(meta, "symbol", "")),
+            _key_part(getattr(meta, "timeframe", "")),
+            "k" if attach_kline_snapshot else "n",
+        ]
+    )
 
     session = _get_session(session_key)
     if session is None:
@@ -124,7 +194,8 @@ async def chat_stream(
             settings=ctx.settings,
             kline_snapshot_fn=kline_fn,
         )
-        _touch_session(session_key, session)
+        _touch_session(session_key, session, threading.Lock())
+    entry_lock = _chat_sessions[session_key]["lock"]
 
     def on_reasoning(c: str) -> None:
         loop.call_soon_threadsafe(event_queue.put_nowait, {
@@ -139,9 +210,10 @@ async def chat_stream(
     def _run():
         try:
             cancel_token = CancelToken()
-            reply = session.send(text, cancel_token=cancel_token,
-                                 on_reasoning_token=on_reasoning,
-                                 on_content_token=on_content)
+            with entry_lock:
+                reply = session.send(text, cancel_token=cancel_token,
+                                     on_reasoning_token=on_reasoning,
+                                     on_content_token=on_content)
             loop.call_soon_threadsafe(event_queue.put_nowait, {
                 "type": "done",
                 "content": reply.content,
