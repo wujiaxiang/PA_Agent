@@ -194,7 +194,7 @@ def _is_sensenova(base_url: str) -> bool:
     """SenseNova (token.sensenova.cn) OpenAI-compatible gateway.
 
     Provides deepseek-v4-flash 等 DeepSeek 模型的免费代理；其 max_tokens 上限为
-    384000（低于默认 _PRACTICAL_UNLIMITED_MAX_TOKENS），需单独限流以避免 400。
+    384000（低于默认 128k），需单独限流以避免 400。
     """
     return "sensenova.cn" in (base_url or "").lower()
 
@@ -238,8 +238,6 @@ def _adaptive_output_effort(reasoning_effort: str | None) -> str:
     return _EFFORT_TO_ADAPTIVE_OUTPUT.get(key, "medium")
 
 
-# Sent to OpenAI-compatible gateways; upstream may clamp below these values.
-_PRACTICAL_UNLIMITED_MAX_TOKENS = 524288
 # Anthropic-style thinking requires budget_tokens < max_tokens.
 _PRACTICAL_UNLIMITED_THINKING_BUDGET = 524287
 
@@ -302,12 +300,29 @@ def _prepare_api_messages(
     return api_messages, system_param
 
 
+def _is_openrouter(base_url: str | None) -> bool:
+    """Detect OpenRouter gateway by base_url."""
+    return "openrouter.ai" in (base_url or "").lower()
+
+
+# OpenRouter free models cap at 32768 output tokens.
+_OPENROUTER_MAX_OUTPUT_TOKENS = 32_768
+# Fallback for unknown providers (conservative default).
+_UNKNOWN_PROVIDER_MAX_OUTPUT_TOKENS = 128_000
+
+
 def _provider_max_output_tokens(settings: AIProviderSettings) -> int:
     """Per-gateway completion cap (max_tokens); avoids 400 from provider limits.
 
-    If ``settings.max_output_tokens`` is set (>0), it takes precedence over the
-    per-provider defaults (TODO P2.3 — lets users override via settings.json or
-    .env instead of editing this constant).
+    Priority: user explicit setting > per-provider defaults > fallback.
+
+    Per-provider defaults:
+      - Packy Claude: 128k
+      - DeepSeek native: 393216
+      - SenseNova: 131072 (GLM) / 65536 (others)
+      - MiMo: dynamic per model
+      - OpenRouter: 32768 (free model limit)
+      - Unknown: 128k (conservative)
     """
     explicit = getattr(settings, "max_output_tokens", None)
     if explicit and explicit > 0:
@@ -324,7 +339,9 @@ def _provider_max_output_tokens(settings: AIProviderSettings) -> int:
         return _SENSENOVA_DEFAULT_MAX_OUTPUT_TOKENS
     if _is_mimo(settings):
         return mimo_max_output_tokens(settings.model)
-    return _PRACTICAL_UNLIMITED_MAX_TOKENS
+    if _is_openrouter(settings.base_url):
+        return _OPENROUTER_MAX_OUTPUT_TOKENS
+    return _UNKNOWN_PROVIDER_MAX_OUTPUT_TOKENS
 
 
 def _completion_max_tokens(

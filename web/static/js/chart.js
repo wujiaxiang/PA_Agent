@@ -238,9 +238,14 @@ function setBars(candleSeries, bars) {
         wickColor: color,
       };
     }
+    // 已收盘的 bar → 显式设置实色（确保从 forming 切换到 closed 时颜色更新）
+    const color = b.close >= b.open ? COLOR_UP : COLOR_DOWN;
     return {
       time: b.ts_open / 1000,
       open: b.open, high: b.high, low: b.low, close: b.close,
+      color,
+      borderColor: color,
+      wickColor: color,
     };
   });
   candleSeries.setData(data);

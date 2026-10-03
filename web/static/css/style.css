@@ -54,11 +54,11 @@ body {
   background: var(--bg-input);
   color: var(--text);
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: 5px;
   padding: 4px 8px;
   font-size: 12px;
   height: 26px;
-  transition: border-color 0.15s ease;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 .seg-select:hover,
 .seg-input:hover { border-color: var(--text-dim); }
@@ -66,6 +66,7 @@ body {
 .seg-input:focus {
   outline: none;
   border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(41, 98, 255, 0.15);
 }
 .seg-select { min-width: 80px; cursor: pointer; }
 
@@ -74,16 +75,21 @@ body {
   background: var(--bg-input);
   color: var(--text);
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: 5px;
   padding: 4px 10px;
   font-size: 12px;
   height: 26px;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
 }
 .compact-btn:hover {
   background: var(--border);
   border-color: var(--text-dim);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+.compact-btn:active {
+  transform: scale(0.97);
+  box-shadow: none;
 }
 
 /* 图标按钮：纯图标，方形 */
@@ -91,13 +97,13 @@ body {
   background: transparent;
   color: var(--text-dim);
   border: 1px solid transparent;
-  border-radius: 4px;
+  border-radius: 5px;
   padding: 4px 6px;
   font-size: 14px;
   height: 26px;
   min-width: 26px;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -107,8 +113,9 @@ body {
   background: var(--bg-input);
   color: var(--text);
   border-color: var(--border);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
 }
-.icon-btn:active { transform: scale(0.95); }
+.icon-btn:active { transform: scale(0.93); box-shadow: none; }
 
 /* 分组分隔线 */
 .toolbar-divider {
@@ -248,19 +255,21 @@ body {
 
 button {
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: 5px;
   padding: 4px 12px;
   font-size: 12px;
   cursor: pointer;
   background: var(--bg-input);
   color: var(--text);
+  transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
 }
-button:hover { background: var(--border); }
+button:hover { background: var(--border); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2); }
+button:active { transform: scale(0.97); box-shadow: none; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-button.primary:hover { background: var(--accent-hover); }
+button.primary:hover { background: var(--accent-hover); box-shadow: 0 2px 8px rgba(41, 98, 255, 0.3); }
 button.danger { background: var(--red); border-color: var(--red); color: #fff; }
-button.danger:hover { background: #d84a49; }
-button.danger:disabled { background: var(--bg-input); border-color: var(--border); color: var(--text-dim); cursor: not-allowed; }
+button.danger:hover { background: #d84a49; box-shadow: 0 2px 8px rgba(239, 83, 80, 0.3); }
+button.danger:disabled { background: var(--bg-input); border-color: var(--border); color: var(--text-dim); cursor: not-allowed; box-shadow: none; }
 
 /* ── Main layout ─────────────────────── */
 #main {
@@ -290,6 +299,7 @@ button.danger:disabled { background: var(--bg-input); border-color: var(--border
   flex: 1;
   min-height: 0;
   position: relative;
+  width: 100% !important;  /* 防止 LightweightCharts 内联 width 覆盖 flex 布局 */
 }
 /* 副图容器：作为 chart-pane 子元素自下而上堆叠，无 gap/background 卡片堆叠样式 */
 #chart-osc-wrap {
@@ -813,9 +823,13 @@ button.danger:disabled { background: var(--bg-input); border-color: var(--border
   align-items: center;
   justify-content: center;
   box-shadow: -2px 0 8px rgba(0,0,0,0.3);
-  transition: background 0.15s;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
-.sidebar-expand-fab:hover { background: var(--accent-hover); }
+.sidebar-expand-fab:hover {
+  background: var(--accent-hover);
+  box-shadow: -3px 0 12px rgba(41, 98, 255, 0.4);
+  width: 28px;
+}
 .sidebar-expand-fab.visible { display: flex; }
 
 /* ── Sidebar tabs ────────────────────── */
@@ -1878,14 +1892,16 @@ button.danger:disabled { background: var(--bg-input); border-color: var(--border
   flex: 1;
   padding: 6px 10px;
   border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 4px;
+  border-radius: 5px;
   background: rgba(0, 0, 0, 0.3);
   color: #e0e6ed;
   font-size: 13px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 #tab-stream .chat-input-row input:focus {
   outline: none;
   border-color: #2962ff;
+  box-shadow: 0 0 0 2px rgba(41, 98, 255, 0.15);
 }
 #tab-stream .chat-input-row input:disabled {
   opacity: 0.5;
@@ -3381,3 +3397,32 @@ button.secondary:hover { background: var(--border); }
   from { opacity: 0; transform: translate(-50%, -10px); }
   to { opacity: 1; transform: translate(-50%, 0); }
 }
+
+/* 健康状态提示条 */
+.health-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 9999;
+  padding: 6px 16px;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 500;
+  transition: opacity 0.3s ease;
+}
+.health-banner.hidden { display: none; }
+.health-banner.starting { background: #1565c0; color: #fff; }
+.health-banner.degraded { background: #e65100; color: #fff; }
+.health-banner.error { background: #c62828; color: #fff; }
+.health-banner .close-btn {
+  float: right;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  opacity: 0.8;
+}
+.health-banner .close-btn:hover { opacity: 1; }

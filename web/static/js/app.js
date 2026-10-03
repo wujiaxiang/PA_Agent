@@ -250,6 +250,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   initSidebarResizer();  // 恢复侧边栏宽度（Phase A Task 1），需在 createChart 前完成以避免布局抖动
   const { chart: c, candleSeries: cs, emaSeries: es, emaSeriesMap: em } = createChart($('#chart-main'));
   chart = c; candleSeries = cs; emaSeries = es; emaSeriesMap = em;
+  // 移除 LightweightCharts 设置的固定 width，让 flex:1 布局接管容器宽度
+  // 这样 sidebar 折叠/展开时 chart-main 能正确自适应
+  const chartMainEl = $('#chart-main');
+  if (chartMainEl) {
+    chartMainEl.style.removeProperty('width');
+    chartMainEl.style.width = '100%';
+  }
 
   // 🔑 关键：先注册 UI 事件 handler，再做数据加载
   // 原因：loadBars() 在异常时会重新抛出（throw e），如果 bindEvents 在 await 之后调用，
@@ -280,6 +287,36 @@ document.addEventListener('DOMContentLoaded', async () => {
   if ((cbWait && cbWait.checked) || (cbKeep && cbKeep.checked)) {
     startWaitingCountdownDisplay();
   }
+
+  // ── 健康状态指示 ──────────────────────────────────────────────────
+  (function initHealthBanner() {
+    const banner = $('#health-banner');
+    if (!banner) return;
+    let closed = false;
+
+    function updateHealth() {
+      if (closed) return;
+      API.get('/api/health').then(data => {
+        const status = data?.status || 'ok';
+        if (status === 'ok') {
+          banner.classList.add('hidden');
+          banner.className = 'health-banner hidden';
+        } else {
+          banner.className = 'health-banner ' + status;
+          const messages = {
+            starting: '系统启动中，请稍候…',
+            degraded: '部分服务异常，功能可能受限',
+            error: '服务异常，请检查后端状态',
+          };
+          banner.innerHTML = (messages[status] || '状态未知') +
+            ' <button class="close-btn" onclick="this.parentElement.classList.add(\'hidden\')">&times;</button>';
+        }
+      }).catch(() => {}); // 静默忽略网络错误
+    }
+
+    updateHealth();
+    setInterval(updateHealth, 60000); // 每 60 秒轮询
+  })();
 });
 
 window.addEventListener('resize', resizeChart);
@@ -375,6 +412,7 @@ async function loadSettings() {
     $('#s-api-key').value = s.provider?.api_key || '';
     $('#s-reasoning-effort').value = s.provider?.reasoning_effort || 'high';
     $('#s-thinking').checked = s.provider?.thinking !== false;
+    $('#s-max-output-tokens').value = s.provider?.max_output_tokens || 0;
     $('#s-refresh-ms').value = s.general?.refresh_interval_ms || 1000;
     $('#s-decision-stance').value = s.general?.decision_stance || 'balanced';
     $('#s-ctx-warn').value = s.general?.context_warning_threshold_pct || 80;
@@ -603,6 +641,54 @@ function bindEvents() {
       $('#tab-stream').classList.add('active');
     });
   }
+  // Demo 按钮：加载 Demo 数据体验 UI
+  const btnDemo = $('#btn-demo');
+  if (btnDemo) {
+    btnDemo.addEventListener('click', async () => {
+      try {
+        btnDemo.disabled = true;
+        btnDemo.textContent = '加载中...';
+        const data = await API.get('/api/demo/sample');
+        // 设置 lastRecord 并渲染各 tab
+        lastRecord = data;
+        renderDecision(data);
+        renderFuturePanel(data);
+        renderDecisionTree(data);
+        renderRaw(data);
+        renderDebug(data);
+        renderTokenUsage(data.usage_total);
+        updateTokenProgress(data.usage_total);
+        renderTreeViz(data);
+        // 更新 K 线图表
+        if (data.kline_data && data.kline_data.length) {
+          const bars = data.kline_data.map(bar => ({
+            time: bar.ts_open / 1000,
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+          }));
+          setBars(candleSeries, bars);
+          chart.timeScale().fitContent();
+        }
+        // 更新决策叠加层
+        const overlay = data.decision_overlay || data.stage2_decision || {};
+        setDecisionOverlays(candleSeries, overlay);
+        setDirectionMarker(candleSeries, overlay);
+        // 切换到决策 tab
+        $$('.sidebar-tabs .tab').forEach(b => b.classList.remove('active'));
+        document.querySelector('.sidebar-tabs .tab[data-tab="decision"]')?.classList.add('active');
+        $$('.tab-panel').forEach(p => p.classList.remove('active'));
+        $('#tab-decision').classList.add('active');
+      } catch (err) {
+        console.error('Demo 加载失败:', err);
+        alert('Demo 数据加载失败: ' + err.message);
+      } finally {
+        btnDemo.disabled = false;
+        btnDemo.textContent = 'Demo';
+      }
+    });
+  }
   // 点击 popover 外部关闭它
   document.addEventListener('click', (e) => {
     const pop = $('#history-popover');
@@ -745,6 +831,7 @@ function bindEvents() {
 
   // Chat（追问嵌入实时 tab，Phase C Task 3）
   $('#btn-chat-send').addEventListener('click', sendChat);
+  $('#btn-chat-resend').addEventListener('click', resendLastChat);
   $('#chat-input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') sendChat();
   });
@@ -897,6 +984,7 @@ async function saveSettingsHandler() {
         api_key: $('#s-api-key').value,
         reasoning_effort: $('#s-reasoning-effort').value,
         thinking: $('#s-thinking').checked,
+        max_output_tokens: parseInt($('#s-max-output-tokens').value) || 0,
         // Phase I Task 19: context_window 在 AIProviderSettings
         context_window: parseInt($('#s-context-window').value) || 2000000,
       },
@@ -1543,9 +1631,16 @@ function startSSEBarsStream() {
         updateSSEStatusWithExpiry();
         // 持续分析：K 线收盘后自动触发新一轮分析（分析期间不重复触发）
         // 哨兵去重：仅当新收盘 bar 的 ts_open 与上次处理的不同时才触发
+        // 注意：sorted 按 ts_open 升序，sorted[-1] = forming bar，sorted[-2] = 刚收盘 bar
         const cbKeep = $('#cb-keep-analysis');
+        // 防御性重置：如果分析流已结束但 isAnalyzing 未被正确重置（边界情况），修正它
+        if (isAnalyzing && currentAnalysisStream === null) {
+          isAnalyzing = false;
+        }
         if (cbKeep && cbKeep.checked && !isAnalyzing) {
-          const newClosedTs = sorted.length ? sorted[sorted.length - 1].ts_open : 0;
+          // 使用刚收盘 bar 的 ts_open（sorted[-2]）作为哨兵，而非 forming bar
+          const closedBarIdx = sorted.length >= 2 ? sorted.length - 2 : sorted.length - 1;
+          const newClosedTs = closedBarIdx >= 0 ? sorted[closedBarIdx].ts_open : 0;
           if (newClosedTs && newClosedTs !== keepAnalysisLastClosedTs) {
             keepAnalysisLastClosedTs = newClosedTs;
             // 自动增量：有增量基础记录时用增量分析，否则完整分析
@@ -1871,7 +1966,8 @@ function updateSSEStatusWithExpiry() {
           // 更新持续分析去重哨兵（与 SSE bar_close handler 使用相同公式）
           if (lastBars && lastBars.length) {
             const sorted = [...lastBars].sort((a, b) => a.ts_open - b.ts_open);
-            const newClosedTs = sorted.length ? sorted[sorted.length - 1].ts_open : 0;
+            const closedBarIdx = sorted.length >= 2 ? sorted.length - 2 : sorted.length - 1;
+            const newClosedTs = closedBarIdx >= 0 ? sorted[closedBarIdx].ts_open : 0;
             if (newClosedTs) keepAnalysisLastClosedTs = newClosedTs;
           }
         })
@@ -2038,6 +2134,14 @@ function setSidebarCollapsed(collapsed) {
       btnToggle.classList.remove('is-collapsed');
     }
   }
+
+  // 🔑 关键：强制重置 chart-main 的 inline width，让 flex 布局重新计算
+  // LightweightCharts 内部会设置固定 inline width，阻止 flex:1 自动扩展
+  const chartMainEl = document.getElementById('chart-main');
+  if (chartMainEl) {
+    chartMainEl.style.width = '100%';
+  }
+
   // CSS transition 时长 50ms（极短，避免 TRAE webview 的 rAF throttle 问题）；
   // rAF 循环跑 150ms 兜底，确保 chart 跟上最终宽度。
   // 另外在每次 resizeChart 前强制 reflow（读 offsetWidth 触发布局同步），
@@ -2397,7 +2501,8 @@ async function startWaitCloseCountdown() {
             // 处理器使用相同的 sorted[last].ts_open 计算），防止 SSE 重复触发分析
             if (lastBars && lastBars.length) {
               const sorted = [...lastBars].sort((a, b) => a.ts_open - b.ts_open);
-              const newClosedTs = sorted.length ? sorted[sorted.length - 1].ts_open : 0;
+              const closedBarIdx = sorted.length >= 2 ? sorted.length - 2 : sorted.length - 1;
+              const newClosedTs = closedBarIdx >= 0 ? sorted[closedBarIdx].ts_open : 0;
               if (newClosedTs) {
                 keepAnalysisLastClosedTs = newClosedTs;
               }
@@ -4156,6 +4261,9 @@ async function sendChat() {
   input.value = '';
   appendChatMsg('user', text);
   appendChatMsg('assistant', '');
+  // 显示重发按钮
+  const resendBtn = $('#btn-chat-resend');
+  if (resendBtn) resendBtn.style.display = '';
 
   sendBtn.textContent = '停止';
   sendBtn.classList.add('btn-danger');
@@ -4164,46 +4272,37 @@ async function sendChat() {
   chatReasoningText = '';
   chatContentText = '';
 
-  const recordId = lastRecord ? `${lastRecord.symbol}_${lastRecord.timeframe}_${Date.now()}` : `chat_${Date.now()}`;
+  // 使用 lastRecord 的 timestamp_local_iso 作为 record_id（与 FreeChatSession 期望格式一致）
+  const recordId = lastRecord && lastRecord.timestamp_local_iso
+    ? `${lastRecord.symbol}_${lastRecord.timeframe}_${lastRecord.timestamp_local_iso}`
+    : `chat_${Date.now()}`;
   const url = `/api/chat/stream?text=${encodeURIComponent(text)}&record_id=${encodeURIComponent(recordId)}&attach_kline_snapshot=true`;
 
   try {
-    const resp = await fetch(url, { signal: chatAbortController.signal });
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+    const { controller, source } = API.sse(url);
+    // 将 API.sse 的 AbortController 与本地的合并（用户点停止时能中断）
+    const origAbort = chatAbortController.abort.bind(chatAbortController);
+    chatAbortController.abort = () => { origAbort(); controller.abort(); };
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        try {
-          const evt = JSON.parse(line.slice(6));
-          if (evt.type === 'reasoning_token') {
-            chatReasoningText += evt.chunk || '';
-            stageCharCounts.chat.reasoning = chatReasoningText.length;
-            updateStreamStats();
-            const rEl = $('#chat-reasoning');
-            if (rEl) rEl.textContent = chatReasoningText;
-          } else if (evt.type === 'content_token') {
-            chatContentText += evt.chunk || '';
-            stageCharCounts.chat.content = chatContentText.length;
-            updateStreamStats();
-            const cEl = $('#chat-content');
-            if (cEl) cEl.textContent = chatContentText;
-          } else if (evt.type === 'done') {
-            break;
-          } else if (evt.type === 'error') {
-            const cEl = $('#chat-content');
-            if (cEl) cEl.textContent = `[错误] ${evt.message || '未知错误'}`;
-            break;
-          }
-        } catch (e) { /* ignore parse errors */ }
+    for await (const evt of source) {
+      if (evt.type === 'reasoning_token') {
+        chatReasoningText += evt.chunk || '';
+        stageCharCounts.chat.reasoning = chatReasoningText.length;
+        updateStreamStats();
+        const rEl = $('#chat-reasoning');
+        if (rEl) rEl.textContent = chatReasoningText;
+      } else if (evt.type === 'content_token') {
+        chatContentText += evt.chunk || '';
+        stageCharCounts.chat.content = chatContentText.length;
+        updateStreamStats();
+        const cEl = $('#chat-content');
+        if (cEl) cEl.textContent = chatContentText;
+      } else if (evt.type === 'done') {
+        break;
+      } else if (evt.type === 'error') {
+        const cEl = $('#chat-content');
+        if (cEl) cEl.textContent = `[错误] ${evt.message || '未知错误'}`;
+        break;
       }
     }
   } catch (err) {

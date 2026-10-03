@@ -26,6 +26,9 @@ class AppContext:
     exp_reader: Any = None        # ExperienceReader
     ledger: Any = None            # SessionTokenLedger
 
+    # Web route shared state
+    _last_record: Any = None      # Last completed AnalysisRecord (for chat followup)
+
     @classmethod
     def bootstrap(cls) -> "AppContext":
         """Wire all real components and return a fully initialised AppContext."""
