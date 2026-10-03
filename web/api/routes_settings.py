@@ -33,17 +33,42 @@ async def get_settings(request: Request):
     return JSONResponse(content=d, headers={"Cache-Control": "no-store"})
 
 
+def _is_masked_key(value) -> bool:
+    """True when *value* is a masked/placeholder API key rather than a real one.
+
+    ``GET /api/settings`` deliberately masks the provider key before returning it
+    (``abcd****wxyz``, or ``****`` for short keys). The settings form refills
+    itself from that response and posts the value straight back on save, so
+    without this guard a single "save settings" click overwrites the real key on
+    disk with the placeholder and every later model call fails with 401.
+    """
+    if not isinstance(value, str):
+        return False
+    v = value.strip()
+    if not v:
+        return True
+    if v == "****" or "****" in v:
+        return True
+    # Cheap structural guards: real keys are long and hex/base64-ish.
+    return len(v) < 16
+
+
 @router.put("/settings")
 async def put_settings(request: Request, body: dict):
     """Merge *body* into current settings and save to disk."""
     ctx = request.app.state.ctx
     current = ctx.settings
+    masked_key_dropped = False
     for section in ("provider", "prompt", "validation", "general", "feishu", "tushare", "pushplus", "tradingview"):
         if section in body and isinstance(body[section], dict):
             target = getattr(current, section, None)
             if target is not None:
                 for k, v in body[section].items():
                     if hasattr(target, k):
+                        # Never let a masked placeholder overwrite the stored key.
+                        if section == "provider" and k == "api_key" and _is_masked_key(v):
+                            masked_key_dropped = True
+                            continue
                         setattr(target, k, v)
     save_settings(current, SETTINGS_JSON_PATH)
 
@@ -54,7 +79,7 @@ async def put_settings(request: Request, body: dict):
     from pa_agent.ai.client_factory import create_ai_client
     ctx.client = create_ai_client(current.provider, logger_=ctx.logger)
 
-    return {"status": "saved"}
+    return {"status": "saved", "api_key_masked_ignored": masked_key_dropped}
 
 
 _FEISHU_ERR_HINT = {
