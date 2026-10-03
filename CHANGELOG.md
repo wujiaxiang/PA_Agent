@@ -19,6 +19,21 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 5. 追问链路优化 + 记录缓存/健康探测/demo 契约修复
+
+- **问题**：追问（`/api/chat/stream`）跨品种串味、并发追问损坏会话；增量分析的记录缓存永久失效；失败记录读不出来；未鉴权健康端点驱动无上限 LLM 调用；demo 模式渲染错位
+- **根因与修复**：
+  1. **追问跨品种串味**：`ctx._last_record` 跨品种切换仍存活，切换后追问静默锚定到上一个品种的分析。新增 `_record_matches_subscription()`，不匹配时按当前 `(symbol, timeframe, exchange)` 从历史取最新记录；比较仅在两侧均为非空字符串时生效
+  2. **追问会话串味**：`session_key` 缺省时所有会话共用 `'latest'`。改为 `record_id|品种|周期|K线快照开关`，不同品种对话互不污染，且 `attach_kline_snapshot` 复用时真正生效（此前被静默忽略）
+  3. **并发损坏**：`FreeChatSession.send()` 会改 `_turn` 与 `_history_full` 且内部无锁，两个并发追问会交错历史、重复轮次号 → per-session 锁串行化
+  4. **内存记录被覆盖**：任何一次磁盘回退都会无条件写回 `ctx._last_record`，覆盖刚分析出的记录。改为仅在确实取到更新记录时提升
+  5. **记录缓存永久失效**：`find_latest_successful_record` 缓存键取**根目录** mtime，但记录写在嵌套 `{exchange}/{symbol}/{timeframe}/` 分区，嵌套写入不改根目录 mtime（已实测），且 `None` 也会被缓存 → 增量分析一直复用旧记录。新增 `_scan_signature()`，签名包含实际扫描的分区目录
+  6. **失败记录不可见**：`load_record` 未 `pop("_partial_reason")`，schema 为 `extra="forbid"` → 每条 `save_partial` 记录都读不出来（`routes_records` 侧已有 pop）
+  7. **健康探测成本可滥用**：`/api/health/check` 未鉴权却驱动一次**不限 token、默认 600s 超时**的真实 LLM 调用。`chat()` 新增 `max_tokens` 覆盖，探测改为 `max_tokens=1` + `timeout_s=10`
+  8. **demo 契约错位**：payload 与前端渲染器有 6 处不匹配（决策区恒显「不下单」、概率芯片全 0%、`terminal` 渲染为空串）。改为构造真实 `AnalysisRecord` 并复用 `_serialize_record()`，从结构上杜绝漂移
+- **文件**：`web/api/routes_chat.py`、`web/api/routes_demo.py`、`pa_agent/records/analysis_history.py`、`pa_agent/util/startup_health_check.py`、`pa_agent/ai/deepseek_client.py`
+- **验证**：新增 `tests/unit/test_followup_and_audit_fixes.py`(12)。线上实测两轮连续追问均正常返回 reasoning + content + done；全量 `tests/unit` 对基线：新增失败 0，修复 2
+
 ### 3. 逐功能审计修复：交易静默否决 / 凭据泄露 / 上下文溢出
 
 - **问题**：对推理链、`web/` 后端、`data`+`records`+`notify` 三路逐功能审计后发现 4 个 High 级缺陷，其中一个会**静默吃掉真实交易**
