@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, List
 
 from pa_agent.config.paths import LOG_FILE_PATH
-from pa_agent.util.mask_secret import mask_secret
+from pa_agent.util.mask_secret import mask_secret, register_secret, register_secrets, scrub
 
 # ── Module-level state ────────────────────────────────────────────────────────
 
@@ -54,7 +54,13 @@ def get_trace_id() -> str:
 
 
 class MaskingFormatter(logging.Formatter):
-    """Logging formatter that replaces the plaintext API key with its masked form."""
+    """Logging formatter that redacts every registered secret from the message.
+
+    Masks both the provider API key (passed at construction / via
+    :meth:`set_api_key`) and anything registered with
+    :func:`pa_agent.util.mask_secret.register_secret` — notably the Feishu
+    webhook token, which ``requests`` embeds in ``ConnectionError`` strings.
+    """
 
     def __init__(self, fmt: str, api_key: str = "") -> None:
         super().__init__(fmt)
@@ -64,7 +70,7 @@ class MaskingFormatter(logging.Formatter):
         message = super().format(record)
         if self._api_key:
             message = message.replace(self._api_key, mask_secret(self._api_key))
-        return message
+        return scrub(message)
 
     def set_api_key(self, new_key: str) -> None:
         self._api_key = new_key
@@ -106,14 +112,16 @@ class JsonlFormatter(logging.Formatter):
                     payload[k] = v
                 except (TypeError, ValueError):
                     payload[k] = repr(v)
-        # Exception info
+        # Exception info — the traceback text can embed request URLs that carry
+        # credentials (e.g. a Feishu webhook token), so scrub it too.
         if record.exc_info:
-            payload["exc"] = self.formatException(record.exc_info)
+            payload["exc"] = scrub(self.formatException(record.exc_info))
         # Mask api_key in message
         if self._api_key and self._api_key in payload["msg"]:
             payload["msg"] = payload["msg"].replace(
                 self._api_key, mask_secret(self._api_key)
             )
+        payload["msg"] = scrub(payload["msg"])
         return json.dumps(payload, ensure_ascii=False)
 
     def set_api_key(self, new_key: str) -> None:
@@ -254,6 +262,49 @@ def _silence_noisy_libraries() -> None:
 
 
 def update_api_key(new_key: str) -> None:
-    """Update the masking key in all active MaskingFormatter instances."""
+    """Update the masking key in all active MaskingFormatter instances.
+
+    Also (re)registers *new_key* in the process-wide secret registry so any other
+    credential registered later (webhook, tokens) survives alongside it.
+    """
+    register_secret(new_key)
     for formatter in _active_formatters:
         formatter.set_api_key(new_key)
+
+
+def register_settings_secrets(settings: object) -> None:
+    """Register every credential reachable from *settings* with the scrubber.
+
+    Call after ``load_settings`` and after every settings save so a rotated key
+    never lingers unmasked. Covers: provider API key, Feishu webhook/secret/
+    app_secret, PushPlus token, Tushare token and TradingView session/password.
+    """
+    if settings is None:
+        return
+
+    provider = getattr(settings, "provider", None)
+    if provider is not None:
+        register_secret(getattr(provider, "api_key", ""))
+
+    feishu = getattr(settings, "feishu", None)
+    if feishu is not None:
+        register_secrets(
+            getattr(feishu, "webhook_url", ""),
+            getattr(feishu, "secret", ""),
+            getattr(feishu, "app_secret", ""),
+        )
+
+    pushplus = getattr(settings, "pushplus", None)
+    if pushplus is not None:
+        register_secret(getattr(pushplus, "token", ""))
+
+    tushare = getattr(settings, "tushare", None)
+    if tushare is not None:
+        register_secret(getattr(tushare, "token", ""))
+
+    tradingview = getattr(settings, "tradingview", None)
+    if tradingview is not None:
+        register_secrets(
+            getattr(tradingview, "session_id", ""),
+            getattr(tradingview, "password", ""),
+        )

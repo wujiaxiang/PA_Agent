@@ -30,6 +30,8 @@ import hmac
 import logging
 import time
 import threading
+
+from pa_agent.util.mask_secret import register_secret, scrub
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -45,6 +47,19 @@ _IMAGE_UPLOAD_URL = "https://open.feishu.cn/open-apis/im/v1/images"
 # tenant_access_token 有效期 2 小时；提前 5 分钟刷新
 _TOKEN_TTL_BUFFER_S = 300
 _REQUEST_TIMEOUT_S = 12
+
+
+def _webhook_token(webhook_url: str) -> str:
+    """Extract the secret token embedded in a Feishu bot webhook URL.
+
+    Feishu webhooks embed the credential in the path:
+    ``https://open.feishu.cn/open-apis/bot/v2/hook/<TOKEN>``. Registering just the
+    token (not the whole URL) means a partially-redacted URL in a log line can
+    never expose it.
+    """
+    if not webhook_url:
+        return ""
+    return webhook_url.rstrip("/").rsplit("/", 1)[-1]
 
 
 # ── Token 缓存（进程内单例，线程安全）────────────────────────────────────────────
@@ -403,5 +418,10 @@ def send_order_signal(
             )
             return False
     except Exception as exc:
-        logger.warning("飞书通知 HTTP 请求失败: %s", exc)
+        # requests 会把完整 URL（含 /bot/v2/hook/<TOKEN>）塞进 ConnectionError
+        # 等异常串里，直接记日志会把 webhook token 明文写进 logs/pa_agent.log。
+        # 先登记再脱敏，然后才落日志。
+        register_secret(webhook_url)
+        register_secret(_webhook_token(webhook_url))
+        logger.warning("飞书通知 HTTP 请求失败: %s", scrub(str(exc)))
         return False

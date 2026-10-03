@@ -408,6 +408,22 @@ def validate_order_trade_metrics(
     if order_type not in ("限价单", "突破单", "市价单"):
         return []
 
+    # Snapshot the model's *intended* geometry before the RR cap mutates the stop.
+    #
+    # Why this matters: MAX_TP1_RISK_REWARD_RATIO widens the stop until TP1 RR
+    # equals the cap (1.0), which forces reward == risk. The trader equation
+    # `p*reward > (1-p)*risk` then collapses to `p > 0.5`, so *every* order whose
+    # RR exceeded the cap was guaranteed to be rejected at any win rate <= 50% —
+    # a genuinely good 9:1 plan at 50% confidence was killed. Widening a
+    # too-tight stop is the intended behaviour; the equation must instead judge
+    # the trade the model actually sized its win-rate estimate for.
+    intended = compute_risk_reward(
+        decision.get("entry_price"),
+        decision.get("take_profit_price"),
+        decision.get("stop_loss_price"),
+        decision.get("order_direction"),
+    )
+
     if apply_rr_cap_adjustment:
         adjust_decision_stop_for_tp1_rr_cap(decision, kline_frame=kline_frame)
 
@@ -448,13 +464,19 @@ def validate_order_trade_metrics(
         errors.append(
             "decision.estimated_win_rate: required integer 0–100 when placing an order"
         )
-    elif not passes_trader_equation(win_rate, risk, reward):
-        ev = win_rate / 100.0 * reward - (1.0 - win_rate / 100.0) * risk
-        errors.append(
-            f"decision prices: trader equation fails at {win_rate:.0f}% win rate "
-            f"(risk={risk:.4g}, reward={reward:.4g}, expectancy≈{ev:.4g}); "
-            "10.3 must be 否 and order_type=不下单 unless prices are fixed"
-        )
+    else:
+        # Judge the equation on the intended geometry (pre-cap-widening) when
+        # available, so the cap cannot manufacture a rejection. Fall back to the
+        # post-adjustment numbers if the original geometry was unusable.
+        eq_risk = float(intended["risk"]) if intended else risk
+        eq_reward = float(intended["reward"]) if intended else reward
+        if not passes_trader_equation(win_rate, eq_risk, eq_reward):
+            ev = win_rate / 100.0 * eq_reward - (1.0 - win_rate / 100.0) * eq_risk
+            errors.append(
+                f"decision prices: trader equation fails at {win_rate:.0f}% win rate "
+                f"(risk={eq_risk:.4g}, reward={eq_reward:.4g}, expectancy≈{ev:.4g}); "
+                "10.3 must be 否 and order_type=不下单 unless prices are fixed"
+            )
 
     if kline_frame is not None:
         errors.extend(

@@ -148,17 +148,74 @@ def supports_kv_prefix_chain(settings: AIProviderSettings | None) -> bool:
 
 
 def _extract_cached_prompt_tokens(usage: Any) -> int:
-    """Read KV-cache hit count from provider usage (DeepSeek or OpenAI-compat)."""
+    """Read KV-cache hit count from provider usage across OpenAI-compatible shapes.
+
+    Different gateways name this differently, and missing a spelling silently
+    reports a 0% hit rate — which makes prompt-cache optimisations look useless
+    when they are actually working. Recognised, in order:
+
+    * DeepSeek native:  ``usage.prompt_cache_hit_tokens``
+    * OpenAI:           ``usage.prompt_tokens_details.cached_tokens``
+    * Anthropic-style: ``usage.cache_read_input_tokens``
+    * Some proxies:    raw ``cached_tokens`` / ``cache_read_tokens`` at the top
+      level, or nested under ``usage.model_extra`` (openai-python puts unknown
+      response fields there).
+    """
     if usage is None:
         return 0
-    hit = getattr(usage, "prompt_cache_hit_tokens", None)
+
+    def _pick(obj: Any, *names: str) -> int | None:
+        for name in names:
+            value = getattr(obj, name, None)
+            if value is None and isinstance(obj, dict):
+                value = obj.get(name)
+            if value is not None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _container(obj: Any, name: str) -> Any:
+        """Fetch a nested container whether *obj* is a model or a plain dict."""
+        value = getattr(obj, name, None)
+        if value is None and isinstance(obj, dict):
+            value = obj.get(name)
+        return value
+
+    # Nested containers first (DeepSeek / OpenAI).
+    for container_name in ("prompt_tokens_details", "model_extra"):
+        container = _container(usage, container_name)
+        if container is not None:
+            hit = _pick(container, "cached_tokens", "prompt_cache_hit_tokens", "cache_read_input_tokens")
+            if hit:
+                return hit
+
+    hit = _pick(
+        usage,
+        "prompt_cache_hit_tokens",
+        "cached_tokens",
+        "cache_read_input_tokens",
+        "cache_read_tokens",
+        "prompt_cache_miss_tokens_ignored",
+    )
     if hit is not None:
-        return int(hit or 0)
-    details = getattr(usage, "prompt_tokens_details", None)
-    if details is not None:
-        cached = getattr(details, "cached_tokens", 0)
-        if cached:
-            return int(cached)
+        return hit
+
+    # Some SDKs keep the whole body under .extra or as a mapping.
+    for extra_name in ("extra", "_raw_response", "model_extra"):
+        extra = _container(usage, extra_name)
+        if extra is None:
+            continue
+        if isinstance(extra, dict):
+            hit = _pick(extra, "cached_tokens", "prompt_cache_hit_tokens", "cache_read_input_tokens")
+            if hit:
+                return hit
+            details = extra.get("prompt_tokens_details")
+            if isinstance(details, dict):
+                hit = _pick(details, "cached_tokens")
+                if hit:
+                    return hit
     return 0
 
 

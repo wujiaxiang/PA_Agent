@@ -536,3 +536,77 @@ def test_planned_limit_allows_k1_wick_touch_entry() -> None:
         decision, _frame(), bar_analysis=bar_analysis
     )
     assert not errors, errors
+
+
+# ── RR cap must not manufacture a rejection ──────────────────────────────────
+#
+# Regression: MAX_TP1_RISK_REWARD_RATIO widens the stop until TP1 RR == cap (1.0),
+# which forces reward == risk. The trader equation then collapses to `p > 0.5`, so
+# every order whose RR exceeded the cap was killed at any win rate <= 50%. A real
+# BTCUSDT 15m plan (entry 84835.6 / SL 84826.6 / TP1 84917.9, RR 9.14, 50% win
+# rate, expectancy +36.6) was silently converted to 不单.
+
+
+def test_rr_cap_does_not_reject_good_plan_at_50pct_win_rate():
+    decision = {
+        "order_type": "限价单",
+        "order_direction": "做多",
+        "entry_price": 84835.6,
+        "stop_loss_price": 84826.599999,
+        "take_profit_price": 84917.9,
+        "take_profit_price_2": 84972.0,
+        "estimated_win_rate": 50,
+    }
+    errors = validate_order_trade_metrics(dict(decision), decision_stance="balanced")
+    assert not errors, errors
+
+
+def test_rr_cap_still_widens_the_stop():
+    """The cap itself is intended behaviour and must stay."""
+    decision = {
+        "order_type": "限价单",
+        "order_direction": "做多",
+        "entry_price": 84835.6,
+        "stop_loss_price": 84826.599999,
+        "take_profit_price": 84917.9,
+        "take_profit_price_2": 84972.0,
+        "estimated_win_rate": 50,
+    }
+    validate_order_trade_metrics(decision, decision_stance="balanced")
+    # long trade: widening the stop moves it further away, i.e. lower
+    assert decision["stop_loss_price"] < 84826.599999, "stop should be widened"
+    rr = compute_risk_reward(
+        decision["entry_price"],
+        decision["take_profit_price"],
+        decision["stop_loss_price"],
+        decision["order_direction"],
+    )
+    assert rr["ratio"] <= 1.0 + 1e-9
+
+
+def test_truly_bad_plan_is_still_rejected():
+    """The fix must not weaken genuine rejection of hopeless plans."""
+    decision = {
+        "order_type": "限价单",
+        "order_direction": "做多",
+        "entry_price": 100.0,
+        "stop_loss_price": 99.0,
+        "take_profit_price": 100.5,
+        "estimated_win_rate": 10,
+    }
+    assert validate_order_trade_metrics(dict(decision), decision_stance="balanced")
+
+
+def test_low_win_rate_with_poor_rr_still_fails_equation():
+    """A capped plan whose *intended* geometry also fails must be rejected."""
+    decision = {
+        "order_type": "限价单",
+        "order_direction": "做多",
+        "entry_price": 100.0,
+        "stop_loss_price": 95.0,
+        "take_profit_price": 105.0,
+        "estimated_win_rate": 20,
+    }
+    # intended RR = 1.0, 20% win rate -> 0.2*5 <= 0.8*5, equation fails
+    errors = validate_order_trade_metrics(dict(decision), decision_stance="balanced")
+    assert any("trader equation fails" in e for e in errors), errors

@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 
 from pa_agent.config.paths import SETTINGS_JSON_PATH
 from pa_agent.config.settings import load_settings, save_settings
+from pa_agent.util.logging import register_settings_secrets
 
 router = APIRouter(tags=["settings"])
 
@@ -23,6 +24,9 @@ async def get_settings(request: Request):
     ctx = request.app.state.ctx
     settings = load_settings(SETTINGS_JSON_PATH)
     ctx.settings = settings  # sync live reference
+    # 每次载入都刷新脱敏注册表：换密钥后旧值失效、新值生效，
+    # 否则新密钥会以明文写进 records/pending/*.json。
+    register_settings_secrets(settings)
     d = settings.model_dump()
     pk = d.get("provider", {})
     if pk.get("api_key"):
@@ -72,8 +76,11 @@ async def put_settings(request: Request, body: dict):
                         setattr(target, k, v)
     save_settings(current, SETTINGS_JSON_PATH)
 
-    from pa_agent.util.logging import update_api_key
+    from pa_agent.util.logging import register_settings_secrets, update_api_key
     update_api_key(current.provider.api_key)
+    # 注册全部凭据（飞书 webhook/secret/app_secret、PushPlus/Tushare token、
+    # TradingView 凭证）到脱敏注册表，避免它们经由 requests 异常串进日志。
+    register_settings_secrets(current)
 
     # Rebuild AI client if provider changed
     from pa_agent.ai.client_factory import create_ai_client

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from pa_agent.records.schema import AnalysisRecord, FollowupTurn
-from pa_agent.util.mask_secret import mask_secret
+from pa_agent.util.mask_secret import mask_secret, register_secret, scrub
 
 # Characters that are illegal in Windows/Linux path segments.
 _ILLEGAL_PATH_CHARS = ('/', '\\', ':', '*', '?', '"', '<', '>', '|')
@@ -89,6 +89,10 @@ class PendingWriter:
         self._event_bus = event_bus
         self._logger = logger or _default_logger()
         self._api_key = api_key
+        # 密钥可能在运行期被用户改过（PUT /api/settings 会调 update_api_key →
+        # register_secret）。落盘脱敏时一并兜底所有已注册密钥，避免旧 key
+        # 失效后新 key 以明文写进 records/pending/*.json。
+        register_secret(api_key)
 
         try:
             self._pending_dir.mkdir(parents=True, exist_ok=True)
@@ -180,19 +184,21 @@ class PendingWriter:
 
     @staticmethod
     def _sanitize(data: dict, api_key: str) -> dict:
-        """Recursively replace any occurrence of *api_key* in string values.
+        """Recursively redact secrets in string values at any depth.
 
-        If *api_key* is empty, returns *data* unchanged.
+        Covers *api_key* explicitly plus every secret in the process-wide
+        registry (``pa_agent.util.mask_secret``), so a rotated key — which
+        replaces ``self._api_key`` on disk but not in this instance — still gets
+        masked instead of being written in plaintext.
         Handles nested dicts, lists, and plain string values at any depth.
         """
-        if not api_key:
-            return data
-
-        masked = mask_secret(api_key)
+        masked = mask_secret(api_key) if api_key else None
 
         def _walk(node):
             if isinstance(node, str):
-                return node.replace(api_key, masked)
+                if masked is not None:
+                    node = node.replace(api_key, masked)
+                return scrub(node)
             if isinstance(node, dict):
                 return {k: _walk(v) for k, v in node.items()}
             if isinstance(node, list):

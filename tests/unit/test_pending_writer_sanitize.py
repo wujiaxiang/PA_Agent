@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from pa_agent.records.pending_writer import PendingWriter
-from pa_agent.util.mask_secret import mask_secret
+from pa_agent.util.mask_secret import mask_secret, register_secret
 
 
 # ---------------------------------------------------------------------------
@@ -126,13 +126,20 @@ class TestSaveFullSanitizes:
         assert api_key not in content
         assert mask_secret(api_key) in content
 
-    def test_no_api_key_writes_plaintext(self, tmp_path):
+    def test_no_api_key_still_scrubs_registered_secret(self, tmp_path):
+        """A registered secret must never be written in plaintext.
+
+        The writer only holds the key it was constructed with, but secrets are
+        tracked process-wide (pa_agent.util.mask_secret), so a key rotated after
+        construction is still scrubbed on the way out.
+        """
         api_key = "sk-supersecret"
+        register_secret(api_key)
         record = _make_record(api_key)
-        writer = PendingWriter(pending_dir=tmp_path)  # no api_key
+        writer = PendingWriter(pending_dir=tmp_path)  # no api_key passed
         path = writer.save_full(record)
         content = path.read_text(encoding="utf-8")
-        assert api_key in content
+        assert api_key not in content
 
 
 class TestSavePartialSanitizes:

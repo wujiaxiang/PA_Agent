@@ -447,6 +447,19 @@ class TwoStageOrchestrator:
         else:
             messages_s1 = self._assembler.build_stage1(frame, analysis_mode=analysis_mode)
 
+        # ── Step 4.5: Context-window pre-flight ───────────────────────────────
+        # analysis_bar_count is allowed up to 5000, but the rendered prompt grows
+        # ~283 chars/bar across the OHLCV + geometry tables (on top of ~78k chars
+        # of static strategy text). Around ~2500 bars a 1M-context model
+        # overflows and the provider returns a hard 400 mid-run — after the user
+        # has already waited through the analysis. Fail fast instead.
+        overflow = self._check_context_budget(messages_s1)
+        if overflow is not None:
+            record = record.model_copy(update={"exception": overflow})
+            self._pending_writer.save_partial(record, "context_overflow")
+            on_event(OrchestratorEvent.InsufficientData)
+            return record
+
         # ── Step 5: Call AI for Stage 1 ───────────────────────────────────────
         logger.debug("\n" + "="*80)
         logger.debug("【Stage 1 发送的完整 Prompt】")
@@ -1012,6 +1025,57 @@ class TwoStageOrchestrator:
         return record
 
     # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _check_context_budget(self, messages: list[dict]) -> dict | None:
+        """Return an exception payload when *messages* cannot fit the context window.
+
+        Returns ``None`` when the prompt fits. Uses the same tiktoken estimator
+        that already exists in :mod:`pa_agent.ai.token_counter` (previously
+        orphaned) and reserves headroom for the completion, because the rendered
+        prompt plus max_tokens must stay under ``context_window``.
+        """
+        if self._settings is None:
+            return None
+        provider = getattr(self._settings, "provider", None)
+        window = int(getattr(provider, "context_window", 0) or 0)
+        if window <= 0:
+            return None
+
+        try:
+            from pa_agent.ai.token_counter import estimate_tokens
+
+            prompt_tokens = estimate_tokens(messages)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("context pre-flight skipped: %s", exc)
+            return None
+
+        completion = int(getattr(provider, "max_output_tokens", 0) or 0)
+        if completion <= 0:
+            try:
+                from pa_agent.ai.deepseek_client import _provider_max_output_tokens
+
+                completion = int(_provider_max_output_tokens(provider))
+            except Exception:  # noqa: BLE001
+                completion = 0
+        # Leave room for provider-side additions even when max_tokens is unset.
+        budget = max(1, window - max(completion, window // 10))
+
+        if prompt_tokens <= budget:
+            return None
+
+        return {
+            "type": "context_overflow",
+            "stage": "preflight",
+            "failed_check": "context_window",
+            "message": (
+                f"分析提示词约 {prompt_tokens:,} tokens，超出模型上下文预算 "
+                f"{budget:,}（context_window={window:,}）。"
+                "请调低设置里的「K线根数」（analysis_bar_count），或改用上下文更大的模型。"
+            ),
+            "prompt_tokens": prompt_tokens,
+            "context_window": window,
+            "budget_tokens": budget,
+        }
 
     def _thinking_params(self) -> tuple[bool, str]:
         """Return (thinking, reasoning_effort) from settings defaults."""
