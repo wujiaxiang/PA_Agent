@@ -19,6 +19,26 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 6. 设置接口凭据跨域暴露修复 + Docker 重新部署
+
+- **问题**：`GET /api/settings` 只脱敏 `provider.api_key`，其余通知凭据明文返回；配合 `allow_origins=["*"]` 且全站无鉴权，运营者访问的任意网页即可跨域读取并可驱动写接口
+- **根因**：
+  1. 脱敏范围仅覆盖 `provider.api_key`，飞书 `secret`/`app_secret`/`webhook_url`、PushPlus token、Tushare token、TradingView 密码/session 均明文返回（且注释明确写着「保持明文以适配表单回填」）
+  2. `CORSMiddleware allow_origins=["*"]`，而 WebUI 与 API 本就同源，CORS 完全不需要
+- **修复**：
+  - 新增 `_SECRET_FIELDS` 覆盖 8 个凭据字段，GET 统一输出 `abcd****wxyz`；非凭据字段（`app_id`/`enabled`/`username`）不受影响
+  - PUT 的占位值保护从「仅 api_key」推广到全部 `_SECRET_FIELDS`，表单回填仍可安全保存；判定同时收紧为「含 `****` 才算占位」——此前 `<16` 字符即视为占位的启发式会让用户保存其它设置时**静默丢掉较短的飞书/Tushare 凭据**
+  - `provider.api_key` 空提交按「保持原值」处理，其余字段空提交视为主动清空
+  - CORS 默认不启用；确需分离前端时用 `PA_AGENT_CORS_ORIGINS` 显式列出并记录告警
+  - 前端为脱敏字段加虚线边框与「已配置」提示，避免用户误把占位值当真实值重输
+- **Docker 重建与部署**：
+  - 修复镜像烘焙凭据（`COPY config/` → 只拷 `*.example.json`），`.dockerignore` 追加凭据与备份排除
+  - 补 `matplotlib`（此前交易图 PNG 永远静默跳过）、显式声明 `requests`、补 `fonts-noto-cjk`（否则图表中文全是豆腐块）
+  - 镜像内创建 `trade_records/`，compose 增加 `trade_records`/`experience` 挂载与 healthcheck（原先交易记录随容器重建丢失）
+  - 该 LXC 主机无法在 buildkit RUN 阶段加载 apparmor profile，按 `docker-compose.yml` 既有说明改用 `docker run --security-opt apparmor=unconfined` + `docker commit` 构建
+- **文件**：`web/api/routes_settings.py`、`web/server.py`、`web/static/{js/app.js,css/style.css,index.html}`、`web/Dockerfile`、`web/docker-compose.yml`、`.dockerignore`、`pyproject.toml`、`uv.lock`
+- **验证**：新增/更新 21 例凭据脱敏与往返测试。部署后容器运行于 `0.0.0.0:8005`，镜像内确认无 PyQt6、20 条路由注册、CORS 默认关闭、无 `settings.json` 进镜像层；端到端跑通 subscribe → 201 根 K 线 → 完整两阶段分析（160,416 tokens，无异常），记录以「时间戳_毫秒_uuid」写入宿主机挂载目录且无 `.tmp` 残留；跨域请求不再返回 `Access-Control-Allow-Origin`
+
 ### 5. 追问链路优化 + 记录缓存/健康探测/demo 契约修复
 
 - **问题**：追问（`/api/chat/stream`）跨品种串味、并发追问损坏会话；增量分析的记录缓存永久失效；失败记录读不出来；未鉴权健康端点驱动无上限 LLM 调用；demo 模式渲染错位
