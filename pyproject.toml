@@ -38,6 +38,11 @@ web = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
     "sse-starlette>=2.0",
+    # 交易记录落盘时会渲染 K 线图 PNG（trade_logger._render_chart）并随飞书卡片
+    # 上传；缺 matplotlib 会静默跳过，通知里就没有图。
+    "matplotlib>=3.7",
+    # 飞书 webhook / 测试端点直接使用，缺了会在保存设置时才报错。
+    "requests>=2.31",
 ]
 cn-stocks = [
     "akshare>=1.14",

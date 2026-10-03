@@ -17,3 +17,11 @@ tests
 .idea
 .vscode
 *.log
+
+# Never ship real credentials into the build context / daemon.
+config/settings.json
+config/*.bak-*
+config/.tv_token_cache.json
+trade_records/
+.omo/
+.omc/
