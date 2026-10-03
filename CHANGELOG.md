@@ -6,6 +6,19 @@
 
 ## 2026-10-03
 
+### 4. 事件循环阻塞下线 + 记录/交易落盘原子化
+
+- **问题**：async 路由里直接调用阻塞 I/O；记录文件名秒级碰撞；交易 CSV 整文件读改写
+- **根因**：
+  1. `/api/bars`（前端每秒轮询）与 `/api/bars/next-close` 直接在 `async def` 中调 `latest_snapshot()`，TradingView 源会开 WebSocket + HTTP `get_hist`；而 SSE 后台循环对**同一调用**已正确使用 `asyncio.to_thread`。一次缓存未命中即冻结整个事件循环，连带所有 SSE 流与在途请求。同类问题还有 `/api/subscribe` 的 `connect/disconnect/subscribe` + `save_settings`、`/api/feishu/test` 的 `requests.post`（10s 超时）、`/api/chat/stream` 的记录扫描、`/api/records` 的整目录扫描
+  2. SSE 订阅队列 `asyncio.Queue()` 无 `maxsize`，`QueueFull` 分支是不可达死代码，后台标签页无限堆积 `bar_update`
+  3. `_build_basename` 只精确到秒且无唯一后缀，同一秒内同品种两次分析写同一路径互相覆盖
+  4. `_write_json` 非原子，崩溃会留下被截断的 `.json`，读取端静默跳过 → 整条记录丢失
+  5. 交易 CSV 先读全量、内存追加、再以 `mode="w"` 重写：截断先于写入，崩溃或并发保存丢整段历史，且每次追加 O(n²)
+- **修复**：全部阻塞调用改 `await asyncio.to_thread(...)`（`routes_analyze._run_analysis` 本就跑在 `run_in_executor`，无需改）；订阅队列 `maxsize=256` 且满时丢弃**最旧**增量事件（`bar_update` 是覆盖式快照，丢旧的安全；丢 `bar_close` 会卡住倒计时）；记录文件名加毫秒 + uuid6；`_write_json` 改同目录临时文件 + `os.replace` 原子落盘；CSV 改 per-file 锁 + 单次追加 + 仅新建时写表头
+- **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
+- **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
+
 ### 3. 逐功能审计修复：交易静默否决 / 凭据泄露 / 上下文溢出
 
 - **问题**：对推理链、`web/` 后端、`data`+`records`+`notify` 三路逐功能审计后发现 4 个 High 级缺陷，其中一个会**静默吃掉真实交易**
