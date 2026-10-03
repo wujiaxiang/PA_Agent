@@ -6,6 +6,20 @@
 
 ## 2026-10-03
 
+### 2. 补齐 GUI→WebUI 移植缺口：下单推送 / 交易落盘 / 失效开关
+
+- **问题**：对照 `pa_agent/gui/` 逐模块审计 WebUI 后发现，桌面 GUI 的下单信号推送与交易记录在 Web 端**完全没有实现**
+- **根因**：全仓 `save_trade_record` / `feishu.send_order_signal` / `pushplus.send_order_signal` 的调用者**只有** `pa_agent/gui/main_window.py:4016-4096`，`web/` 零命中。即配了飞书/PushPlus 配置 UI、且「测试发送」按钮可用，但服务端从不真正发送，交易 CSV 也从不落盘。Docker 常驻部署没有浏览器标签页可依赖，告警实际是死的
+- **修复**：
+  1. 把 `has_order_opportunity()` 等纯门控逻辑从 `pa_agent/gui/order_opportunity.py` 抽到 Qt-free 的 `pa_agent/ai/order_opportunity.py`；原文件改为转出同名符号的兼容层，GUI import 不变。抽出后测试不再需要 pyqtgraph（原先 `pa_agent/gui/__init__.py` 会 `import MainWindow → ChartWidget → pyqtgraph`，无 Qt 环境直接 ImportError）
+  2. 新增 `web/api/order_followup.py`：门控通过后在 daemon 线程执行 `save_trade_record()`（CSV + 图表 PNG）与 Feishu/PushPlus 推送，每步独立 try/except，异常只记 warning 不冒泡进分析流程
+  3. 在 `web/api/routes_analyze.py::_run_analysis` 成功提交记录后调用 `spawn_post_order_followup()`
+- **附带修复**：
+  1. **`cancel_keep_analysis_on_retry` 开关失效**：前端只在保存设置时写盘，从未在重试事件读取该开关 —— 界面上是个完全不起作用的复选框。新增 `applyCancelKeepAnalysisOnRetry()`，在 `Stage1Retry`/`Stage2Retry`（全量与增量两条流共 4 处）按开关关闭持续分析并持久化，对齐 GUI 的 `_on_retry_occurred`
+  2. **切换品种后的增量提示**：桌面 GUI 在切换后自动跑一次增量；Web 端改为提示（`refreshIncrementalButtonState()` 返回可用性 + toast）。因为每次分析都调 LLM 且现在可能推送下单信号，浏览品种时自动触发会反复烧 token 并打扰通知渠道
+- **文件**：`pa_agent/ai/order_opportunity.py`（新增）、`pa_agent/gui/order_opportunity.py`、`web/api/order_followup.py`（新增）、`web/api/routes_analyze.py`、`web/static/js/app.js`、`web/static/index.html`（app.js `?v=23`→`?v=25`）、`tests/unit/test_web_order_followup.py`（新增 14 例）
+- **验证**：`tests/unit` 全量对比同步前 `main` 基线：**新增失败 0，修复 2**。实测分析完成后生成 `trade_records/BTCUSDT_15m.csv` 且正确调用飞书（未配置时优雅跳过）
+
 ### 1. 同步上游 1.31 ~ 1.39（11 个提交）
 
 - **目标**：把上游 `upstream/main`（`rosemarycox5334-debug/PA_Agent`）从 `bb7c7d3`（1.3）推进到 `cd0aca2`（1.39），共 11 个提交、28 个文件、+614/-242

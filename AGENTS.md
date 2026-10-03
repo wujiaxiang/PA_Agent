@@ -130,6 +130,22 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 
 - `migrate_general_gold_defaults` 仅在 symbol 为黄金关键词（XAUUSD/GOLD/XAU）时强制修正为 OANDA/XAUUSD
 - 非黄金品种（如 NVDA/AAPL/TSM）保留用户选择配置，不做强制迁移
+- 加密货币代码（BTCUSDT/ETHUSDT…）同样**保留原样**，不迁移为黄金默认品种
+
+### 分层约束：Web 层禁止依赖 PyQt（最高优先级）
+
+- **`web/` 下的任何模块禁止 import `pa_agent.gui.*`**：`pa_agent/gui/__init__.py` 会 `import MainWindow → ChartWidget → pyqtgraph`，而 Docker 镜像**不安装 PyQt6/pyqtgraph**（见 `web/Dockerfile`），一旦引用就是启动期 ImportError
+- **需要被 Web 复用的纯逻辑必须放在 Qt-free 包内**：决策/门控类助手统一放 `pa_agent/ai/`（如 `order_opportunity.py`、`decision_stance.py`、`decision_continuity.py`）
+- **GUI 侧保留兼容层**：抽离后 `pa_agent/gui/<mod>.py` 改为 re-export 同名符号，GUI 现有 import 不受影响
+- **默认数据源必须是 `tradingview`**：`pa_agent/data/factory.py::DATA_SOURCE_CHOICES` 只暴露 tradingview，MT5 仅 Windows 可用；而 `config/settings.json` 在 `.gitignore` 中，全新 Docker volume 无该文件会走代码默认值，若默认 `mt5` 则 `create_data_source()` 抛 `DataSourceTransientError` 且被 `AppContext.bootstrap()` 的 `except Exception` 吞掉 → **应用静默启动但完全没有数据源**。修改 `GeneralSettings` 默认值时必须同步这条
+
+### 下单信号推送（交易记录 + Feishu/PushPlus）
+
+- **判定门控唯一来源**：`pa_agent.ai.order_opportunity.has_order_opportunity()`（Qt-free）。判定「是否下单机会」必须调用它，禁止在前端或路由里另写一份
+- **执行入口**：`web/api/order_followup.spawn_post_order_followup()`，在 `_run_analysis` 成功提交记录后调用；桌面 GUI 的等价实现是 `MainWindow._spawn_post_order_followup`
+- **必须后台线程 + 分步 try/except**：落盘与推送都可能耗时/失败，任何异常只记 warning，**绝不能冒泡进分析主流程**
+- **`decision_inner` 传扁平化后的 stage2**：落盘/通知/门控都读 `order_type`、`trade_confidence`、`entry_price` 等顶层字段；原始嵌套结构在 `.decision` 里，需合并（`_flat_stage2()`）
+- **总开关是 `alert_on_order_opportunity`**：关闭时既不落盘也不推送（与 GUI 语义一致）
 
 ### 前端进度条
 
@@ -187,25 +203,27 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 
 ## 已知问题
 
-- **模型 API 连接失败**：本地模型 API 服务器 `192.168.2.177:8082` 未运行，导致分析失败（已通过 `.env` 配置切换到可用 endpoint 解决，但配置项仍可能被误填回内网地址）
-- **Demo 模式缺失**：Web UI 缺乏桌面 GUI 有的 demo 模式
-- **resendLastChat 死代码**：`web/static/js/app.js` 中函数存在但无 UI 按钮绑定
+- **模型 API 连接失败**：本地模型 API 服务器 `192.168.2.177:8082` 未运行，导致分析失败（已通过 `.env` 配置切换到可用 endpoint 解决，但配置项仍可能被误填回内网地址）。注意 2026-10 实测还存在「模型免费期结束」类 404（`base_url` 可达但模型不可用），`/api/health` 会显示 `degraded`/`model_api: error`
 - **经验库系统数据为空**：`experience/` 目录无数据文件，经验库检索与应用功能空跑
 - **移动端未适配**：当前 UI 为桌面端设计，移动端显示效果差
 - **国际化缺失**：所有文案硬编码中文，无多语言支持
+- **`/api/bars` 忽略查询参数**：该端点只接受 `count`，实际数据取自当前订阅状态（`settings.general.last_symbol/last_timeframe`）；而 `/api/bars/next-close` 却接受并回显 `symbol/timeframe/exchange`。两个端点对同一请求会返回不同品种，属于**已知接口不一致**，前端必须先 `POST /api/subscribe` 再 `GET /api/bars`。待统一
+- **`_build_incremental_stage1_user_prompt` 为死代码**：`pa_agent/ai/prompt_assembler.py` 中该方法全仓无调用者（增量路径走 `build_incremental_stage1` 的续写变体）
+- **429 耗尽后被归类为网络错误**：`two_stage._stream_chat_resilient` 中 `_is_network_error` 匹配 `openai.APIStatusError`（`RateLimitError` 的父类），持续限流时会静默轮换 provider fallback 而不是直接报错
 
 ---
 
 ## 后续迭代需求
 
 1. **经验库系统完善** ⭐ 高优：添加经验数据文件，实现经验库检索和应用功能
-2. **Demo 模式**：实现 Web UI 的 demo 模式，便于用户体验
-3. **resendLastChat 功能**：添加 UI 按钮绑定，实现重新发送最后一条消息功能
-4. **前端顶部健康状态指示**：轮询 `/api/health`，`degraded`/`error` 时顶部红条提示
-5. **`_PRACTICAL_UNLIMITED_MAX_TOKENS` 按 provider 动态读模型上限**：当前用静态默认值
-6. **`max_output_tokens` 前端可配**：当前只能在 `settings.json` / `.env` 配置，前端设置面板未暴露
-7. **移动端适配**：响应式布局，关键操作在移动端可用
-8. **性能优化**：页面加载速度、渲染性能、SSE 长连接内存泄漏排查
-9. **国际化支持**：添加多语言支持（中/英）
+2. **移动端适配**：响应式布局，关键操作在移动端可用
+3. **性能优化**：页面加载速度、渲染性能、SSE 长连接内存泄漏排查
+4. **国际化支持**：添加多语言支持（中/英）
+5. **统一 `/api/bars` 与 `/api/bars/next-close` 的参数契约**：要么都接受 `symbol/timeframe/exchange`，要么都只读订阅状态，避免前端拿错品种
+6. **AI provider 预设与字段校验**：桌面 GUI 有 cursor/qclaw/workbuddy/trae_cn 等预设和「model / BaseURL 填反了」的守卫（`gui/settings_dialog.py:335-446`），Web 端目前是裸文本框，Docker 用户需手填
+7. **SummaryStrip 指标条**：GUI 的 5 项指标条（趋势/市场周期/下周期/支撑/阻力，`gui/widgets/summary_strip.py:7-16`）未移植，数据其实已在 Web payload 里
+8. **TradingView 连通性诊断**：GUI 的 `tv_connectivity_dialog` 提供 MT5/云端回退建议与 wiki 链接，Web 端只有 toast（错误分类 `error_type` 反而更好）
+9. **Demo 模式增强**：当前 `web/api/routes_demo.py` 是随机游走的合成数据，不支持真实记录回放与自动串联（真实记录回放已由历史记录功能覆盖）
+10. **删除 `pa_agent/gui/`**：桌面 GUI 代码 1.7 万行已成死代码，且上游仍在积极修改它（每次同步都产生删除冲突；`.github/workflows/sync-upstream.yml` 已预设「keep our deletion」策略）。前置条件：把 `pa_agent/gui/stage2_payload.py` 等无 Qt 依赖的模块移出 `gui/`（`tests/unit/test_validation_retry.py` 目前依赖它）
 
 详细规划见 [TODO.md](TODO.md) 第五节「后续可推进的优化」。
