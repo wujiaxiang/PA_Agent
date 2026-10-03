@@ -43,9 +43,15 @@ _background_task: asyncio.Task | None = None
 # ── 订阅者管理 ─────────────────────────────────────────────────────────────────
 
 
+#: Per-subscriber queue depth. Bounded so a paused/backgrounded browser tab
+#: cannot accumulate bar_update events forever (the previous unbounded Queue made
+#: the QueueFull branch below unreachable dead code).
+SUBSCRIBER_QUEUE_MAXSIZE = 256
+
+
 async def _add_subscriber() -> asyncio.Queue:
-    """添加一个订阅者，返回其专属 queue。"""
-    q: asyncio.Queue = asyncio.Queue()
+    """添加一个订阅者，返回其专属（有界）queue。"""
+    q: asyncio.Queue = asyncio.Queue(maxsize=SUBSCRIBER_QUEUE_MAXSIZE)
     async with _subscribers_lock:
         _subscribers.append(q)
     return q
@@ -61,8 +67,8 @@ async def _remove_subscriber(q: asyncio.Queue) -> None:
 async def _broadcast(event: dict) -> None:
     """向所有订阅者广播事件。
 
-    使用 ``put_nowait`` 避免一个慢客户端阻塞其他订阅者；队列满时丢弃事件
-    并打印警告（订阅者队列默认无限大，正常不会触发）。
+    使用 ``put_nowait`` 避免一个慢客户端阻塞其他订阅者；队列满时丢弃**最旧的**
+    增量事件（bar_update），保证 bar_close / ping 等关键事件仍能送达。
     """
     async with _subscribers_lock:
         subs = list(_subscribers)
@@ -70,7 +76,14 @@ async def _broadcast(event: dict) -> None:
         try:
             q.put_nowait(event)
         except asyncio.QueueFull:
-            logger.warning("Subscriber queue full, dropping event")
+            # Drop the oldest buffered event rather than the new one: bar_update
+            # is a superseding snapshot, so losing stale increments is safe, but
+            # dropping a bar_close would strand the wait-close countdown.
+            try:
+                q.get_nowait()
+                q.put_nowait(event)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                logger.warning("Subscriber queue full, dropping event")
 
 
 # ── bar 序列化 ────────────────────────────────────────────────────────────────

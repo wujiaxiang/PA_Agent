@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -185,7 +186,12 @@ async def list_records(
     include_partial: bool = Query(False, description="是否包含失败记录"),
 ):
     """列出指定 (exchange, symbol, timeframe) 下的历史记录摘要。"""
-    return _list_records(exchange, symbol, timeframe, limit, include_partial)
+    # Offloaded: _list_records globs the partitions, stats and JSON-parses every
+    # candidate (records embed full stage1+stage2 payloads). Pure blocking file
+    # I/O — inline it stalls the event loop and every SSE stream.
+    return await asyncio.to_thread(
+        _list_records, exchange, symbol, timeframe, limit, include_partial
+    )
 
 
 @router.get("/records/{record_id:path}")

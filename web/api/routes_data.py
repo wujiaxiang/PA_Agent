@@ -1,6 +1,7 @@
 """REST routes for data sources, symbols, timeframes."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -86,13 +87,14 @@ async def list_tv_symbols(request: Request, exchange: str = ""):
     """
     ctx = request.app.state.ctx
     ds = ctx.data_source
-    # Prefer the data source's list_symbols(exchange) if available (TradingView)
+    # Prefer the data source's list_symbols(exchange) if available (TradingView).
+    # Offloaded: TradingViewSource.list_symbols() may hit the network.
     if hasattr(ds, "list_symbols"):
         try:
-            syms = ds.list_symbols(exchange)
+            syms = await asyncio.to_thread(ds.list_symbols, exchange)
         except TypeError:
             # Older data sources have list_symbols() without args
-            syms = ds.list_symbols()
+            syms = await asyncio.to_thread(ds.list_symbols)
     else:
         syms = []
 
@@ -113,7 +115,7 @@ async def list_timeframes(request: Request):
     """Return timeframes supported by the current data source."""
     ctx = request.app.state.ctx
     try:
-        tfs = ctx.data_source.supported_timeframes()
+        tfs = await asyncio.to_thread(ctx.data_source.supported_timeframes)
     except Exception:
         tfs = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
     return tfs
@@ -153,7 +155,7 @@ async def subscribe(req: SubscribeRequest, request: Request):
 
     if kind != old_kind:
         try:
-            ctx.data_source.disconnect()
+            await asyncio.to_thread(ctx.data_source.disconnect)
         except Exception:
             pass
         ctx.data_source = create_data_source(kind)
@@ -168,11 +170,14 @@ async def subscribe(req: SubscribeRequest, request: Request):
     )
 
     try:
+        # connect() rebuilds a TradingView WebSocket and subscribe() fetches
+        # history — both block for seconds. Offload so a switch cannot stall the
+        # whole event loop (and with it every SSE stream).
         if not already_connected:
-            ctx.data_source.connect()
+            await asyncio.to_thread(ctx.data_source.connect)
         if kind == "tradingview" and hasattr(ctx.data_source, "set_exchange"):
             ctx.data_source.set_exchange(exchange)
-        ctx.data_source.subscribe(symbol, timeframe)
+        await asyncio.to_thread(ctx.data_source.subscribe, symbol, timeframe)
     except Exception as exc:
         # switch-performance-refactor spec: 结构化错误响应
         # 根据异常信息分类返回 error_type，前端据此显示针对性提示：
@@ -203,7 +208,7 @@ async def subscribe(req: SubscribeRequest, request: Request):
 
     from pa_agent.config.paths import SETTINGS_JSON_PATH
     from pa_agent.config.settings import save_settings
-    save_settings(ctx.settings, SETTINGS_JSON_PATH)
+    await asyncio.to_thread(save_settings, ctx.settings, SETTINGS_JSON_PATH)
 
     return {
         "status": "subscribed",
@@ -218,7 +223,11 @@ async def subscribe(req: SubscribeRequest, request: Request):
 async def get_bars(request: Request, count: int = 100):
     """Fetch latest N bars and return as JSON for chart rendering."""
     ctx = request.app.state.ctx
-    bars_raw = ctx.data_source.latest_snapshot(count)
+    # latest_snapshot() can open a TradingView WebSocket + HTTP get_hist on a
+    # cache miss. The frontend polls this every second, so calling it inline
+    # would block the event loop and freeze every SSE stream. The background SSE
+    # loop already offloads the same call (see routes_bars_stream._push_bar_update).
+    bars_raw = await asyncio.to_thread(ctx.data_source.latest_snapshot, count)
     bars: list[dict] = []
     for b in bars_raw:
         bars.append({
@@ -266,7 +275,7 @@ async def get_next_close(
     # symbol / exchange are accepted for symmetry with /api/subscribe but
     # are not strictly required — we read the forming bar from the
     # current data source regardless.
-    bars_raw = ctx.data_source.latest_snapshot(2)
+    bars_raw = await asyncio.to_thread(ctx.data_source.latest_snapshot, 2)
     if not bars_raw:
         return {
             "symbol": symbol or getattr(ctx.settings.general, "last_symbol", ""),

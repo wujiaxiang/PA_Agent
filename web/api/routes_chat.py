@@ -89,9 +89,11 @@ async def chat_stream(
     # Create or reuse a FreeChatSession anchored to the last analysis record
     record = getattr(ctx, "_last_record", None)
     if record is None:
-        # Try to load latest from history
+        # Try to load latest from history. Offloaded: on a cache miss this
+        # rglobs + parses every record — blocking file I/O on the event loop.
         from pa_agent.records.analysis_history import find_latest_successful_record
-        record = find_latest_successful_record()
+
+        record = await asyncio.to_thread(find_latest_successful_record)
 
     if record is None:
         event_queue.put_nowait({"type": "error", "message": "没有已完成的交易分析记录，请先进行一次分析"})

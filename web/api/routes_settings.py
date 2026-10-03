@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import time
+import asyncio
 
 import requests
 from fastapi import APIRouter, HTTPException, Request
@@ -22,7 +23,7 @@ router = APIRouter(tags=["settings"])
 async def get_settings(request: Request):
     """Return current settings with API key masked."""
     ctx = request.app.state.ctx
-    settings = load_settings(SETTINGS_JSON_PATH)
+    settings = await asyncio.to_thread(load_settings, SETTINGS_JSON_PATH)
     ctx.settings = settings  # sync live reference
     # 每次载入都刷新脱敏注册表：换密钥后旧值失效、新值生效，
     # 否则新密钥会以明文写进 records/pending/*.json。
@@ -74,7 +75,7 @@ async def put_settings(request: Request, body: dict):
                             masked_key_dropped = True
                             continue
                         setattr(target, k, v)
-    save_settings(current, SETTINGS_JSON_PATH)
+    await asyncio.to_thread(save_settings, current, SETTINGS_JSON_PATH)
 
     from pa_agent.util.logging import register_settings_secrets, update_api_key
     update_api_key(current.provider.api_key)
@@ -82,9 +83,11 @@ async def put_settings(request: Request, body: dict):
     # TradingView 凭证）到脱敏注册表，避免它们经由 requests 异常串进日志。
     register_settings_secrets(current)
 
-    # Rebuild AI client if provider changed
+    # Rebuild AI client if provider changed (may probe the provider; offload it)
     from pa_agent.ai.client_factory import create_ai_client
-    ctx.client = create_ai_client(current.provider, logger_=ctx.logger)
+    ctx.client = await asyncio.to_thread(
+        create_ai_client, current.provider, logger_=ctx.logger
+    )
 
     return {"status": "saved", "api_key_masked_ignored": masked_key_dropped}
 
@@ -121,7 +124,12 @@ async def feishu_test(request: Request, body: dict):
         payload["sign"] = sign
 
     try:
-        resp = requests.post(webhook, json=payload, timeout=10)
+        # Offloaded: this is an outbound HTTPS POST with a 10s timeout. Calling it
+        # inline would block the whole event loop for up to 10 seconds, freezing
+        # every SSE stream and every other in-flight request.
+        resp = await asyncio.to_thread(
+            requests.post, webhook, json=payload, timeout=10
+        )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"请求失败: {exc}")
 

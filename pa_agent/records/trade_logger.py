@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,23 @@ _TRADE_RECORDS_DIR = Path("trade_records")
 _CHART_MAX_BARS = 50
 
 # ── CSV column definitions ─────────────────────────────────────────────────────
+
+#: Per-CSV-file locks so two concurrent saves (e.g. the post-order follow-up
+#: thread plus a manual analysis) cannot interleave partial writes.
+_CSV_LOCKS: dict[str, threading.Lock] = {}
+_CSV_LOCKS_GUARD = threading.Lock()
+
+
+def _csv_lock_for(path: Path) -> threading.Lock:
+    """Return the process-wide lock guarding writes to *path*."""
+    key = str(path)
+    with _CSV_LOCKS_GUARD:
+        lock = _CSV_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _CSV_LOCKS[key] = lock
+        return lock
+
 
 _CSV_FIELDNAMES = [
     # ── Meta ──────────────────────────────────────────────────────────────────
@@ -604,23 +622,23 @@ def _save_trade_record_impl(
         "chart_image": image_filename if chart_written else "",
     }
 
-    # ── Write CSV (rewrite with unified header for schema migrations) ─────────
-    existing_rows: list[dict[str, str]] = []
-    if csv_path.exists():
-        try:
-            with open(csv_path, encoding="utf-8-sig", newline="") as f:
-                existing_rows = list(csv.DictReader(f))
-        except OSError:
-            existing_rows = []
+    # ── Write CSV ────────────────────────────────────────────────────────────
+    # Previously this read the whole file, appended in memory, then reopened with
+    # mode "w" — which truncates before writing. A crash (or a concurrent save
+    # from the post-order thread) destroyed the entire trade history, and every
+    # append rewrote all previous rows (O(n^2)). Now: per-file lock, header only
+    # when creating, and a single O_APPEND-mode write.
     merged_row = {k: str(row.get(k, "")) for k in _CSV_FIELDNAMES}
     for k, v in row.items():
         if k in _CSV_FIELDNAMES:
             merged_row[k] = "" if v is None else str(v)
-    existing_rows.append(merged_row)
-    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=_CSV_FIELDNAMES, extrasaction="ignore")
-        writer.writeheader()
-        for r in existing_rows:
-            writer.writerow({k: r.get(k, "") for k in _CSV_FIELDNAMES})
+
+    with _csv_lock_for(csv_path):
+        needs_header = not csv_path.exists() or csv_path.stat().st_size == 0
+        with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=_CSV_FIELDNAMES, extrasaction="ignore")
+            if needs_header:
+                writer.writeheader()
+            writer.writerow({k: merged_row.get(k, "") for k in _CSV_FIELDNAMES})
 
     logger.info("Trade record appended: %s", csv_path)

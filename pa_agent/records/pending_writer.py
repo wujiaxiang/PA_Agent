@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -54,7 +56,12 @@ def _build_basename(record: AnalysisRecord) -> str:
     """
     dt = _ms_to_local_datetime(record.meta.timestamp_local_ms)
     ts_str = dt.strftime("%Y-%m-%d_%H-%m-%S")
-    return ts_str
+    # Second resolution collided: two analyses of the same
+    # (exchange, symbol, timeframe) inside one second produced identical paths and
+    # the second truncated the first. Append milliseconds + a short uuid so the
+    # stem stays human-sortable while being unique.
+    ms = int(record.meta.timestamp_local_ms) % 1000
+    return f"{ts_str}_{ms:03d}_{uuid.uuid4().hex[:6]}"
 
 
 def _build_record_path(record: AnalysisRecord, pending_dir: Path) -> Path:
@@ -216,7 +223,19 @@ class PendingWriter:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             text = json.dumps(data, ensure_ascii=False, indent=2)
-            path.write_text(text, encoding="utf-8")
+            # Atomic: write a unique temp file in the same directory, then rename.
+            # A crash mid-write previously left a truncated/empty .json that the
+            # reader then silently skipped — losing the record entirely.
+            tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+            try:
+                tmp.write_text(text, encoding="utf-8")
+                os.replace(tmp, path)
+            finally:
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
         except OSError as exc:
             self._handle_disk_error(exc, path)
 
