@@ -9,9 +9,11 @@
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="/css/style.css?v=16">
+<link rel="stylesheet" href="/css/style.css?v=17">
 </head>
 <body>
+
+<div id="health-banner" class="health-banner hidden"></div>
 
 <div id="api-key-alert" class="api-key-alert" hidden>⚠️ 未配置 API Key，<a href="#" id="api-key-alert-open">点击设置</a></div>
 
@@ -81,6 +83,7 @@
         <button id="btn-back-to-live" class="tool-icon-btn hidden" title="返回实时" aria-label="返回实时">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
         </button>
+        <button id="btn-demo" class="compact-btn" title="加载 Demo 数据体验">Demo</button>
       </div>
       <div id="history-popover" class="history-popover hidden">
         <div class="history-popover-header">
@@ -238,6 +241,7 @@
       <div class="disclaimer">⚠️ AI 分析仅供参考，不构成投资建议</div>
       <div class="chat-input-row">
         <input id="chat-input" type="text" placeholder="分析完成后可继续追问…" disabled>
+        <button id="btn-chat-resend" class="compact-btn" title="重发上一条消息" style="display:none">重发</button>
         <button id="btn-chat-send" class="compact-btn" disabled>发送</button>
         <button id="btn-chat-clear" class="compact-btn" title="清空追问消息">清空</button>
       </div>
@@ -433,6 +437,7 @@
         <label class="checkbox-label">
           <input id="s-thinking" type="checkbox" checked> 扩展思考（Thinking）
         </label>
+        <label>最大输出 Token 数（Max Output Tokens） <input id="s-max-output-tokens" type="number" min="0" placeholder="0 = 自动"></label>
         <fieldset class="settings-fieldset">
           <legend>TradingView 凭证（选填）</legend>
           <p class="muted-text" style="font-size:12px;margin:0 0 6px;">
@@ -585,6 +590,6 @@
 <script src="/js/api.js?v=3"></script>
 <script src="/js/chart.js?v=3"></script>
 <script src="/js/indicators.js?v=3"></script>
-<script src="/js/app.js?v=21"></script>
+<script src="/js/app.js?v=23"></script>
 </body>
 </html>

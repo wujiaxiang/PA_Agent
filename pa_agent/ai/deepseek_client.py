@@ -200,7 +200,7 @@ def _is_sensenova(base_url: str) -> bool:
     """SenseNova (token.sensenova.cn) OpenAI-compatible gateway.
 
     Provides deepseek-v4-flash 等 DeepSeek 模型的免费代理；其 max_tokens 上限为
-    384000（低于默认 _PRACTICAL_UNLIMITED_MAX_TOKENS），需单独限流以避免 400。
+    384000（低于默认 128k），需单独限流以避免 400。
     """
     return "sensenova.cn" in (base_url or "").lower()
 
@@ -265,8 +265,6 @@ def _adaptive_output_effort(reasoning_effort: str | None) -> str:
     return _EFFORT_TO_ADAPTIVE_OUTPUT.get(key, "medium")
 
 
-# Sent to OpenAI-compatible gateways; upstream may clamp below these values.
-_PRACTICAL_UNLIMITED_MAX_TOKENS = _GLOBAL_MAX_OUTPUT_TOKENS
 # Anthropic-style thinking requires budget_tokens < max_tokens.
 _PRACTICAL_UNLIMITED_THINKING_BUDGET = _GLOBAL_MAX_OUTPUT_TOKENS - 1
 
@@ -329,12 +327,28 @@ def _prepare_api_messages(
     return api_messages, system_param
 
 
+def _is_openrouter(base_url: str | None) -> bool:
+    """Detect OpenRouter gateway by base_url."""
+    return "openrouter.ai" in (base_url or "").lower()
+
+
+# OpenRouter free models cap at 32768 output tokens.
+_OPENROUTER_MAX_OUTPUT_TOKENS = 32_768
+
+
 def _provider_max_output_tokens(settings: AIProviderSettings) -> int:
     """Per-gateway completion cap (max_tokens); avoids 400 from provider limits.
 
-    If ``settings.max_output_tokens`` is set (>0), it takes precedence over the
-    per-provider defaults (TODO P2.3 — lets users override via settings.json or
-    .env instead of editing this constant).
+    Priority: user explicit setting > per-provider defaults > global clamp.
+
+    Per-provider defaults:
+      - Packy Claude: 128k
+      - DeepSeek native: 393216
+      - SenseNova: 131072 (GLM) / 65536 (others)
+      - B.AI: 8192 (official cap for deepseek-v4-flash)
+      - MiMo: dynamic per model
+      - OpenRouter: 32768 (free model limit)
+      - Unknown: global clamp (_GLOBAL_MAX_OUTPUT_TOKENS)
     """
     explicit = getattr(settings, "max_output_tokens", None)
     if explicit and explicit > 0:
@@ -356,8 +370,10 @@ def _provider_max_output_tokens(settings: AIProviderSettings) -> int:
         cap = _BAI_MAX_OUTPUT_TOKENS
     elif _is_mimo(settings):
         cap = mimo_max_output_tokens(settings.model)
+    elif _is_openrouter(settings.base_url):
+        cap = _OPENROUTER_MAX_OUTPUT_TOKENS
     else:
-        cap = _PRACTICAL_UNLIMITED_MAX_TOKENS
+        cap = _GLOBAL_MAX_OUTPUT_TOKENS
     return min(cap, _GLOBAL_MAX_OUTPUT_TOKENS)
 
 

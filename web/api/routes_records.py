@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -76,7 +76,7 @@ def _derive_last_close_bar_iso(record: AnalysisRecord) -> str:
             # 实际时间字段是 ts_open（ms）；time 是旧字段名，做兼容
             ts_ms = int(target_bar.get("ts_open") or target_bar.get("time") or 0)
             if ts_ms > 0:
-                return datetime.fromtimestamp(ts_ms / 1000).isoformat()
+                return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
         except (TypeError, ValueError, AttributeError, IndexError):
             pass
 

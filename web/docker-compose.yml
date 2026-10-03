@@ -4,6 +4,8 @@ services:
     # AppArmor, so we build manually via `docker run --security-opt apparmor=unconfined`
     # then commit.  See web/Dockerfile for the recipe.
     image: pa-agent-web:latest
+    security_opt:
+      - apparmor=unconfined
     ports:
       - "8005:8000"
     volumes:

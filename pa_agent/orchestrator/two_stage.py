@@ -26,7 +26,7 @@ STAGE2_VALIDATION_AUTO_RETRY = False
 import copy
 import dataclasses
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
@@ -202,7 +202,7 @@ def _build_empty_record(
 ) -> AnalysisRecord:
     """Build a partial AnalysisRecord with meta populated from the frame."""
     ts_ms = now_local_ms()
-    ts_iso = datetime.fromtimestamp(ts_ms / 1000).isoformat(timespec="milliseconds")
+    ts_iso = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat(timespec="milliseconds")
 
     # Build masked provider snapshot
     ai_provider: dict[str, Any] = {}
@@ -249,7 +249,7 @@ def _build_empty_record(
             ts_close_ms = int(target_bar.get("ts_open") or target_bar.get("time", 0))
             if ts_close_ms > 0:
                 last_close_bar_iso = datetime.fromtimestamp(
-                    ts_close_ms / 1000
+                    ts_close_ms / 1000, tz=timezone.utc
                 ).isoformat(timespec="milliseconds")
         except (TypeError, ValueError, AttributeError, IndexError):
             last_close_bar_iso = ""

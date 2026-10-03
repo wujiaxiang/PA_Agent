@@ -167,6 +167,7 @@ from web.api.routes_analyze import router as analyze_router
 from web.api.routes_chat import router as chat_router
 from web.api.routes_records import router as records_router
 from web.api.routes_bars_stream import router as bars_stream_router
+from web.api.routes_demo import router as demo_router
 
 app.include_router(settings_router, prefix="/api")
 app.include_router(data_router, prefix="/api")
@@ -174,6 +175,7 @@ app.include_router(analyze_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
 app.include_router(records_router, prefix="/api")
 app.include_router(bars_stream_router, prefix="/api")
+app.include_router(demo_router, prefix="/api")
 
 
 @app.get("/api/health")

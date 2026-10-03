@@ -10,7 +10,7 @@ import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from sse_starlette.sse import EventSourceResponse
@@ -291,7 +291,7 @@ def _derive_last_close_bar_iso(record) -> str:
         try:
             ts_ms = int(record.kline_data[-1].get("time", 0))
             if ts_ms > 0:
-                return datetime.fromtimestamp(ts_ms / 1000).isoformat()
+                return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
         except (TypeError, ValueError, AttributeError, IndexError):
             pass
 
@@ -453,6 +453,8 @@ def _run_analysis(
             **callbacks,
         )
         record_payload = _serialize_record(record)
+        # 保存最近记录引用，供追问（/api/chat/stream）路由使用
+        ctx._last_record = record
         # 脱敏：递归替换 payload 中出现的 api_key（含 raw_debug_payload 内的 prompt/response）
         api_key = ""
         try:
