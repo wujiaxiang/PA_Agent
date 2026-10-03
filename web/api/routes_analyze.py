@@ -261,6 +261,19 @@ def _serialize_record(record) -> dict:
     return {
         "symbol": record.meta.symbol,
         "timeframe": record.meta.timeframe,
+        # 前端用 lastRecord.timestamp_local_iso 拼追问会话的 record_id
+        # （app.js: buildChatRecordId），缺失会退化成 chat_${Date.now()}，
+        # 导致每条消息都开新会话、追问上下文全部丢失。
+        "timestamp_local_iso": _meta_str(record.meta, "timestamp_local_iso"),
+        # 历史回看 banner 直接读 meta.timestamp_local_iso（app.js）。这里只显式
+        # 拷贝前端需要的标量字段并强制转 str：整块 model_dump() 在测试的
+        # MagicMock 记录下会产出不可 JSON 序列化的对象。
+        "meta": {
+            "timestamp_local_iso": _meta_str(record.meta, "timestamp_local_iso"),
+            "symbol": _meta_str(record.meta, "symbol"),
+            "timeframe": _meta_str(record.meta, "timeframe"),
+            "exchange": _meta_str(record.meta, "exchange"),
+        },
         "last_close_bar_iso": _derive_last_close_bar_iso(record),
         "stage1_diagnosis": record.stage1_diagnosis,
         "stage2_decision": stage2_for_payload,
@@ -272,6 +285,12 @@ def _serialize_record(record) -> dict:
         "raw_debug_payload": _build_raw_debug_payload(record),
         "debug_files_payload": _build_debug_files_payload(record),
     }
+
+
+def _meta_str(meta: object, field: str) -> str:
+    """Read *field* off a record meta object as a plain JSON-safe string."""
+    value = getattr(meta, field, "")
+    return "" if value is None else str(value)
 
 
 def _derive_last_close_bar_iso(record) -> str:

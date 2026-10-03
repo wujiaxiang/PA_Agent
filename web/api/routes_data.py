@@ -119,6 +119,20 @@ async def list_timeframes(request: Request):
     return tfs
 
 
+@router.get("/order-opportunity-types")
+async def list_order_opportunity_types():
+    """Expose the single-source-of-truth order gate types to the browser.
+
+    The frontend's browser-side alert must use exactly the same set as
+    ``pa_agent.ai.order_opportunity.ORDER_OPPORTUNITY_TYPES`` (see AGENTS.md
+    「下单信号推送」). Duplicating the list in JS previously caused the alert to
+    compare Chinese stage-2 output against English labels and never fire.
+    """
+    from pa_agent.ai.order_opportunity import ORDER_OPPORTUNITY_TYPES
+
+    return sorted(ORDER_OPPORTUNITY_TYPES)
+
+
 @router.post("/subscribe")
 async def subscribe(req: SubscribeRequest, request: Request):
     """Switch to a new symbol/timeframe/data-source."""

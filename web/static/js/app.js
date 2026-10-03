@@ -142,6 +142,11 @@ let sseFallbackPolling = false;// SSE 失败后是否降级为轮询模式
 let sseLastBarUpdateTs = 0;    // 最近一次 SSE bar_update/bar_close 事件的时间戳（ms）
 let sseNextCloseTs = 0;        // 当前 forming bar 的下一收盘时间戳（ms，来自后端 next_close_ts）
 let keepAnalysisLastClosedTs = 0;  // 持续分析哨兵：上次处理的收盘 bar ts_open，防止同一根 bar 重复触发分析
+// 下单机会订单类型 —— 由 /api/order-opportunity-types 从后端单一真源
+// （pa_agent.ai.order_opportunity.ORDER_OPPORTUNITY_TYPES）拉取，避免前后端枚举漂移。
+let ORDER_OPPORTUNITY_TYPES = ['限价单', '突破单', '市价单'];
+// 删除历史记录的二次确认状态（不用 confirm()，见 deleteRecord 注释）
+let pendingDeleteId = null;
 let chartUpdatePaused = false;  // 分析期间暂停图表实时更新
 let sseStatusExpiryTimer = null;  // updateSSEStatusWithExpiry 定时器句柄
 let nextClosePollingTimer = null;  // 低频拉取 next_close_ts 定时器（fallback/纯轮询模式下使用）
@@ -268,6 +273,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadExchanges();     // 再加载交易所下拉（并选中当前值）
   await loadSymbols();       // 根据当前交易所加载品种列表
   await loadTimeframes();    // 加载周期下拉（并选中当前值）
+  await loadOrderOpportunityTypes();  // 从后端拉下单机会订单类型（避免前后端枚举漂移）
   await loadBars();          // 最后拉 K 线
   loadHistoryList();         // 拉当前 (exchange, symbol, timeframe) 的历史分析记录
   refreshIncrementalButtonState();  // 初始化增量分析按钮可用性
@@ -569,6 +575,19 @@ async function loadTimeframes() {
   }
 }
 
+// 拉取后端单一真源的下单机会订单类型（pa_agent.ai.order_opportunity.ORDER_OPPORTUNITY_TYPES）。
+// 失败时保留内置默认值，避免下单提醒整体失效。
+async function loadOrderOpportunityTypes() {
+  try {
+    const list = await API.get('/api/order-opportunity-types');
+    if (Array.isArray(list) && list.length) {
+      ORDER_OPPORTUNITY_TYPES = list;
+    }
+  } catch (e) {
+    console.warn('loadOrderOpportunityTypes: 使用内置默认值', e);
+  }
+}
+
 // ── Events ─────────────────────────────────────────────────────────────
 let currentAnalysisStream = null;
 
@@ -682,7 +701,8 @@ function bindEvents() {
         $('#tab-decision').classList.add('active');
       } catch (err) {
         console.error('Demo 加载失败:', err);
-        alert('Demo 数据加载失败: ' + err.message);
+        // TRAE 内置 webview 中 alert() 会触发崩溃（AGENTS.md UI 风格）
+        showToast('Demo 数据加载失败: ' + err.message, 'error');
       } finally {
         btnDemo.disabled = false;
         btnDemo.textContent = 'Demo';
@@ -4548,7 +4568,17 @@ function hideReplayBadge() {
 // 删除历史记录：二次确认 → DELETE /api/records/{record_id} → 刷新列表
 async function deleteRecord(recordId) {
   if (!recordId) return;
-  if (!confirm('确定删除此条历史记录？')) return;
+  // confirm() 在 TRAE 内置 webview 中同样会崩溃，改用 Toast 二次确认
+  showToast('再次点击「删除」以确认删除该条历史记录', 'warning');
+  if (!pendingDeleteId) {
+    pendingDeleteId = recordId;
+    return;
+  }
+  if (pendingDeleteId !== recordId) {
+    pendingDeleteId = recordId;
+    return;
+  }
+  pendingDeleteId = null;
   try {
     await API.delete(`/api/records/${encodeURIComponent(recordId)}`);
     showToast('已删除');
@@ -4919,10 +4949,13 @@ function triggerOrderAlertIfNeeded(record) {
   // 开关检查：默认 true，仅在显式 false 时跳过（避免 undefined 误判）
   if (currentSettings?.general?.alert_on_order_opportunity === false) return;
   const decision = record.stage2_decision || {};
-  const orderType = String(decision.order_type || '').toLowerCase();
+  const orderType = String(decision.order_type || '');
   const confidence = Number(decision.trade_confidence || 0);
   const threshold = Number(currentSettings?.general?.decision_confidence_threshold || 40);
-  if (!['limit', 'market', 'stop'].includes(orderType)) return;
+  // 阶段二输出的是中文订单类型（限价单/突破单/市价单），与后端
+  // ORDER_OPPORTUNITY_TYPES 一致。此前这里比对英文 ['limit','market','stop']，
+  // 永远匹配不上 —— 浏览器端的下单提醒（toast/beep/通知）从未触发过。
+  if (!ORDER_OPPORTUNITY_TYPES.includes(orderType)) return;
   if (confidence < threshold) return;
   showOrderToast(decision);
   notifyOrderOpportunity(decision);
