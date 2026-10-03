@@ -37,8 +37,10 @@ def test_round_trip(tmp_path):
     save_settings(original, p)
     loaded = load_settings(p)
     assert loaded.provider.api_key == "sk-test-1234"
-    # 默认数据源为 mt5, 加密货币代码 BTCUSDT 迁移为 MT5 现货黄金默认品种 XAUUSDm
-    assert loaded.general.last_symbol == "XAUUSDm"
+    # 本仓库规则：非黄金品种（含加密货币）保留用户选择，不做强制迁移 ——
+    # 见 AGENTS.md「品种迁移逻辑」与 normalize_gold_symbol_for_kind()。
+    # 上游曾把 BTCUSDT 强制迁移为 MT5 黄金默认品种 XAUUSDm，本仓库已移除该行为。
+    assert loaded.general.last_symbol == "BTCUSDT"
     assert loaded.provider.model == original.provider.model
 
 
