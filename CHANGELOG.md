@@ -6,6 +6,17 @@
 
 ## 2026-10-03
 
+### 3. 逐功能审计修复：交易静默否决 / 凭据泄露 / 上下文溢出
+
+- **问题**：对推理链、`web/` 后端、`data`+`records`+`notify` 三路逐功能审计后发现 4 个 High 级缺陷，其中一个会**静默吃掉真实交易**
+- **根因与修复**：
+  1. **RR 上限自造否决（吃掉交易）**：`MIN/MAX_RISK_REWARD_RATIO` 同为 1.0，上限靠拉宽止损把 TP1 盈亏比压到 1.0，于是 reward == risk，交易方程 `p*reward > (1-p)*risk` 退化为 `p > 0.5`——**任何盈亏比超限且胜率 ≤50% 的单子必然被否**。线上实录：BTCUSDT 15m 盈亏比 9.14:1、胜率 50%、期望值 +36.6 被改成「不下单」；同一决策内节点 10.2 报 risk=9.0 而 10.3 报 risk=82.3，互相矛盾。修复：方程改用上限调整**前**的模型原始几何判定，盈亏比上下限仍在调整后几何上检查
+  2. **凭据明文进日志/记录**：`requests` 的 `ConnectionError` 把完整 URL（含飞书 `bot/v2/hook/<TOKEN>`）塞进异常串 → 明文写进 `logs/pa_agent.log`；`JsonlFormatter` 不脱敏 `exc`；`PendingWriter._api_key` 构造后不刷新，换密钥后新 key 明文落盘。修复：`mask_secret` 升级为进程级 `SecretRegistry`（`register_secret`/`scrub`），两个 formatter 统一过滤，`register_settings_secrets()` 在载入/保存时登记全部凭据，落盘时一并 scrub
+  3. **KV cache 命中率恒读 0**：`_extract_cached_prompt_tokens` 只认两种字段名，遇到 `cache_read_input_tokens`/顶层 `cached_tokens`/`model_extra` 一律返回 0（实测 0.18%），使 prefix-chain 优化收益不可见。修复：补齐各形状
+  4. **大 `analysis_bar_count` 直接 400**：允许至 5000 根，但提示词约 283 字符/根，约 2500 根即撑爆 1M 上下文。修复：`submit()` 发起任何 API 调用前做 context-budget 预检，超限 fail fast
+- **文件**：`pa_agent/util/{trade_metrics,mask_secret,logging}.py`、`pa_agent/ai/deepseek_client.py`、`pa_agent/orchestrator/two_stage.py`、`pa_agent/notify/feishu_notifier.py`、`pa_agent/records/pending_writer.py`、`web/api/routes_settings.py`
+- **验证**：新增 `tests/unit/test_secret_scrubbing.py`(12)、`test_context_budget_and_cache_meter.py`(13)，`test_trade_metrics_validation.py` 补 4 例 RR 上限回归。全量 `tests/unit` 对基线：新增失败 0，修复 2
+
 ### 2. 补齐 GUI→WebUI 移植缺口：下单推送 / 交易落盘 / 失效开关
 
 - **问题**：对照 `pa_agent/gui/` 逐模块审计 WebUI 后发现，桌面 GUI 的下单信号推送与交易记录在 Web 端**完全没有实现**
