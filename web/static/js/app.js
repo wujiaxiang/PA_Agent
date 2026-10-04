@@ -5287,12 +5287,18 @@ async function loadExperienceLibrary() {
       const win = e.result === 'win';
       const pnl = typeof e.pnl_pct === 'number' ? e.pnl_pct : null;
       const pats = (e.detected_patterns || []).slice(0, 4).join('、');
+      // 枚举一律中英展示：中文给操作者看，括号里的 raw 值用于和提示词、
+      // 落盘目录名对账。缺 label 时（老数据）回退到裸值。
+      const cyc = e.cycle_label || e.cycle_position || '';
+      const dir = e.direction_label || e.direction || '';
+      const res = e.case_type_label || (win ? '盈利 (win)' : '亏损 (loss)');
       return `<div class="exp-item ${win ? 'is-success' : 'is-failure'}">
         <div class="exp-head">
           <span class="exp-symbol">${escapeHtml(e.symbol || '—')}</span>
           <span class="exp-tag">${escapeHtml(e.timeframe || '')}</span>
-          <span class="exp-tag">${escapeHtml(e.cycle_position || '')}</span>
-          <span class="exp-tag ${win ? 'win' : 'loss'}">${win ? '盈利' : '亏损'}</span>
+          ${cyc ? `<span class="exp-tag" title="${escapeHtml(e.cycle_position || '')}">${escapeHtml(cyc)}</span>` : ''}
+          ${dir ? `<span class="exp-tag">${escapeHtml(dir)}</span>` : ''}
+          <span class="exp-tag ${win ? 'win' : 'loss'}">${escapeHtml(res)}</span>
           ${e.confidence != null ? `<span class="exp-tag">置信 ${e.confidence}</span>` : ''}
           ${pnl != null ? `<span class="exp-pnl ${pnl >= 0 ? 'pos' : 'neg'}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</span>` : ''}
         </div>

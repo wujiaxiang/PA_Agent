@@ -103,6 +103,11 @@ class ExperienceWriter:
         ``pnl_pct`` is rounded to 2 decimals and omitted when unknown.
         """
         content: dict[str, Any] = {
+            # Previously cycle_position only reached the *directory* name, so
+            # every entry's JSON came back with cycle_position == null and the
+            # reader had to fall back to its parent folder. Persist it so an
+            # entry file is self-describing.
+            "cycle_position": str(cycle_position or ""),
             "direction": str(direction or ""),
             "detected_patterns": list(detected_patterns or []),
             "confidence": int(round(float(confidence or 0))),

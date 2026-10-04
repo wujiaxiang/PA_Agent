@@ -6,6 +6,13 @@ import logging
 import time
 from pathlib import Path
 
+from pa_agent.ai.display_labels import (  # noqa: E402
+    bilingual_case_type as _bilingual_case_type,
+    bilingual_cycle as _bilingual_cycle,
+    bilingual_direction as _bilingual_direction,
+    bilingual_result as _bilingual_result,
+)
+
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -326,6 +333,7 @@ async def get_next_close(
 # 库里到底有什么、Stage2 到底检索到了什么。这里补上只读浏览接口。
 
 @router.get("/experience")
+# 枚举中英标签（Qt-free，展示层专用，不影响业务判定）
 async def list_experience(
     cycle: str = Query(default="", description="按市场周期过滤，空=全部"),
     symbol: str = Query(default="", description="按交易对过滤，如 BTCUSDT；空=全部"),
@@ -378,10 +386,16 @@ async def list_experience(
                     success += 1
                 elif case_type == "failure":
                     failure += 1
+                cycle_pos = getattr(e, "cycle_position", None) or content.get("cycle_position") or name
                 all_rows.append({
                     "filename": getattr(e, "filename", ""),
                     "case_type": case_type,
-                    "cycle_position": getattr(e, "cycle_position", name),
+                    "cycle_position": cycle_pos,
+                    # 枚举同时给出中英标签：中文给操作者看，raw 给提示词/落盘路径对齐
+                    "cycle_label": _bilingual_cycle(cycle_pos),
+                    "direction_label": _bilingual_direction(content.get("direction", "")),
+                    "result_label": _bilingual_result(content.get("result", "")),
+                    "case_type_label": _bilingual_case_type(case_type),
                     "timestamp_ms": getattr(e, "timestamp_ms", 0),
                     "symbol": content.get("symbol", ""),
                     "timeframe": content.get("timeframe", ""),
