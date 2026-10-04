@@ -19,6 +19,22 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 15. 追问升为独立 tab + 经验库按交易对/周期过滤
+
+- **追问 → 独立顶层 tab**（置于「决策树」之后）：此前追问挂在「分析」面板最末尾的 `.stream-footer`，必须滚过整段流式输出才能看到输入框，而追问恰是最常用的主交互之一
+  - 顺序现为：分析 / 预测 / 决策树 / **追问** / 决策 / 经验库
+  - 消息区独立成 `#chat-messages` 占满可滚动高度，输入框常驻底部（补 `padding-bottom: 6px`，此前底边紧贴视口）
+  - 新增「锚定分析」上下文条，显示当前追问挂在哪次分析上（品种·周期·订单类型·时间）—— 切品种/回看历史会换锚点，不显示出来用户会以为还在追问上一份结论
+  - `appendChatMsg` / `clearChatOutput` 改指新容器（保留 `#tab-chat` 兜底）
+- **修一个连带 bug**：**demo 下追问输入框始终禁用**。`enableChat()` 只在真实分析的 `done` 事件里调用，demo 路径漏了，等于演示时这条主交互根本用不了。demo 收尾处补 `enableChat()` + `renderChatContext()`
+- **经验库先做一层过滤**：
+  - `GET /api/experience` 新增 `symbol` / `timeframe`，按**条目内容**过滤（同一代码会出现在不同市场周期下，只看文件名不够）；`counts` 汇总同步跟随过滤，否则前端数字对不上
+  - 同时返回全量 `symbols` / `timeframes` 供前端下拉
+  - 默认勾选「跟随当前」，只显示当前订阅的品种+周期；用户手动选下拉会自动取消跟随，避免两控件互相覆盖
+  - 摘要行显示 范围 · 条数 · 盈利/亏损 · 胜率
+- **文件**：`web/static/{index.html,js/app.js,css/style.css}`、`web/api/routes_data.py`
+- **验证**：demo 加载后输入框可用、锚定条显示 `BTCUSDT · 1d 限价单`、真实发送收到 AI 回复（user+assistant 两条）；经验库跟随当前 `BTCUSDT 1h`→「共 0 条」（库中仅 1d/4h，正确空集且有引导文案），取消跟随→「共 36 条（盈利 18 / 亏损 18，胜率 50%）」；无 JS 错误；全量 `tests/unit` 对基线新增失败 0
+
 ### 14. 接入 TradingView scanner：全市场实时品种搜索
 
 - **修正上一轮的结论**：失效的只有 tvDatafeed 自带的 `search_symbol()`，而 `scanner.tradingview.com` 走另一条路径、无需登录，实测完全可用。实测各市场 `totalCount`：crypto 64412 / futures 52721 / america 20069 / china 7476 / forex 6333 / hongkong 3060 / global 456108（`symbol-search.tradingview.com` v3 则是 403，已弃用）

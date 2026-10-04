@@ -149,12 +149,15 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **未了结的计划不写入**：触及任一价位前超时（`experience_max_wait_s`，默认 24h）即丢弃
 - **触发点**：`order_followup.spawn_post_order_followup()`（与通知同一入口，AGENTS.md 单一入口约束）
 - **必须 daemon 线程 + 分步 try/except**：轮询数据源可能失败/超时，任何异常只记 warning，**绝不能冒泡进分析主流程**
+- **经验库浏览必须先过滤**：`GET /api/experience` 支持 `symbol` / `timeframe`，按**条目内容**过滤而非文件名（同一代码会出现在不同市场周期下）。前端默认勾选「跟随当前订阅」；用户手动选下拉会自动取消跟随，避免两控件互相覆盖。`cycles` 汇总计数必须跟着过滤，否则前端显示的数字对不上
 - **读取端默认必须 > 0**：`experience_max_entries` 默认 0 会让整条检索链路空跑；新增/修改 PromptSettings 时注意该默认值
 
 ### 侧边栏 tab 分组与子 tab
 
-- **顶层只有 5 个 tab**：分析 / 预测 / 决策树 / 决策 / 经验库（顺序固定，不可随意调换）
+- **顶层只有 6 个 tab**：分析 / 预测 / 决策树 / 追问 / 决策 / 经验库（顺序固定，不可随意调换）
 - **两组通过面板内子 tab 合并**：「分析」= 流式分析(`stream`) + 原始数据(`raw`) + 文件与经验(`debug`)；「决策树」= 问答回放(`tree`) + 流程图(`tree-viz`)
+- **只有单视图的面板不要画子 tab 条**：单项子 tab 是纯噪音（如「追问」）
+- **任何解锁「追问」的路径都必须调 `enableChat()` + `renderChatContext()`**：此前只在真实分析的 `done` 事件里调，demo 路径漏掉 → demo 下追问输入框永远禁用。新增演示/回放/加载入口时务必一并调用
 - **子 tab 不做 DOM 嵌套**：两组面板是同级兄弟、共享侧边栏同一槽位（`.tab-panel` 默认 `display:none`，`.active` 才占位）。切换时必须在**同组全部面板**间转移 `.active`，否则会出现两个面板同时占位
 - **品种搜索走 scanner，不要用 tvDatafeed 的 search_symbol**：后者对任意查询都返回非 JSON（已失效）。可用的是 `search_tv_symbols()`（POST `scanner.tradingview.com/{market}/scan`，无需登录），覆盖 crypto 64k / futures 52k / america 20k / china 7.4k / forex 6.3k / hongkong 3k。`symbol-search.tradingview.com` v3 已 403 不可用
 - **scanner 交易所名与我们的不一致**：`GATEIO` 在 scanner 里叫 **GATE**（见 `TV_SEARCH_EXCHANGE_ALIASES`），漏了映射会一个都搜不到
