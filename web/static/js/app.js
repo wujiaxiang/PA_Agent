@@ -132,6 +132,10 @@ function trendLabelColor(label) {
 let chart, candleSeries, emaSeries, emaSeriesMap;
 let lastRecord = null;
 let isReplaying = false;
+// 回看历史时暂存的「实时订阅」，供「返回实时」恢复。
+// 此前回看只重渲染侧边栏、完全不碰图表，图上仍是当前品种，
+// 且切到别的品种的历史记录时 K 线与决策价线完全对不上。
+let _liveSubBeforeReplay = null;
 let currentSettings = null;
 let lastBars = null;           // 最近一次 /api/bars 返回的 K 线（供实时刷新复用）
 let liveRefreshTimer = null;   // 实时刷新 setInterval 句柄（fallback 轮询使用）
@@ -691,13 +695,46 @@ function bindEvents() {
   // 返回实时按钮：清除回看状态，隐藏 badge，切回 stream tab
   const btnBack = $('#btn-back-to-live');
   if (btnBack) {
-    btnBack.addEventListener('click', () => {
+    btnBack.addEventListener('click', async () => {
       hideReplayBadge();
       lastRecord = null;
       $$('.sidebar-tabs .tab').forEach(b => b.classList.remove('active'));
       document.querySelector('.sidebar-tabs .tab[data-tab="stream"]')?.classList.add('active');
       $$('.tab-panel').forEach(p => p.classList.remove('active'));
       $('#tab-stream').classList.add('active');
+      // 回看期间主图被切到了历史记录的品种，这里必须恢复实时订阅，
+      // 否则「返回实时」只是切了 tab，K 线还停在历史品种上。
+      const live = _liveSubBeforeReplay;
+      _liveSubBeforeReplay = null;
+      if (!live || !live.symbol) return;
+      const nowSym = $('#ds-symbol')?.value || '';
+      const nowTf = $('#ds-timeframe')?.value || '';
+      if (nowSym === live.symbol && nowTf === live.timeframe) {
+        clearOverlays(candleSeries);
+        return;
+      }
+      try {
+        if (window._indicatorsAPI) window._indicatorsAPI.clearAllData();
+        const wasLive = $('#cb-live-refresh')?.checked;
+        if (wasLive) stopSSEBarsStream();
+        await API.post('/api/subscribe', {
+          kind: 'tradingview',
+          symbol: live.symbol,
+          timeframe: live.timeframe,
+          exchange: live.exchange,
+        }, { timeout: 15000 });
+        await loadBars();
+        if (wasLive) startSSEBarsStream();
+        clearOverlays(candleSeries);
+        const hid = $('#ds-symbol'); if (hid) hid.value = live.symbol;
+        const shown = $('#ds-symbol-search'); if (shown) shown.value = live.symbol;
+        const tf = $('#ds-timeframe'); if (tf) tf.value = live.timeframe;
+        const ex = $('#ds-exchange'); if (ex && live.exchange) ex.value = live.exchange;
+        showToast(`已返回实时：${live.symbol} ${live.timeframe}`, 'success');
+      } catch (err) {
+        console.error('backToLive:', err);
+        showToast('返回实时失败，请手动切换品种', 'error');
+      }
     });
   }
   // Demo 按钮：加载 Demo 数据体验 UI
@@ -4600,6 +4637,8 @@ async function replayRecord(recordId) {
     if (typeof renderTreeViz === 'function') renderTreeViz(lastRecord);
     // Phase A Task 1.2：补充实时 tab 历史回显
     if (typeof renderStreamFromRecord === 'function') renderStreamFromRecord(lastRecord);
+    // 联动主图：切到该记录的品种/周期，绘制入场/止损/止盈
+    await applyReplayChart(data);
     // 显示回看 badge
     showReplayBadge(data);
     // 关闭 popover
@@ -4614,6 +4653,98 @@ async function replayRecord(recordId) {
   } catch (e) {
     console.error('replayRecord:', e);
     showToast('加载历史记录失败', 'error');
+  }
+}
+
+// ── 回看联动主图 ────────────────────────────────────────────────────────────
+// 回看一条历史记录时，主图必须跟着切到**该记录**的品种/周期，并画出当时的
+// 入场/止损/止盈横线。此前 replayRecord 只重渲染侧边栏，图表原封不动，
+// 于是：图上是当前品种 K 线、面板里是历史记录的数字，两边完全对不上。
+async function applyReplayChart(record) {
+  const meta = record?.meta || {};
+  const symbol = record?.symbol || meta.symbol;
+  const timeframe = record?.timeframe || meta.timeframe;
+  const exchange = meta.exchange || '';
+  if (!symbol || !timeframe) return;
+
+  try {
+    // 暂存当前实时订阅（仅第一次回看时存，后续在同品种间切换不覆盖）
+    if (!_liveSubBeforeReplay) {
+      // 取 settings 的真实订阅状态；工具栏标签可能与之不一致。
+      const g = currentSettings?.general || {};
+      _liveSubBeforeReplay = {
+        symbol: g.last_symbol || $('#ds-symbol')?.value || '',
+        timeframe: g.last_timeframe || $('#ds-timeframe')?.value || '',
+        exchange: g.last_tradingview_exchange || $('#ds-exchange')?.value || '',
+      };
+    }
+
+    // 记录 instrument 后**无条件**重新订阅，不按工具栏标签做「无需切换」判断。
+    // 标签与后端订阅可能不一致（例如别处直接调过 /api/subscribe），
+    // 那种情况下按标签判断会跳过切换，导致图上仍是别的品种，
+    // 而面板里显示历史记录的数字 —— 两边彻底对不上。
+    if (window._indicatorsAPI) window._indicatorsAPI.clearAllData();
+    const wasLive = $('#cb-live-refresh')?.checked;
+    if (wasLive) stopSSEBarsStream();
+    await API.post('/api/subscribe', {
+      kind: 'tradingview', symbol, timeframe, exchange,
+    }, { timeout: 15000 });
+    await loadBars();
+    if (wasLive) startSSEBarsStream();
+    // 工具栏同步，避免「图上是 ETHUSDT、工具栏写 NVDA」
+    const hid = $('#ds-symbol'); if (hid) hid.value = symbol;
+    const shown = $('#ds-symbol-search'); if (shown) shown.value = symbol;
+    const tf = $('#ds-timeframe'); if (tf) tf.value = timeframe;
+    const ex = $('#ds-exchange'); if (ex && exchange) ex.value = exchange;
+
+    // 清掉上一次回看留下的横线，再画本次记录的
+    clearOverlays(candleSeries);
+    const overlay = record.decision_overlay || record.stage2_decision || {};
+    setDecisionOverlays(candleSeries, overlay);
+    setDirectionMarker(candleSeries, overlay);
+    _renderTradeLegend(overlay);
+
+    // 视窗对齐到「分析当时」：以该记录最后一根已收盘 bar 为锚。
+    // 注意：老记录的分析时间可能已不在当前加载的数据范围内
+    // （例如回看 8 月的 ETH，而当前只有 10 月的 K 线），
+    // 此时若硬对齐到最近的一根，会被钳到序列边界、视窗退化成开头两三根
+    // 超宽 K 线。所以锚点落在数据范围外时改为回退到近期窗口。
+    try {
+      if (lastBars && lastBars.length) {
+        const sorted = [...lastBars].sort((a, b) => a.ts_open - b.ts_open);
+        const firstTs = sorted[0].ts_open / 1000;
+        const lastTs = sorted[sorted.length - 1].ts_open / 1000;
+        const anchorTs = record.last_close_bar_iso
+          ? Date.parse(record.last_close_bar_iso) / 1000
+          : lastTs;
+        const total = sorted.length;
+        if (anchorTs >= firstTs && anchorTs <= lastTs) {
+          let nearest = 0, best = Infinity;
+          sorted.forEach((b, i) => {
+            const d = Math.abs(b.ts_open / 1000 - anchorTs);
+            if (d < best) { best = d; nearest = i; }
+          });
+          const half = Math.min(30, Math.floor(total / 3));
+          const from = Math.max(0, nearest - half);
+          const to = Math.min(total - 1, nearest + half);
+          if (to > from) chart.timeScale().setVisibleLogicalRange({ from, to: to + 0.5 });
+        } else {
+          // 锚点不在范围内：展示最近窗口，价位是否在视野内由图例「视野外」标注说明
+          const win = Math.min(60, total);
+          chart.timeScale().setVisibleLogicalRange({ from: total - win, to: total - 1 + 1.5 });
+        }
+      }
+    } catch (_) { /* 视窗调整失败不影响回看主体 */ }
+
+    // 复盘模式不参与持续分析的自动触发判定，避免回看时误触发新一轮分析
+    const cbKeep = $('#cb-keep-analysis');
+    if (cbKeep && cbKeep.checked) {
+      cbKeep.checked = false;
+      cbKeep.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  } catch (err) {
+    console.error('applyReplayChart:', err);
+    showToast('历史记录图表联动失败，已保留当前视图', 'warning');
   }
 }
 
