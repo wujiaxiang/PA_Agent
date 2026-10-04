@@ -1887,6 +1887,30 @@ button.danger:disabled { background: var(--bg-input); border-color: var(--border
   background: rgba(20, 25, 35, 0.5);
   margin-top: 0;
   padding-top: 8px;
+  /* 追问输入框必须常驻可见：此前它位于 #tab-stream 的滚动流末尾，
+     在 1000px 视口下 top=1011 完全落在折线以下，用户必须滚动才能追问，
+     而「分析完成后继续追问」正是本应用的主交互之一。 */
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  background: #141926;
+  box-shadow: 0 -6px 12px -6px rgba(0, 0, 0, 0.6);
+}
+/* 免责声明 + 追问输入框作为一个整体常驻底部：此前两者都在滚动流末尾，
+   在 1000px 视口下免责声明正好被折线切成一半、输入框完全不可见。 */
+#tab-stream .stream-footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  background: #141926;
+  box-shadow: 0 -6px 12px -6px rgba(0, 0, 0, 0.6);
+}
+#tab-stream .stream-footer .chat-input-row {
+  position: static;   /* 外层 .stream-footer 已负责 sticky */
+  box-shadow: none;
+}
+#tab-stream .stream-footer .disclaimer {
+  background: #141926;
 }
 #tab-stream .chat-input-row input {
   flex: 1;
@@ -3433,3 +3457,42 @@ button.secondary:hover { background: var(--border); }
   border-style: dashed !important;
   opacity: 0.85;
 }
+
+/* 主图指标图例：默认首屏叠加 6 条 EMA（5/10/20/40/60/120）但全程无标识，
+   用户无法区分紫=EMA5 还是橙=EMA10。此处按 series 实际颜色渲染色块 + 周期名，
+   悬停可临时隐藏对应线以单独观察某一条。 */
+#chart-legend {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  max-width: calc(100% - 80px);
+  padding: 5px 9px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #9ca3af;
+  background: rgba(17, 21, 31, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 5px;
+  pointer-events: none;
+  z-index: 3;
+}
+#chart-legend:empty { display: none; }
+#chart-legend .lg-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  pointer-events: auto;
+  cursor: pointer;
+  user-select: none;
+}
+#chart-legend .lg-swatch {
+  width: 11px;
+  height: 2px;
+  border-radius: 1px;
+  flex: none;
+}
+#chart-legend .lg-item.is-off { opacity: 0.35; text-decoration: line-through; }

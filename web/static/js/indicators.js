@@ -412,6 +412,83 @@ function syncAllSubChartsToMain() {
 }
 
 // ── 指标管理 ──────────────────────────────────────────────────────────
+// ── 主图指标图例 ────────────────────────────────────────────────────────────
+// 首屏默认叠加 6 条 EMA（5/10/20/40/60/120），此前完全没有标识，用户无法
+// 区分紫=EMA5 与橙=EMA10。这里读取各 overlay series 的**实际颜色**渲染，
+// 因此 EMA20/40/60/120 的加粗配色与自定义指标都能如实反映。
+const LEGEND_HIDDEN = new Set();
+
+function _overlayLegendItems() {
+  const host = window._indicatorsState.mainChart;
+  const state = window._indicatorsState;
+  if (!host || !state) return [];
+  const items = [];
+  for (const inst of state.activeIndicators) {
+    if (inst._hiddenInLegend) continue;
+    const reg = INDICATOR_REGISTRY[inst.key];
+    if (!reg || reg.type !== 'overlay') continue;
+    for (const out of reg.outputs) {
+      const series = inst._series && inst._series[out.key];
+      if (!series) continue;
+      let color = out.color;
+      try {
+        const applied = series.applyOptions && series.applyOptions();
+        if (applied && applied.color) color = applied.color;
+      } catch (_) { /* applyOptions 无参调用不合法时退回声明色 */ }
+      const periodLabel = inst.params && inst.params.period ? String(inst.params.period) : '';
+      items.push({
+        instId: inst.id,
+        seriesKey: out.key,
+        label: (periodLabel ? `EMA${periodLabel}` : (out.label || inst.key.toUpperCase())),
+        color: color || '#9ca3af',
+      });
+    }
+  }
+  return items;
+}
+
+function _renderOverlayLegend() {
+  const box = document.getElementById('chart-legend');
+  if (!box) return;
+  const items = _overlayLegendItems();
+  if (!items.length) { box.innerHTML = ''; return; }
+
+  const sig = items.map(i => `${i.instId}:${i.seriesKey}:${i.color}:${i.label}`).join('|')
+    + '#' + [...LEGEND_HIDDEN].sort().join(',');
+  if (box.dataset.sig === sig) return;
+  box.dataset.sig = sig;
+
+  box.innerHTML = '';
+  for (const it of items) {
+    const el = document.createElement('span');
+    el.className = 'lg-item' + (LEGEND_HIDDEN.has(it.instId) ? ' is-off' : '');
+    el.title = LEGEND_HIDDEN.has(it.instId) ? '点击恢复显示' : '点击临时隐藏该线';
+    const sw = document.createElement('span');
+    sw.className = 'lg-swatch';
+    sw.style.background = it.color;
+    const tx = document.createElement('span');
+    tx.textContent = it.label;
+    el.appendChild(sw);
+    el.appendChild(tx);
+    el.addEventListener('click', () => {
+      if (LEGEND_HIDDEN.has(it.instId)) LEGEND_HIDDEN.delete(it.instId);
+      else LEGEND_HIDDEN.add(it.instId);
+      _applyLegendVisibility();
+      _renderOverlayLegend();
+    });
+    box.appendChild(el);
+  }
+}
+
+function _applyLegendVisibility() {
+  for (const inst of window._indicatorsState.activeIndicators) {
+    const hide = LEGEND_HIDDEN.has(inst.id);
+    for (const k of Object.keys(inst._series || {})) {
+      try { inst._series[k].applyOptions({ visible: !hide }); } catch (_) {}
+    }
+  }
+}
+
 function addIndicator(key, params) {
   const reg = INDICATOR_REGISTRY[key];
   if (!reg) return null;
@@ -1114,6 +1191,9 @@ function initIndicators() {
         } catch (_) {}
       }
     }
+    // MACD 副图：注释里写了「+ MACD 副图」但此前从未真正调用 addIndicator('macd')，
+    // 导致 #chart-osc-wrap 永远 display:none / 高度 0，副图功能形同虚设。
+    addIndicator('macd', {});
     saveIndicatorSettings();
   } else {
     for (const s of saved) {
@@ -1252,7 +1332,10 @@ window._indicatorsAPI = {
   onBarsUpdated(bars) {
     window._lastBars = bars;
     renderAllIndicators(bars);
+    _renderOverlayLegend();
   },
+  // 指标增删改后刷新图例
+  refreshLegend: _renderOverlayLegend,
   // 切换品种/交易所前调用，清空所有指标老数据
   clearAllData: clearAllIndicatorData,
   // 同步所有副图时间轴到主图

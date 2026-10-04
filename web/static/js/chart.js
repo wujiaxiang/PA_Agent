@@ -379,11 +379,19 @@ function setDirectionMarker(candleSeries, decision) {
 //   总数 ≤ 60：每 2 根（1,3,5,...）
 //   总数 ≤ 120：每 3 根（1,4,7,...）
 //   总数 > 120：每 5 根（1,6,11,...）
+// 序号标记密度：密集视图下每个 #N 圆点 + 文本都压在 K 线上。原先按固定档位
+// 取 step，200 根落在 step=5 → 铺出 40 个标记，把蜡烛完全淹没。
+// 改为「标记总数上限 + 整数步长表」：始终保证屏幕标记数 <= 上限，
+// 同时步长取 1/2/5/10/20/… 使标注出来是 #1/#21/#41 这样的整数序号。
+const _SEQ_MAX_MARKERS = 16;
+const _SEQ_NICE_STEPS = [1, 2, 5, 10, 20, 25, 50, 100];
+
 function _seqStep(total) {
-  if (total <= 30) return 1;
-  if (total <= 60) return 2;
-  if (total <= 120) return 3;
-  return 5;
+  if (!Number.isFinite(total) || total <= 0) return 1;
+  for (const step of _SEQ_NICE_STEPS) {
+    if (total / step <= _SEQ_MAX_MARKERS) return step;
+  }
+  return Math.ceil(total / _SEQ_MAX_MARKERS);
 }
 
 function setSeqMarkers(candleSeries, bars) {

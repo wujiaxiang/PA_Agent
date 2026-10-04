@@ -9,7 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="/css/style.css?v=18">
+<link rel="stylesheet" href="/css/style.css?v=20">
 </head>
 <body>
 
@@ -62,6 +62,7 @@
       <div id="chart-main"></div>
       <div id="chart-osc-wrap"></div>
       <div id="tz-label">⏰ 浏览器本地时区</div>
+      <div id="chart-legend" aria-label="主图指标图例"></div>
     </div>
   </div>
   <div id="sidebar">
@@ -238,12 +239,14 @@
       </div>
 
       <div id="stream-usage"></div>
+      <div class="stream-footer">
       <div class="disclaimer">⚠️ AI 分析仅供参考，不构成投资建议</div>
       <div class="chat-input-row">
         <input id="chat-input" type="text" placeholder="分析完成后可继续追问…" disabled>
         <button id="btn-chat-resend" class="compact-btn" title="重发上一条消息" style="display:none">重发</button>
         <button id="btn-chat-send" class="compact-btn" disabled>发送</button>
         <button id="btn-chat-clear" class="compact-btn" title="清空追问消息">清空</button>
+      </div>
       </div>
     </div>
 
@@ -588,9 +591,9 @@
 <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
 <script src="/js/api.js?v=3"></script>
-<script src="/js/chart.js?v=4"></script>
-<script src="/js/indicators.js?v=3"></script>
+<script src="/js/chart.js?v=5"></script>
+<script src="/js/indicators.js?v=4"></script>
 <script src="/js/continuous_gate.js?v=1"></script>
-<script src="/js/app.js?v=28"></script>
+<script src="/js/app.js?v=29"></script>
 </body>
 </html>
