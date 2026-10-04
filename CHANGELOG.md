@@ -19,6 +19,22 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 8. UI 实机排查：追问入口不可见 / MACD 副图缺失 / 指标无图例 / 标记淹没 K 线
+
+- **背景**：改用 Playwright + headless Chromium 对部署实例（`:8005`）实机截图与 DOM 度量排查 UI，而非只读代码
+- **问题**：
+  1. `.chat-input-row` 位于 `#tab-stream` 滚动流末尾，`getBoundingClientRect().top = 1011` > 视口 1000 → **追问输入框完全不可见**，而「分析完成后继续追问」是主交互之一；免责声明同时被折线切成一半（top 982 / bottom 1011）
+  2. `initIndicators()` 注释声明「默认启用 6 条 EMA + MACD 副图」，实际循环中 `addIndicator('macd')` 调用数为 **0** → `#chart-osc-wrap` 永远 `display:none` / 高度 0，副图功能形同虚设
+  3. 首屏叠加 EMA5/10/20/40/60/120 共 6 条线，**全程无任何图例**，无法区分紫=EMA5 与橙=EMA10
+  4. `_seqStep` 按固定档位取步长，200 根落在 step=5 → 屏幕上铺 **40 个** `#N` 圆点+文本，蜡烛被完全遮盖
+- **修复**：
+  - 免责声明 + 输入框包入 `.stream-footer` 整体 sticky 到底部（JS 不依赖二者兄弟关系，仅按 id 取元素）
+  - 补 `addIndicator('macd', {})`，恢复副图
+  - 新增 `#chart-legend`：读取各 overlay series 的**实际 `applyOptions` 颜色**渲染，EMA 加粗配色与自定义指标均如实反映；点击可临时隐藏单条线
+  - `_seqStep` 改为「标记总数上限 16 + 整数步长表 `[1,2,5,10,20,25,50,100]`」，任意长度标记数 ≤16 且序号取整
+- **文件**：`web/static/index.html`、`web/static/css/style.css`、`web/static/js/{chart.js,indicators.js}`
+- **验证**：实机度量 `footer/chatInput/disclaimer.visible = true`（top 915 / 944，bottom 990 ≤ 1000）；`osc-wrap` 变为 `flex` / 140px，MACD(12,26,9) 正常绘制；图例 6 项且像素级验证点击 EMA5 → `#b26cff` 像素 518 → 0 → 恢复 518；序号标记 200 根下由 40 个降至 10 个；页面无 JS 错误。版本号 `chart.js v4→5`、`indicators.js v3→4`、`style.css v18→20`、`app.js v27→29`
+
 ### 7. 持续分析 / 等待收盘 前端联动缺陷修复
 
 - **问题**：持续分析在 SSE 模式下无法真正发起分析；用户取消「等待收盘」勾选会永久挂起等待中的分析
