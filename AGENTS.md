@@ -153,9 +153,12 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 
 ### 侧边栏 tab 分组与子 tab
 
-- **顶层只有 6 个 tab**：实时分析 / 决策 / 预测 / 决策树 / 原始 / 经验库
-- **两组通过面板内子 tab 合并**：「决策树」= 问答回放(`tree`) + 流程图(`tree-viz`)；「原始」= 原始数据(`raw`) + 文件与经验(`debug`)
+- **顶层只有 5 个 tab**：分析 / 预测 / 决策树 / 决策 / 经验库（顺序固定，不可随意调换）
+- **两组通过面板内子 tab 合并**：「分析」= 流式分析(`stream`) + 原始数据(`raw`) + 文件与经验(`debug`)；「决策树」= 问答回放(`tree`) + 流程图(`tree-viz`)
 - **子 tab 不做 DOM 嵌套**：两组面板是同级兄弟、共享侧边栏同一槽位（`.tab-panel` 默认 `display:none`，`.active` 才占位）。切换时必须在**同组全部面板**间转移 `.active`，否则会出现两个面板同时占位
+- **TradingView 品种搜索不可用**：tvDatafeed 2.1.0 的 `search_symbol()` 对任意查询都返回非 JSON（`get_hist` 正常），与 tvDatafeed `__auth` 失效同源。品种选择只能依赖 `TV_SYMBOL_PRESETS` 内置表，**不要尝试接 TV 搜索**
+- **内置表完整性由测试守护**：`tests/unit/test_symbol_presets.py` 要求每个交易所 ≥8 个品种、无重复、且**每个品种都必须有中文名**。新增品种必须同步 `TV_SYMBOL_NAMES`，否则测试会失败
+- **结果项禁止内联 onclick**：品种代码/名称来自外部数据，字符串插值进 HTML 有注入风险且遇引号即破坏结构。统一用 `data-symbol` + 事件委托
 - **按成员反查分组**：`SUBTAB_GROUPS[target]` 在 target 不是组键时查不到，必须 `find(g => g.includes(target))`——曾因此导致切到流程图时 `#tab-tree` 未被移除
 - **控件 id 必须保持不变**（`#btn-tree-viz-*`、`#tab-tree-viz`、`#tab-debug` 等），否则既有 JS 引用要大面积改动
 

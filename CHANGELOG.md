@@ -19,6 +19,21 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 13. tab 重排为 5 个 + 交易对选择器重做
+
+- **tab 顺序**（按用户指定）：分析 / 预测 / 决策树 / 决策 / 经验库。「原始」不再是顶层 tab，降级为「分析」面板内的子 tab
+  - 分析 → 流式分析(`stream`) / 原始数据(`raw`) / 文件与经验(`debug`)
+  - 决策树 → 问答回放(`tree`) / 流程图(`tree-viz`)
+- **交易对选择器**：先说结论 —— **TradingView 的品种搜索接口在本环境不可用**。tvDatafeed 2.1.0 的 `search_symbol()` 对 BTC/AAPL/XAUUSD/苹果 全部返回 `Expecting value: line 1 column 1`（非 JSON），`get_hist` 正常但 `search_symbol` 已失效，与 AGENTS.md 记录的 tvDatafeed `__auth` 失效同源。故无法真正「抓 tv 的数据」，改为把可达成部分做到最好：
+  1. 内置表 100 → **195 个品种**，覆盖加密/外汇贵金属/美股/A股/港股/指数/期货农产品；此前多数交易所仅 5–15 个且 109 个没有中文名，现全部有中文名
+  2. **真·模糊搜索**：打分排序（完全匹配 > 前缀 > 子串 > 子序列）+ 子序列匹配，「btc」命中「比特币」、「na」命中 Solana/NEAR/Uniswap
+  3. 空查询按分组展示（常用/加密/外汇/美股/A股/港股/期货），聚焦即可浏览
+  4. 超出显示上限时提示「共 N 个匹配」而非静默截断
+  5. **修掉注入风险**：结果项原用内联 `onclick="selectSymbol('${code}')"`，字符串插值遇引号即破坏 HTML → 改为 data 属性 + 事件委托，并补 mousemove 同步键盘高亮
+- **新增测试**：`tests/unit/test_symbol_presets.py`(5) —— 每交易所规模下限、无重复、每个品种必须有中文名、`list_symbols` 未知交易所兜底（当场抓到我自己写重复的 BYBIT `ARBUSDT`）
+- **文件**：`pa_agent/data/tradingview.py`、`web/static/{index.html,js/app.js,css/style.css}`
+- **验证**：全量 `tests/unit` 对基线新增失败 0；实机确认顶层 5 个 tab、子 tab 分组互斥、OANDA 空查询 20 项 / GATEIO 30 项均带分组头
+
 ### 12. 历史回看联动主图 + 侧边栏 tab 收敛为 6 个
 
 - **历史回看联动**：此前 `replayRecord()` 只重渲染侧边栏，**完全不碰图表** —— 不画该记录的 Entry/SL/TP1/TP2 横线、不切换品种。于是回看别的品种的历史记录时，图上是当前品种的 K 线、面板里是历史记录的数字，两边彻底对不上；「返回实时」也只是切 tab，K 线还停在回看的品种上。
