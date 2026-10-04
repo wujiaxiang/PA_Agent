@@ -19,6 +19,16 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 16. 经验库枚举改为中英展示
+
+- 经验条目里的枚举一直是裸英文 snake_case（`trending_tr` / `up` / `success`），对实际操作者不可读；但只给中文又会丢掉提示词、落盘目录名里真正在用的 raw 值，对不上账。改为 `中文 (raw)`
+- 新增 `pa_agent/ai/display_labels.py`（Qt-free，展示层专用）：周期 / 方向 / 结果 / 案例类型四张对照表 + `label_for()`。方向表同时覆盖 AI 决策侧别名（`long/bull/bullish`→上涨、`short/bear/bearish`→下跌）
+- **空值返回 `''` 而非「未知 ()」** —— 模板要能整块隐藏该字段；未知枚举回退为裸值，不吞数据
+- `GET /api/experience` 每条新增 `cycle_label` / `direction_label` / `result_label` / `case_type_label`；`cycle_position` 改为「条目内容 → 目录名」两级回退
+- **顺带修一个写入端不一致**：`ExperienceWriter.save()` 收了 `cycle_position` 参数却只用于拼目录名、**从未写进 JSON** —— 实测库中 36 条的 `cycle_position` 全为 `null`，一直靠 reader 回退父目录名才能显示。现已持久化，条目文件自描述（旧数据仍可回退）
+- **文件**：`pa_agent/ai/display_labels.py`(新)、`pa_agent/records/experience_writer.py`、`web/api/routes_data.py`、`web/static/js/app.js`、`tests/unit/test_display_labels.py`(新，13 例)
+- **验证**：实机显示 `趋势型交易区间 (trending_tr)` / `上涨 (up)` / `盈利 (success)`；无 JS 错误；全量 `tests/unit` 对基线新增失败 0
+
 ### 15. 追问升为独立 tab + 经验库按交易对/周期过滤
 
 - **追问 → 独立顶层 tab**（置于「决策树」之后）：此前追问挂在「分析」面板最末尾的 `.stream-footer`，必须滚过整段流式输出才能看到输入框，而追问恰是最常用的主交互之一

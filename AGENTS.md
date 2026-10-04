@@ -149,6 +149,8 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **未了结的计划不写入**：触及任一价位前超时（`experience_max_wait_s`，默认 24h）即丢弃
 - **触发点**：`order_followup.spawn_post_order_followup()`（与通知同一入口，AGENTS.md 单一入口约束）
 - **必须 daemon 线程 + 分步 try/except**：轮询数据源可能失败/超时，任何异常只记 warning，**绝不能冒泡进分析主流程**
+- **枚举展示统一走 `pa_agent.ai.display_labels`**：格式 `中文 (raw)` —— 中文给操作者读，括号里的 raw 值用于和提示词、落盘目录名对账。新增枚举展示字段必须用 `label_for()`，不要在模板里就地翻译
+- **空值必须返回 `''`**：`label_for('')` 返回空串而非「未知 ()」，这样模板能整块隐藏该字段
 - **经验库浏览必须先过滤**：`GET /api/experience` 支持 `symbol` / `timeframe`，按**条目内容**过滤而非文件名（同一代码会出现在不同市场周期下）。前端默认勾选「跟随当前订阅」；用户手动选下拉会自动取消跟随，避免两控件互相覆盖。`cycles` 汇总计数必须跟着过滤，否则前端显示的数字对不上
 - **读取端默认必须 > 0**：`experience_max_entries` 默认 0 会让整条检索链路空跑；新增/修改 PromptSettings 时注意该默认值
 
