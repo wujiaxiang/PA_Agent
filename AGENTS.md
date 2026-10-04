@@ -156,7 +156,10 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **顶层只有 5 个 tab**：分析 / 预测 / 决策树 / 决策 / 经验库（顺序固定，不可随意调换）
 - **两组通过面板内子 tab 合并**：「分析」= 流式分析(`stream`) + 原始数据(`raw`) + 文件与经验(`debug`)；「决策树」= 问答回放(`tree`) + 流程图(`tree-viz`)
 - **子 tab 不做 DOM 嵌套**：两组面板是同级兄弟、共享侧边栏同一槽位（`.tab-panel` 默认 `display:none`，`.active` 才占位）。切换时必须在**同组全部面板**间转移 `.active`，否则会出现两个面板同时占位
-- **TradingView 品种搜索不可用**：tvDatafeed 2.1.0 的 `search_symbol()` 对任意查询都返回非 JSON（`get_hist` 正常），与 tvDatafeed `__auth` 失效同源。品种选择只能依赖 `TV_SYMBOL_PRESETS` 内置表，**不要尝试接 TV 搜索**
+- **品种搜索走 scanner，不要用 tvDatafeed 的 search_symbol**：后者对任意查询都返回非 JSON（已失效）。可用的是 `search_tv_symbols()`（POST `scanner.tradingview.com/{market}/scan`，无需登录），覆盖 crypto 64k / futures 52k / america 20k / china 7.4k / forex 6.3k / hongkong 3k。`symbol-search.tradingview.com` v3 已 403 不可用
+- **scanner 交易所名与我们的不一致**：`GATEIO` 在 scanner 里叫 **GATE**（见 `TV_SEARCH_EXCHANGE_ALIASES`），漏了映射会一个都搜不到
+- **scanner 返回值必须清洗**：原始结果里大量永续 `.P`、杠杆代币 `.3L/.5S`、外汇券商变体 `.ONE/.PRO.OTMS/.SML…`、wrapped/staked 币。`_is_derivative()` 负责识别；**顺序必须是「先相关性排序、再过滤」**，反过来（先分组后整体重排）等于没过滤
+- **TradingView 港股代码不补前导零**：`0700`/`0388` 等在 TV 上不存在，必须写 `700`/`388`。新增港股代码前先用 scanner 验证
 - **内置表完整性由测试守护**：`tests/unit/test_symbol_presets.py` 要求每个交易所 ≥8 个品种、无重复、且**每个品种都必须有中文名**。新增品种必须同步 `TV_SYMBOL_NAMES`，否则测试会失败
 - **结果项禁止内联 onclick**：品种代码/名称来自外部数据，字符串插值进 HTML 有注入风险且遇引号即破坏结构。统一用 `data-symbol` + 事件委托
 - **按成员反查分组**：`SUBTAB_GROUPS[target]` 在 target 不是组键时查不到，必须 `find(g => g.includes(target))`——曾因此导致切到流程图时 `#tab-tree` 未被移除

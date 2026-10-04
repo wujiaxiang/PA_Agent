@@ -19,6 +19,18 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 14. 接入 TradingView scanner：全市场实时品种搜索
+
+- **修正上一轮的结论**：失效的只有 tvDatafeed 自带的 `search_symbol()`，而 `scanner.tradingview.com` 走另一条路径、无需登录，实测完全可用。实测各市场 `totalCount`：crypto 64412 / futures 52721 / america 20069 / china 7476 / forex 6333 / hongkong 3060 / global 456108（`symbol-search.tradingview.com` v3 则是 403，已弃用）
+- **后端**：新增 `search_tv_symbols(query, exchange, limit)`，POST scanner 并返回 `code`（取 `"EXCHANGE:SYMBOL"` 冒号后的部分，格式与 `TV_SYMBOL_PRESETS` 一致，可直接喂 `get_hist`）、`name`/`description`/`exchange`/`volume`/`close`；新增 `GET /api/tv/search`，网络失败返回 `[]` 而非抛错
+- **交易所映射**：`GATEIO/BINANCE/BYBIT/OKX/BITSTAMP/COINBASE→crypto`、`NASDAQ/NYSE/SP→america`、`OANDA/FOREXCOM→forex`、`SSE/SZSE→china`、`HKEX→hongkong`、`CBOT/CME_MINI→futures`；`GATEIO` 在 scanner 里叫 **GATE**（不映射则一个都搜不到）
+- **结果清洗**（不做完全没法用）：搜索 `BTC` 原本返回 `PUMPBTCUSDT`/`WBTCUSDT`/`BTCUSD.P`；搜索 `EURUSD` 原本返回 `EURUSD.ONE`/`EURUSD.SML.ONE`/`EURUSD.PRO.OTMS`。新增 `_is_derivative()` 识别永续 `.P/.F`、杠杆代币 `.3L/.5S/.2L`、券商变体 `.ONE/.PRO/.ECN/.SML…`、wrapped/staked
+  - **顺序是关键**：必须「先按相关性排序、再过滤衍生品」，反过来（先分组后整体重排）等���没过滤 —— 实现时踩到的坑
+- **顺带修一个真 bug**：内置表港股代码错误。TradingView 港股**不补前导零**，`0700`/`0388`/`0688`/`0961` 在 TV 上不存在、订阅必然失败；已按 scanner 实测校正为 `700`(腾讯)/`388`(港交所)/`688`(中国海外)/`1193`(华润燃气)
+- **前端**：有输入时防抖 260ms 走在线搜索（带竞态守卫，只认最后一次输入）；空查询仍用内置表（瞬时、离线可用、带中文名与分组）；在线失败/无结果自动回退到内置表模糊匹配；结果项右侧显示 `交易所 · code`
+- **文件**：`pa_agent/data/tradingview.py`、`web/api/routes_data.py`、`web/static/js/app.js`、`web/static/index.html`、`tests/unit/test_tv_scanner_search.py`(新，24 例)
+- **验证**：实机 `BTC→BTCUSDT`、`EURUSD→EURUSD`（变体已清）、`AAPL→AAPL`、`600519→贵州茅台`、`700→腾讯控股`（点击选中生效），无 JS 错误；全量 `tests/unit` 对基线新增失败 0
+
 ### 13. tab 重排为 5 个 + 交易对选择器重做
 
 - **tab 顺序**（按用户指定）：分析 / 预测 / 决策树 / 决策 / 经验库。「原始」不再是顶层 tab，降级为「分析」面板内的子 tab
