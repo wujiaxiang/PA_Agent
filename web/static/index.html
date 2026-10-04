@@ -131,7 +131,7 @@
     <div class="sidebar-tabs">
       <button class="tab active" data-tab="stream" data-tip="流式观看两阶段 AI 分析的推理与输出过程">实时分析</button>
       <button class="tab" data-tab="decision" data-tip="AI 最终决策：结论 / 市场状态 / 详细依据（三段式）">决策</button>
-      <button class="tab" data-tab="future" data-tip="下一根 K 线与下一市场周期的概率预测">未来</button>
+      <button class="tab" data-tab="future" data-tip="下一根 K 线与下一市场周期的概率预测">预测</button>
       <button class="tab" data-tab="tree" data-tip="阶段一闸门 + 阶段二策略的逐步问答回放">决策树</button>
       <button class="tab" data-tab="tree-viz" data-tip="决策树流程图可视化（可播放逐步高亮）">可视化</button>
       <button class="tab" data-tab="raw" data-tip="查看 AI 请求/响应原始数据（调试用）">原始</button>
@@ -293,7 +293,7 @@
       <details class="tab-help" data-help-key="future">
         <summary>❓ 这个 tab 是什么？怎么用？</summary>
         <div class="tab-help-content">
-          <p><strong>未来 (Future)</strong> — AI 对未来走势的概率性预测，含两个时间维度，辅助判断进场后的胜率。</p>
+          <p><strong>预测 (Forecast)</strong> — AI 对后续走势的概率性预测，含两个时间维度，辅助判断进场后的胜率。</p>
           <p><strong>两块内容：</strong></p>
           <ul>
             <li>📊 <strong>下一根 K 线预期</strong> — 下根 K 线是阳线/阴线/中性的概率 + 理由
@@ -307,7 +307,7 @@
             </li>
           </ul>
           <p><strong>程序补全标记：</strong>若 AI 未输出但程序根据规则补全，会显示【程序补全】前缀</p>
-          <p><strong>使用建议：</strong>用于判断"现在进场后未来 N 根 K 线胜率如何"；市场不可预测时优先看【决策】tab 的置信度</p>
+          <p><strong>使用建议：</strong>用于判断"现在进场后后续 N 根 K 线胜率如何"；市场不可预测时优先看【决策】tab 的置信度</p>
         </div>
       </details>
       <div id="future-content">尚未进行交易分析</div>
@@ -612,6 +612,6 @@
 <script src="/js/chart.js?v=6"></script>
 <script src="/js/indicators.js?v=5"></script>
 <script src="/js/continuous_gate.js?v=1"></script>
-<script src="/js/app.js?v=33"></script>
+<script src="/js/app.js?v=34"></script>
 </body>
 </html>

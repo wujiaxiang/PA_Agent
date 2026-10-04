@@ -870,7 +870,7 @@ function bindEvents() {
       if (tab === 'experience' && typeof initExperienceTab === 'function') {
         initExperienceTab();
       }
-      // Phase A Task 1.3：决策 / 决策树 / 未来 tab 切回时重新渲染，避免显示陈旧内容
+      // Phase A Task 1.3：决策 / 决策树 / 预测 tab 切回时重新渲染，避免显示陈旧内容
       if (tab === 'decision' && lastRecord && typeof renderDecision === 'function') {
         renderDecision(lastRecord);
       } else if (tab === 'tree' && lastRecord && typeof renderDecisionTree === 'function') {
@@ -3567,7 +3567,7 @@ function renderFuturePanel(record) {
   html += renderNextCyclePrediction(d.next_cycle_prediction);
 
   if (!html) {
-    el.innerHTML = '<div class="future-empty">本轮分析未返回未来走势预期</div>';
+    el.innerHTML = '<div class="future-empty">本轮分析未返回走势预测</div>';
     return;
   }
   el.innerHTML = html;
