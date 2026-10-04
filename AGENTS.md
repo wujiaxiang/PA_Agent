@@ -151,6 +151,22 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **必须 daemon 线程 + 分步 try/except**：轮询数据源可能失败/超时，任何异常只记 warning，**绝不能冒泡进分析主流程**
 - **读取端默认必须 > 0**：`experience_max_entries` 默认 0 会让整条检索链路空跑；新增/修改 PromptSettings 时注意该默认值
 
+### 侧边栏 tab 分组与子 tab
+
+- **顶层只有 6 个 tab**：实时分析 / 决策 / 预测 / 决策树 / 原始 / 经验库
+- **两组通过面板内子 tab 合并**：「决策树」= 问答回放(`tree`) + 流程图(`tree-viz`)；「原始」= 原始数据(`raw`) + 文件与经验(`debug`)
+- **子 tab 不做 DOM 嵌套**：两组面板是同级兄弟、共享侧边栏同一槽位（`.tab-panel` 默认 `display:none`，`.active` 才占位）。切换时必须在**同组全部面板**间转移 `.active`，否则会出现两个面板同时占位
+- **按成员反查分组**：`SUBTAB_GROUPS[target]` 在 target 不是组键时查不到，必须 `find(g => g.includes(target))`——曾因此导致切到流程图时 `#tab-tree` 未被移除
+- **控件 id 必须保持不变**（`#btn-tree-viz-*`、`#tab-tree-viz`、`#tab-debug` 等），否则既有 JS 引用要大面积改动
+
+### 历史回看必须联动主图
+
+- `replayRecord()` 除重渲染侧边栏外，**必须**调用 `applyReplayChart(record)`：切订阅 → `loadBars()` → `clearOverlays` → `setDecisionOverlays` + `setDirectionMarker` + `_renderTradeLegend`
+- **判断是否切换订阅不得依赖工具栏标签**：标签与后端订阅可能不一致（别处直接调过 `/api/subscribe`），按标签判断会跳过切换导致图上是错误品种。回看一律**无条件按记录对齐**
+- **视窗锚点可能在数据范围外**：老记录（如回看 8 月 ETH 而当前只有 10 月数据）硬对齐会被钳到序列边界、视窗退化成两三根超宽 K 线。锚点落在 `[首根, 末根]` 之外时改为回退到近期窗口
+- 「返回实时」必须恢复回看前订阅（取 `settings.general` 真实状态，非标签）并 `clearOverlays`
+- 回看期间应取消「持续分析」勾选，避免复盘时误触发新一轮分析
+
 ### 图表数据唯一入口
 
 - **必须经 `applyBarsToChart(bars)`**：`setBars` + `setSeqMarkers` + 指标重算（`_indicatorsAPI.onBarsUpdated`）+ `__PA_LAST_BAR_TIME__` 更新是**成套**动作

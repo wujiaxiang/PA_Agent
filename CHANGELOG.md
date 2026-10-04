@@ -19,6 +19,21 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 12. 历史回看联动主图 + 侧边栏 tab 收敛为 6 个
+
+- **历史回看联动**：此前 `replayRecord()` 只重渲染侧边栏，**完全不碰图表** —— 不画该记录的 Entry/SL/TP1/TP2 横线、不切换品种。于是回看别的品种的历史记录时，图上是当前品种的 K 线、面板里是历史记录的数字，两边彻底对不上；「返回实时」也只是切 tab，K 线还停在回看的品种上。
+  - 新增 `applyReplayChart(record)`：按记录 meta 无条件 `POST /api/subscribe` → `loadBars()` → `clearOverlays` → `setDecisionOverlays` + `setDirectionMarker` + `_renderTradeLegend`，工具栏品种/周期同步
+  - 「返回实时」恢复回看前订阅并清空叠加层；回看期间自动取消「持续分析」勾选，避免复盘时误触发新一轮分析
+  - 视窗对齐：锚点在数据范围内时以该记录最后一根已收盘 bar 为中心；**落在范围外回退到近期窗口**（回看 8 月 ETH 而当前只有 10 月数据时，硬对齐会被钳到序列边界、视窗退化成两三根超宽 K 线）
+  - 两处实现要点均为实测踩出：切换与否**不能按工具栏标签判断**（标签与后端订阅可能不一致，按标签判断会跳过切换）；暂存的「实时订阅」取 `settings.general` 真实状态而非标签
+  - 实测往返：NVDA 1h(200根 207-238) → 回看 ETHUSDT 1h(201根 2636-2777，价位图例 4 条) → 返回 NVDA 1h(叠加层清空)
+- **tab 收敛**：侧边栏顶层 tab 由 8 个降到 6 个 ——「可视化」并入「决策树」（问答回放 / 流程图）、「调试」并入「原始」（原始数据 / 文件与经验）。
+  - **不做 DOM 嵌套**：两组面板本是同级兄弟、共享侧边栏同一槽位（`.tab-panel` 默认 `display:none`，`.active` 才占位），只需面板内插入子 tab 条、点击时转移 `.active`。`#btn-tree-viz-*`、`#tab-tree-viz` 等 id 全部不变，既有 JS 引用零改动
+  - 修掉实现 bug：最初 `SUBTAB_GROUPS[target]` 按键查组，而组键是 `tree`、target 是 `tree-viz` → 查不到 → 旧面板未移除，切到「流程图」时两面板同时占位。改为按成员反查 `groupOf(target)`
+  - 实测任意时刻只有一个面板可见：决策树→问答 10 张卡片 / 流程图 53 个 SVG 节点；原始→文件与经验正常；经验库 36 条
+- **文件**：`web/static/js/app.js`、`web/static/index.html`、`web/static/css/style.css`
+- **验证**：全量 `tests/unit` 对基线新增失败 0；实机无 JS 错误
+
 ### 11. Demo 决策树/可视化渲染成空壳
 
 - **问题**：Demo 模式下「决策树」卡片只有节点号没有内容，「可视化」节点显示 `→ — —`
