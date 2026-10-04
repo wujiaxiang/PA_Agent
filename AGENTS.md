@@ -147,7 +147,11 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **两阶段状态机**：目录即状态 —— `pending_cases/`（入场瞬间写）→ `success_cases/`(win) / `failure_cases/`(loss) / `unresolved_cases/`（走满 N 根仍未触及，终态无盈亏）。**只有 win/loss 会被 `ExperienceReader` 读到**，未决 setup 不得当成失败经验喂回提示词
 - **写入方唯一入口**：`pa_agent.records.experience_writer.ExperienceWriter`（阶段一 `save_pending_if_resolvable()`，阶段二 `finalize()`/`update_pending_progress()`）。`_status_subdir()` 必须用 `STATUS_DIRS[status]` 取目录名 —— 误把 status 本身当目录名会写出 `pending/` 而非 `pending_cases/`，reader 读不到
 - **阶段二必须自备数据源**：`ctx.data_source` 是订阅绑定的单例，待验证记录可能挂几小时后才结算。共享源仅在 (exchange, symbol, timeframe) **三者全等**时复用，否则为该记录单独建源并用完即弃；再叠一道 `bars_belong_to_instrument()` 价格量级兜底。宁可保持 pending，也绝不用别的标的判定
-- **阶段二接线**：`web/api/experience_verifier.verify_pending()`；`POST /api/experience/verify?scope_current=true` 为 UI 的「验证」按钮
+- **阶段二接线**：`web/api.experience_verifier.verify_pending()`；`POST /api/experience/verify/once` 为 UI 的「验证」按钮与后台调度器的共用入口（走 `experience_scheduler.run_once` 的单飞守卫）
+- **后台结算必须有调度器**：`experience_scheduler` 在 lifespan 启动 daemon 线程。单飞守卫保证 pass 不重叠；范围每轮**重读 settings**（用户随时会切品种）；**只结算当前订阅范围且只用共享数据源** —— 结算其它品种要每条建一个 TradingView 连接，放定时器上会打爆上游
+- **`experience_verify_mode`**：`manual` 只关掉**定时器**，不关掉「验证」按钮（`run_once(force=True)`）
+- **复盘要求案例自描述**：`save_pending()` 必须写 `analysis_context`（阶段一判断要点 + 阶段二决策）与 `bars_snapshot`（入场前后各 20 根）。只有 `pnl_pct` 的记录会让模型事后诸葛亮。压缩时丢 prompt/response 原文，长文本截 600 字、列表取前 12 项
+- **前端解析 SSE 必须归一化 CRLF**：sse_starlette 用 `\r\n\r\n` 分隔事件，按 `\n\n` 切会永远切不出完整事件、流式输出停在「生成中…」
 - **胜负判定**：`evaluate_outcome()` 按后续 K 线判定 TP1/SL 谁先触及。**同一根 bar 同时触及两者时必须按止损计** —— OHLC 无法还原 intrabar 路径，按乐观计会把经验库偏向虚高胜率
 - **未了结的计划不写入**：触及任一价位前超时（`experience_max_wait_s`，默认 24h）即丢弃
 - **触发点**：`order_followup.spawn_post_order_followup()`（与通知同一入口，AGENTS.md 单一入口约束）
@@ -167,7 +171,7 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **顶层只有 6 个 tab**：分析 / 预测 / 决策树 / 决策 / 追问 / 经验库（顺序固定，不可随意调换）
 - **两组通过面板内子 tab 合并**：「分析」= 流式分析(`stream`) + 原始数据(`raw`) + 文件与经验(`debug`)；「决策树」= 问答回放(`tree`) + 流程图(`tree-viz`)
 - **可被 innerHTML 重写的容器不能包固定子节点**：`#chart-legend` 每次刷新指标图例都会被 indicators.js 整体重写，任何常驻子节点（如 `#experience-legend`）必须放在**兄弟**位置，否则会被静默抹掉
-- **写文件前先断言**：本轮两次出现「后续 assert 失败导致 `open(p,'w')` 未执行」，改动静默丢失、部署的是旧模板。编辑脚本必须把断言放在写入之前
+- **写文件前先断言**：本轮三次出现「后续 assert 失败导致 `open(p,'w')` 未执行」，改动静默丢失、部署的是旧模板 —— 有一次 `order_followup` 的整段替换因此没落地，容器里跑的还是旧调用却毫无察觉。编辑脚本必须把断言放在写入之前，并在写入后回读校验关键符号
 - **只有单视图的面板不要画子 tab 条**：单项子 tab 是纯噪音（如「追问」）
 - **任何解锁「追问」的路径都必须调 `enableChat()` + `renderChatContext()`**：此前只在真实分析的 `done` 事件里调，demo 路径漏掉 → demo 下追问输入框永远禁用。新增演示/回放/加载入口时务必一并调用
 - **子 tab 不做 DOM 嵌套**：两组面板是同级兄弟、共享侧边栏同一槽位（`.tab-panel` 默认 `display:none`，`.active` 才占位）。切换时必须在**同组全部面板**间转移 `.active`，否则会出现两个面板同时占位
