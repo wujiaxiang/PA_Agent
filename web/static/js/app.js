@@ -818,6 +818,28 @@ function bindEvents() {
   const symSearchInput = $('#ds-symbol-search');
   if (symSearchInput) {
     symSearchInput.addEventListener('input', handleSymbolSearch);
+    // 事件委托：结果项不再用内联 onclick（字符串插值有注入风险，
+    // 且品种名/代码含引号会直接破坏 HTML）。
+    const symResults = document.querySelector('.symbol-search-results');
+    if (symResults) {
+      symResults.addEventListener('click', (ev) => {
+        const item = ev.target.closest('.symbol-search-item');
+        if (!item) return;
+        const sym = item.dataset.symbol;
+        if (sym) selectSymbol(sym);
+      });
+      symResults.addEventListener('mousemove', (ev) => {
+        const item = ev.target.closest('.symbol-search-item');
+        if (!item) return;
+        const idx = Number(item.dataset.index);
+        if (!Number.isNaN(idx) && idx !== symbolSearchSelectedIndex) {
+          symbolSearchSelectedIndex = idx;
+          symResults.querySelectorAll('.symbol-search-item').forEach(el => {
+            el.classList.toggle('selected', Number(el.dataset.index) === idx);
+          });
+        }
+      });
+    }
     symSearchInput.addEventListener('focus', showSymbolDropdown);
     symSearchInput.addEventListener('keydown', handleSymbolSearchKeydown);
   }
@@ -890,7 +912,7 @@ function bindEvents() {
 
 // ── 面板内子 tab（可视化→决策树、调试→原始）────────────────────────────
   // 两组被合并的面板是同级兄弟、共享同一槽位，切换即在两者间转移 .active。
-  const SUBTAB_GROUPS = [['tree', 'tree-viz'], ['raw', 'debug']];
+  const SUBTAB_GROUPS = [['stream', 'raw', 'debug'], ['tree', 'tree-viz']];
 
   // 组是「所属顶层 tab」，必须按成员反查；
   // 直接 SUBTAB_GROUPS[target] 在 target='tree-viz' 时查不到，
@@ -927,6 +949,8 @@ function bindEvents() {
         renderDebug(lastRecord);
       } else if (target === 'tree' && lastRecord && typeof renderDecisionTree === 'function') {
         renderDecisionTree(lastRecord);
+      } else if (target === 'stream' && lastRecord && typeof renderStreamFromRecord === 'function') {
+        renderStreamFromRecord(lastRecord);
       } else if (target === 'raw' && lastRecord && typeof renderRaw === 'function') {
         renderRaw(lastRecord);
       }
@@ -1552,6 +1576,7 @@ function toggleSymbolInputMode() {
 
 // ── 品类搜索功能 ──────────────────────────────────────────────────────
 let symbolSearchSelectedIndex = 0;
+let symbolMatchTotal = 0;
 
 function parseSymbol(symbol) {
   if (typeof symbol === 'object' && symbol !== null) {
@@ -1575,28 +1600,86 @@ function handleSymbolSearch(e) {
   filterSymbolList(query);
 }
 
+// ── 模糊搜索 ────────────────────────────────────────────────────────────────
+// 之前只做 code/name 的 includes 子串匹配，输「btc」命中不了「比特币」，
+// 输「nas」也只能靠运气。加上：
+//   1) 子串匹配（大小写无关）
+//   2) 子序列匹配（b-t-c 命中 BTCUSDT、苹-果 命中 苹果）
+//   3) 匹配得分排序：前缀 > 子串 > 子序列，同分再按预设顺序
+// 空查询时按分组展示「常用 / 全部」，而不是把一长串平铺。
+
+function _norm(s) { return String(s || '').toLowerCase(); }
+
+function _subseqMatch(needle, haystack) {
+  // 子序列匹配，返回得分（越靠前分越高）或 null
+  let hi = 0, score = 0, lastIdx = -1;
+  for (let i = 0; i < needle.length; i++) {
+    const idx = haystack.indexOf(needle[i], hi);
+    if (idx === -1) return null;
+    score += Math.max(1, 8 - (idx - lastIdx - 1) * 2);
+    lastIdx = idx;
+    hi = idx + 1;
+  }
+  return score;
+}
+
+function scoreSymbol(query, symbol) {
+  const { code, name } = parseSymbol(symbol);
+  const q = _norm(query);
+  if (!q) return { score: 0, tier: 0 };
+  const c = _norm(code), n = _norm(name);
+  if (c === q || n === q) return { score: 1000, tier: 0 };
+  if (c.startsWith(q)) return { score: 900 - c.length, tier: 0 };
+  if (n.startsWith(q)) return { score: 850 - n.length, tier: 0 };
+  if (c.includes(q)) return { score: 700 - c.indexOf(q), tier: 1 };
+  if (n.includes(q)) return { score: 650 - n.indexOf(q), tier: 1 };
+  const cs = _subseqMatch(q, c);
+  if (cs != null) return { score: 400 + cs, tier: 2 };
+  const ns = _subseqMatch(q, n);
+  if (ns != null) return { score: 300 + ns, tier: 2 };
+  return null;
+}
+
+const SYMBOL_GROUPS = [
+  { key: 'crypto',  label: '加密货币', test: s => /USDT|USD$|BTC-|ETH-/.test(s) || /USDT$/.test(s) },
+  { key: 'forex',   label: '外汇 / 贵金属', test: s => /^(XAU|XAG|XPT|EUR|GBP|USD|AUD|NZD|CAD|CHF|JPY|MXN|ZAR|SGD|HKD)/.test(s) },
+  { key: 'usstock', label: '美股 / 指数', test: s => /^[A-Z]{1,5}$/.test(s) || /^(SPX|NDX|VIX|DJI)/.test(s) },
+  { key: 'cn',      label: 'A 股', test: s => /^(6|0|3|2)\\d{5}$/.test(s) },
+  { key: 'hk',      label: '港股', test: s => /^\\d{4}$/.test(s) },
+  { key: 'futures', label: '期货', test: s => /^(ZC|ZS|ZW|ZL|ZM|ZO|LE|GF|HE|ES|NQ|YM|RTY|CL|NG|GC|SI)$/.test(s) },
+];
+
+function groupOfSymbol(code) {
+  const c = String(code || '');
+  for (const g of SYMBOL_GROUPS) { if (g.test(c)) return g.label; }
+  return '其他';
+}
+
 function filterSymbolList(query) {
   const dropdown = $('#symbol-search-dropdown');
   const resultsContainer = $('.symbol-search-results');
   if (!dropdown || !resultsContainer) return;
 
-  let filtered = symbolList;
+  let rows;
   if (query) {
-    const q = query.toLowerCase();
-    filtered = symbolList.filter(s => {
-      const { code, name } = parseSymbol(s);
-      return code.toLowerCase().includes(q) || name.toLowerCase().includes(q);
+    const scored = [];
+    symbolList.forEach((sym, i) => {
+      const r = scoreSymbol(query, sym);
+      if (r) scored.push({ sym, score: r.score, tier: r.tier, i });
     });
+    scored.sort((a, b) => (a.tier - b.tier) || (b.score - a.score) || (a.i - b.i));
+    rows = scored.map(x => ({ sym: x.sym, group: null }));
+    symbolMatchTotal = scored.length;
+  } else {
+    // 空查询：按分组展示，前 12 个视为「常用」
+    rows = symbolList.slice(0, 12).map(sym => ({ sym, group: '常用' }));
+    symbolList.slice(12).forEach(sym => rows.push({ sym, group: groupOfSymbol(sym) }));
+    symbolMatchTotal = symbolList.length;
   }
 
   symbolSearchSelectedIndex = 0;
-  renderSymbolResults(filtered);
-
-  if (filtered.length > 0) {
-    dropdown.removeAttribute('hidden');
-  } else if (!query) {
-    dropdown.removeAttribute('hidden');
-  }
+  renderSymbolResults(rows);
+  dropdown.removeAttribute('hidden');
 }
 
 function showSymbolDropdown() {
@@ -1607,31 +1690,42 @@ function showSymbolDropdown() {
   }
 }
 
-function renderSymbolResults(results) {
+function renderSymbolResults(rows) {
   const container = $('.symbol-search-results');
   if (!container) return;
 
-  if (results.length === 0) {
-    container.innerHTML = '<div class="symbol-search-no-results">未找到匹配的品类</div>';
+  if (!rows.length) {
+    container.innerHTML = '<div class="symbol-search-no-results">未找到匹配的品类 —— '
+      + '可直接输入代码并点「应用」手工订阅</div>';
     return;
   }
 
-  const maxResults = 20;
-  const displayResults = results.slice(0, maxResults);
+  const maxResults = 60;
+  const shown = rows.slice(0, maxResults);
+  const parts = [];
+  if (rows.length > maxResults) {
+    parts.push(`<div class="symbol-search-hint">共 ${symbolMatchTotal} 个匹配，显示前 ${maxResults} 个；可继续输入以缩小范围</div>`);
+  }
 
-  container.innerHTML = displayResults.map((symbol, index) => {
-    const { code, name } = parseSymbol(symbol);
-    const isSelected = index === symbolSearchSelectedIndex;
-    return `
-      <div class="symbol-search-item${isSelected ? ' selected' : ''}" 
-           data-symbol="${code}" 
-           data-index="${index}"
-           onclick="selectSymbol('${code}')">
-        <span class="symbol-name">${name || code}</span>
-        <span class="symbol-code">${code}</span>
-      </div>
-    `;
-  }).join('');
+  let currentGroup = null;
+  let idx = 0;
+  for (const row of shown) {
+    const { code, name } = parseSymbol(row.sym);
+    const isSelected = idx === symbolSearchSelectedIndex;
+    if (row.group && row.group !== currentGroup) {
+      currentGroup = row.group;
+      parts.push(`<div class="symbol-search-group">${escapeHtml(currentGroup)}</div>`);
+    }
+    // 用 data 属性 + 事件委托，不做字符串插值内联 onclick
+    parts.push(`
+      <div class="symbol-search-item${isSelected ? ' selected' : ''}"
+           data-symbol="${escapeHtml(code)}" data-index="${idx}" role="option">
+        <span class="symbol-name">${escapeHtml(name || code)}</span>
+        <span class="symbol-code">${escapeHtml(code)}</span>
+      </div>`);
+    idx += 1;
+  }
+  container.innerHTML = parts.join('');
 }
 
 function selectSymbol(symbol) {

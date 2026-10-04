@@ -3635,3 +3635,40 @@ button.secondary:hover { background: var(--border); }
 }
 /* 子面板是 .tab-panel 的兄弟时，仍需保证滚动容器正常 */
 #tab-tree-viz, #tab-debug { padding-top: 4px; }
+
+/* ── 交易对选择器 ───────────────────────────────────────────────────────────
+   原先只做子串匹配且把结果平铺成一长串；现在改为模糊匹配 + 分组，
+   并在输入框获得焦点时直接给出「常用 / 分组」清单，无需先打字。 */
+.symbol-search-group {
+  padding: 6px 10px 3px;
+  font-size: 10px;
+  letter-spacing: .06em;
+  color: #6b7280;
+  background: rgba(255, 255, 255, 0.02);
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.symbol-search-group:first-child { border-top: none; }
+.symbol-search-hint {
+  padding: 5px 10px;
+  font-size: 11px;
+  color: #8b93a1;
+  background: rgba(41, 98, 255, 0.10);
+  border-bottom: 1px solid rgba(41, 98, 255, 0.2);
+}
+.symbol-search-no-results {
+  padding: 14px 10px;
+  color: #8b93a1;
+  line-height: 1.6;
+}
+.symbol-search-item { cursor: pointer; }
+.symbol-search-item .symbol-name { flex: 1; min-width: 0; }
+.symbol-search-item .symbol-code {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  color: #6b7280;
+  font-size: 11px;
+}
+.symbol-search-item.selected .symbol-code { color: #9ca3af; }
+#ds-symbol-search { min-width: 168px; }
