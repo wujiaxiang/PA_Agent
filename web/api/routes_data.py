@@ -4,8 +4,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -318,3 +319,70 @@ async def get_next_close(
         "seconds_remaining": seconds_remaining,
         "market_closed": False,
     }
+
+
+# ── 经验库浏览 ────────────────────────────────────────────────────────────────
+# 经验库此前只有 reader、没有任何写入方，也没有浏览入口 —— Web 端完全看不到
+# 库里到底有什么、Stage2 到底检索到了什么。这里补上只读浏览接口。
+
+@router.get("/experience")
+async def list_experience(cycle: str = Query(default="", description="按市场周期过滤，空=全部")):
+    """List experience-library entries, newest first, grouped by cycle.
+
+    Scans on a worker thread: the library can hold many JSON files and this
+    endpoint must not block the event loop.
+    """
+    from pa_agent.config.paths import EXPERIENCE_DIR
+
+    def _scan() -> dict:
+        from pa_agent.records.experience_reader import ExperienceReader
+
+        root = Path(EXPERIENCE_DIR)
+        if not root.is_dir():
+            return {"total": 0, "entries": [], "cycles": {}}
+
+        cycles = sorted(
+            d.name for d in root.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        )
+        if cycle:
+            cycles = [c for c in cycles if c == cycle]
+
+        reader = ExperienceReader(experience_dir=root)
+        entries: list[dict] = []
+        counts: dict[str, dict[str, int]] = {}
+        for name in cycles:
+            success = 0
+            failure = 0
+            try:
+                found = reader.read_top5(name)
+            except Exception:  # noqa: BLE001
+                found = []
+            for e in found:
+                content = getattr(e, "content", {}) or {}
+                case_type = getattr(e, "case_type", "")
+                if case_type == "success":
+                    success += 1
+                elif case_type == "failure":
+                    failure += 1
+                entries.append({
+                    "filename": getattr(e, "filename", ""),
+                    "case_type": case_type,
+                    "cycle_position": getattr(e, "cycle_position", name),
+                    "timestamp_ms": getattr(e, "timestamp_ms", 0),
+                    "symbol": content.get("symbol", ""),
+                    "timeframe": content.get("timeframe", ""),
+                    "direction": content.get("direction", ""),
+                    "result": content.get("result", ""),
+                    "pnl_pct": content.get("pnl_pct"),
+                    "confidence": content.get("confidence"),
+                    "summary": content.get("summary", ""),
+                    "detected_patterns": content.get("detected_patterns", []) or [],
+                })
+            counts[name] = {"success": success, "failure": failure}
+
+        entries.sort(key=lambda x: x.get("timestamp_ms") or 0, reverse=True)
+        return {"total": len(entries), "entries": entries, "cycles": counts}
+
+    result = await asyncio.to_thread(_scan)
+    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})

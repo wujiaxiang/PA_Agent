@@ -430,11 +430,17 @@ function _overlayLegendItems() {
     for (const out of reg.outputs) {
       const series = inst._series && inst._series[out.key];
       if (!series) continue;
+      // 必须用 options() 读取当前生效的颜色。
+      // 之前误用 applyOptions() 无参调用想「读回」颜色，但 applyOptions 是写入型
+      // API，无参调用会抛 "Cannot read properties of undefined (reading
+      // 'priceScaleId')"，被 catch 吞掉后退回 INDICATOR_REGISTRY 的声明色
+      // —— 而 ema 的声明色对所有周期都是 #ffc800，于是图例 6 个色块全黄，
+      // 与主图实际使用的 6 种颜色完全对不上。series.options() 才是读取接口。
       let color = out.color;
       try {
-        const applied = series.applyOptions && series.applyOptions();
-        if (applied && applied.color) color = applied.color;
-      } catch (_) { /* applyOptions 无参调用不合法时退回声明色 */ }
+        const cur = series.options && series.options();
+        if (cur && cur.color) color = cur.color;
+      } catch (_) { /* options() 不可用时退回声明色 */ }
       const periodLabel = inst.params && inst.params.period ? String(inst.params.period) : '';
       items.push({
         instId: inst.id,

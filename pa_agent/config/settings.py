@@ -38,7 +38,14 @@ class PromptSettings(BaseModel):
 
     #: When True, Stage 2 loads every strategy .txt (legacy/test behaviour).
     stage2_load_full_strategy_library: bool = False
-    experience_max_entries: int = Field(default=0, ge=0, le=10)
+    # 0 = 不注入经验库。历史默认 0，等于整条经验库读取链路长期空跑；
+    # 现默认 3 条，让已有 59 条经验真正参与 Stage2 提示词组装。
+    experience_max_entries: int = Field(default=3, ge=0, le=10)
+    # 计划在 TP1/SL 之一被触及时自动回写一条经验（闭环的写入端）
+    experience_auto_write: bool = Field(default=True)
+    # 单笔计划最长观察时长（秒）。超时仍未触及 TP/SL 则不写入 ——
+    # 未了结的交易无法说明这个 setup 好不好。
+    experience_max_wait_s: float = Field(default=86400.0, ge=300.0, le=604800.0)
     experience_max_chars_per_entry: int = Field(default=400, ge=100, le=4000)
     #: Inject pattern判定表 + 速查 brief into Stage 1 user prompt (reduces missed tags).
     stage1_inject_pattern_briefs: bool = True

@@ -356,25 +356,39 @@ function resizeChart() {
 }
 
 // ── Data loading ───────────────────────────────────────────────────────
+// ── 图表数据唯一入口 ────────────────────────────────────────────────────────
+// setSeries + setSeqMarkers + 指标重算 + 时间锚点更新，必须**成套**执行：
+// 只调 setBars 会让 EMA/MACD 继续持有上一个品种的数据（实测切到 BTCUSDT 后
+// EMA 仍是 NVDA 的 210~234，而蜡烛是 48000~64000），主图自动缩放把两个数量级
+// 一起纳入，价格轴被拉到 -8000~66000，K 线被压成顶部一条、指标线贴地。
+// demo 上一轮就是这么坏的。这里收口成唯一入口，新增数据源只需调它。
+function applyBarsToChart(bars, opts) {
+  const options = opts || {};
+  const list = Array.isArray(bars) ? bars : [];
+  setBars(candleSeries, list);
+  if (options.seqMarkers !== false) setSeqMarkers(candleSeries, list);
+  if (list.length) {
+    lastBars = list;
+    const sorted = [...list].sort((a, b) => a.ts_open - b.ts_open);
+    window.__PA_LAST_BAR_TIME__ = sorted[sorted.length - 1].ts_open / 1000;
+  }
+  if (window._indicatorsAPI && window._indicatorsAPI.onBarsUpdated) {
+    window._indicatorsAPI.onBarsUpdated(list);
+  }
+  return list;
+}
+
 async function loadBars() {
   try {
     const barCount = parseInt($('#ds-bar-count')?.value) || 100;
     const data = await API.get(`/api/bars?count=${barCount}`);
-    lastBars = data.bars || [];
-    setBars(candleSeries, lastBars);
-    setSeqMarkers(candleSeries, lastBars);
-    // 记录最新一根 bar 的时间，供 setDirectionMarker 锚定
-    if (lastBars.length) {
-      const sorted = [...lastBars].sort((a, b) => a.ts_open - b.ts_open);
-      window.__PA_LAST_BAR_TIME__ = sorted[sorted.length - 1].ts_open / 1000;
-    }
+    applyBarsToChart(data.bars || []);
     // 休市检测：bars[0].closed == true 表示无 forming bar（市场已收盘）
     // 清空 sseNextCloseTs 避免取模算法返回错误未来值，触发「休市中」显示
     if (lastBars.length && lastBars[0] && lastBars[0].closed === true) {
       sseNextCloseTs = 0;
     }
     // 通知指标库重新计算并渲染（含 EMA/SMA/BOLL/RSI/MACD/KDJ 等）
-    if (window._indicatorsAPI) window._indicatorsAPI.onBarsUpdated(lastBars);
     fitView(chart, 20, lastBars.length);
     // 主图 fitView 后同步副图时间轴
     if (window._indicatorsAPI && window._indicatorsAPI.syncSubCharts) {
@@ -394,14 +408,12 @@ async function refreshBarsOnly() {
   try {
     const data = await API.get('/api/bars?count=100');
     lastBars = data.bars || [];
-    setBars(candleSeries, lastBars);
-    setSeqMarkers(candleSeries, lastBars);
+    applyBarsToChart(lastBars);
     if (lastBars.length) {
       const sorted = [...lastBars].sort((a, b) => a.ts_open - b.ts_open);
       window.__PA_LAST_BAR_TIME__ = sorted[sorted.length - 1].ts_open / 1000;
     }
     // 通知指标库重新计算并渲染
-    if (window._indicatorsAPI) window._indicatorsAPI.onBarsUpdated(lastBars);
     liveRefreshLastTs = Date.now();
     updateLiveRefreshStatus();
   } catch (e) {
@@ -718,20 +730,9 @@ function bindEvents() {
         // 区间上（实测 NVDA 206-240 的图上出现 60413-68509 的决策价），
         // 「决策 ↔ K 线」彻底脱钩。
         if (data.kline_data && data.kline_data.length) {
-          setBars(candleSeries, data.kline_data);
-          lastBars = data.kline_data;
-          // 必须通知指标层重算：loadBars() 走的是 setBars + onBarsUpdated 两步，
-          // 漏掉 onBarsUpdated 会让 EMA/MACD 继续持有**上一个品种**的数据
-          // （实测切到 BTCUSDT 1d 后 EMA 仍是 NVDA 的 210~234），
-          // 而主图自动缩放会把两个数量级一起纳入，价格轴被拉到 -8000~66000，
-          // K 线被压成顶部一条、指标线贴地 —— 图表彻底失真。
-          if (window._indicatorsAPI && window._indicatorsAPI.onBarsUpdated) {
-            window._indicatorsAPI.onBarsUpdated(data.kline_data);
-          }
-          // setDirectionMarker 依赖 __PA_LAST_BAR_TIME__ 定位箭头；
-          // 不更新的话它仍是切换前的品种时间戳，落在新序列之外会被 LWC 拒绝。
-          const tsSorted = [...data.kline_data].sort((a, b) => a.ts_open - b.ts_open);
-          window.__PA_LAST_BAR_TIME__ = tsSorted[tsSorted.length - 1].ts_open / 1000;
+          // applyBarsToChart 内部成套完成：蜡烛 + 序号标记 + 指标重算 + 时间锚点。
+          // （曾漏掉指标重算，导致 EMA/MACD 继续持有上一个品种的数据。）
+          applyBarsToChart(data.kline_data);
           chart.timeScale().fitContent();
           // 工具栏同步 demo 的品种/周期，避免「图上是 BTCUSDT、工具栏写 NVDA」。
           // #ds-symbol 是隐藏域（真实订阅状态），#ds-symbol-search 是可见展示框，
@@ -864,6 +865,10 @@ function bindEvents() {
       // Phase D Task 4 SubTask 4.10：切到「决策树可视化」tab 时按需重渲染
       if (tab === 'tree-viz' && lastRecord) {
         renderTreeViz(lastRecord);
+      }
+      // 「经验库」tab：首次进入或再次进入都拉一次最新库内容
+      if (tab === 'experience' && typeof initExperienceTab === 'function') {
+        initExperienceTab();
       }
       // Phase A Task 1.3：决策 / 决策树 / 未来 tab 切回时重新渲染，避免显示陈旧内容
       if (tab === 'decision' && lastRecord && typeof renderDecision === 'function') {
@@ -1695,11 +1700,8 @@ function startSSEBarsStream() {
         // sorted 提前定义，避免 bars 为空时 L1518 引用未定义变量
         const sorted = bars.length ? [...bars].sort((a, b) => a.ts_open - b.ts_open) : [];
         if (bars.length) {
-          lastBars = bars;
-          setBars(candleSeries, bars);
-          setSeqMarkers(candleSeries, bars);
-          if (window._indicatorsAPI) window._indicatorsAPI.onBarsUpdated(bars);
-          // 更新最新一根 bar 的时间锚点
+          // 成套更新（蜡烛 + 序号标记 + 指标重算 + 时间锚点）
+          applyBarsToChart(bars);
           if (sorted.length) window.__PA_LAST_BAR_TIME__ = sorted[sorted.length - 1].ts_open / 1000;
         }
         // 解析后端附带的 next_close_ts（新 forming bar 的收盘时间戳，ms）
@@ -4872,6 +4874,74 @@ function exportRecordJson() {
 }
 
 // 临时 Toast 提示（不依赖 toast-container，使用简易浮层）
+// ── 经验库浏览 ──────────────────────────────────────────────────────────────
+// 经验库此前没有写入方也没有浏览入口，这里是只读面板。
+async function loadExperienceLibrary() {
+  const list = $('#exp-list');
+  const summary = $('#exp-summary');
+  if (!list) return;
+  const sel = $('#exp-cycle');
+  const cycle = sel && sel.value ? sel.value : '';
+  list.innerHTML = '<div class="exp-empty">加载中…</div>';
+  try {
+    const d = await API.get(`/api/experience${cycle ? `?cycle=${encodeURIComponent(cycle)}` : ''}`);
+    const entries = d.entries || [];
+    const counts = d.cycles || {};
+    if (summary) {
+      const total = Object.values(counts).reduce(
+        (a, c) => a + (c.success || 0) + (c.failure || 0), 0);
+      summary.textContent = `共 ${total} 条 · 当前筛选 ${entries.length} 条`;
+    }
+    if (!entries.length) {
+      list.innerHTML = '<div class="exp-empty">该周期暂无经验条目。'
+        + '出现下单信号后，系统会在 TP1/SL 触达后自动回写。</div>';
+      return;
+    }
+    list.innerHTML = entries.map((e) => {
+      const win = e.result === 'win';
+      const pnl = typeof e.pnl_pct === 'number' ? e.pnl_pct : null;
+      const pats = (e.detected_patterns || []).slice(0, 4).join('、');
+      return `<div class="exp-item ${win ? 'is-success' : 'is-failure'}">
+        <div class="exp-head">
+          <span class="exp-symbol">${escapeHtml(e.symbol || '—')}</span>
+          <span class="exp-tag">${escapeHtml(e.timeframe || '')}</span>
+          <span class="exp-tag">${escapeHtml(e.cycle_position || '')}</span>
+          <span class="exp-tag ${win ? 'win' : 'loss'}">${win ? '盈利' : '亏损'}</span>
+          ${e.confidence != null ? `<span class="exp-tag">置信 ${e.confidence}</span>` : ''}
+          ${pnl != null ? `<span class="exp-pnl ${pnl >= 0 ? 'pos' : 'neg'}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</span>` : ''}
+        </div>
+        <div class="exp-summary">${escapeHtml(e.summary || '')}</div>
+        ${pats ? `<div class="exp-patterns">形态：${escapeHtml(pats)}</div>` : ''}
+      </div>`;
+    }).join('');
+  } catch (err) {
+    list.innerHTML = `<div class="exp-empty">加载失败：${escapeHtml(String(err.message || err))}</div>`;
+  }
+}
+
+async function initExperienceTab() {
+  const sel = $('#exp-cycle');
+  if (sel && !sel.dataset.filled) {
+    try {
+      const d = await API.get('/api/experience');
+      const cycles = Object.keys(d.cycles || {});
+      sel.innerHTML = '<option value="">全部周期</option>'
+        + cycles.map(c => {
+          const n = (d.cycles[c].success || 0) + (d.cycles[c].failure || 0);
+          return `<option value="${escapeHtml(c)}">${escapeHtml(c)} (${n})</option>`;
+        }).join('');
+      sel.dataset.filled = '1';
+      sel.addEventListener('change', loadExperienceLibrary);
+    } catch (_) { /* 目录不存在时静默 */ }
+  }
+  const btn = $('#btn-exp-refresh');
+  if (btn && !btn.dataset.bound) {
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', loadExperienceLibrary);
+  }
+  loadExperienceLibrary();
+}
+
 function showToast(message, type) {
   // 复用已有 toast-container（HTML 中已定义，CSS 定位在右下角 z-index:9999）
   // type: 'success' | 'warning' | 'error' | undefined（默认中性灰）

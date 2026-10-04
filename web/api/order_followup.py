@@ -173,6 +173,26 @@ def spawn_post_order_followup(
         logger.warning("order opportunity gate failed: %s", exc)
         return False
 
+    # 经验库闭环：下单信号时同步起一个观察线程，等 TP1/SL 之一被触发后
+    # 把本次分析作为一条经验写回 experience/，让后续 Stage1/Stage2 能检索到。
+    # 与通知线程同样：失败只记 warning，绝不冒泡进分析主流程。
+    try:
+        from web.api.experience_watcher import spawn_experience_watch
+
+        ds = getattr(record, "_data_source", None) or getattr(frame, "data_source", None)
+        if ds is not None:
+            spawn_experience_watch(
+                data_source=ds,
+                settings=settings,
+                symbol=symbol,
+                timeframe=timeframe,
+                stage1=dict(getattr(record, "stage1_diagnosis", None) or {}),
+                stage2_flat=_flat_stage2(record),
+                last_closed_ts_open_ms=0,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("experience watch spawn failed: %s", exc)
+
     try:
         threading.Thread(
             target=_run_followup,

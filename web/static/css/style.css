@@ -3553,3 +3553,48 @@ button.secondary:hover { background: var(--border); }
 }
 #trade-legend .tl-out.up { color: #26a69a; border-color: rgba(38,166,154,.35); }
 #trade-legend .tl-out.down { color: #ef5350; border-color: rgba(239,83,80,.35); }
+
+/* ── 经验库 tab ─────────────────────────────────────────────────────────────
+   经验库此前既无写入方也无浏览入口，Web 端完全看不到它。此处提供只读浏览：
+   每个周期一条汇总 + 成败样本卡片（结果/盈亏/置信度/形态）。 */
+.exp-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 2px 10px;
+}
+.exp-list { display: flex; flex-direction: column; gap: 6px; padding-bottom: 8px; }
+.exp-item {
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-left-width: 3px;
+  border-radius: 5px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.exp-item.is-success { border-left-color: var(--teal, #26a69a); }
+.exp-item.is-failure { border-left-color: var(--red, #ef5350); }
+.exp-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 2px;
+}
+.exp-symbol { font-family: 'JetBrains Mono', monospace; color: #e5e7eb; font-weight: 600; }
+.exp-tag {
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #9ca3af;
+}
+.exp-tag.win { color: #26a69a; border-color: rgba(38, 166, 154, 0.4); }
+.exp-tag.loss { color: #ef5350; border-color: rgba(239, 83, 80, 0.4); }
+.exp-pnl { font-family: 'JetBrains Mono', monospace; margin-left: auto; }
+.exp-pnl.pos { color: #26a69a; }
+.exp-pnl.neg { color: #ef5350; }
+.exp-summary { color: #cbd5e1; }
+.exp-patterns { color: #6b7280; font-size: 11px; margin-top: 2px; }
+.exp-empty { color: #6b7280; padding: 18px 0; text-align: center; font-size: 12px; }
