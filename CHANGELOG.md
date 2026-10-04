@@ -19,6 +19,25 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 19. 两阶段经验库：入场即写「待验证」+ 按 N 根 K 线结算 + 点击联动主图
+
+- **动机**：旧实现是一次性判定（起线程轮询到 TP/SL 触发才写一条），进程重启全丢，且只能验证「用户一直没换品种」的那些。改为两阶段，让「记录事实」与「判定结果」解耦
+- **状态机（落盘目录即状态）**：`pending_cases/` → `success_cases/`(win) / `failure_cases/`(loss) / `unresolved_cases/`（走满 N 根仍未触及，终态但无盈亏）。**只有 win/loss 被 `ExperienceReader` 读到** —— 未决的 setup 绝不能被当成失败经验喂回提示词
+- **阶段一** `save_pending_if_resolvable()`：入场瞬间落盘（「我们做了什么」是事实，不需等结果）。门控拒绝：不下单 / 缺 TP 或 SL / 零价位 / 无多空方向 / 无入场锚点。锚点取最后一根**已收盘** bar（`bars[0]` 是 forming bar，用它会把未收盘走势算进「入场之后」）
+- **阶段二** `web/api/experience_verifier.py`：按 N = `experience_verify_bars`（默认 20，可配）结算 —— 触及 TP/SL → win/loss + pnl；走满 N 根未触及 → unresolved；不足 N 根 → 保持 pending 继续等
+- **币种/周期/交易所三轴对齐是硬不变量**（此前致命 bug 的根源）：
+  - 共享数据源仅在 (exchange, symbol, timeframe) 三者全等时复用；否则为该记录单独建数据源（用完即弃，绝不去改共享订阅）
+  - 取到的 bars 再过价格量级兜底 `bars_belong_to_instrument()`：与记录 entry 不在同一量级 → 判为另一个标的，保持 pending
+  - 实测：故意造 entry=100 的记录而真实 BTC 在 83589，日志正确输出 `bars for GATEIO/BTCUSDT do not straddle entry 100.0 — leaving record pending`，记录未被错误结算
+- **UI**：待验证与终态同列表展示并区分标签；待验证显示「已走 k/N 根」让等待进度可见；「验证」按钮按当前范围结算并 toast 汇报；**点击条目 → 主图联动**（入场线蓝/止盈绿/止损红 + 入场与结算标记 + 视窗对齐入场点），图例展示状态、品种周期、多空方向、价位与判定窗口
+- **实现中踩到并修掉的三个坑**
+  1. `_status_subdir` 误把 status 当目录名，写出 `pending/` 而非 `pending_cases/` → reader 按 `*_cases` 扫描，结算后的记录读不到
+  2. `#experience-legend` 被嵌在 `#chart-legend` **内部**，而 indicators.js 每次刷新指标图例都会整体重写其 innerHTML，把经验图例一并抹掉 → 改为兄弟节点
+  3. 一段 `loadExperienceLibrary` 重写因后续 assert 失败导致写文件那步未执行，前端仍是旧模板（class 恒为 `is-failure`、不渲染价位行、点击无反应）。该坑本轮出现两次，已改为写文件前先断言
+- **测试**：新增 `tests/unit/test_experience_two_stage.py`(15) —— pending 落盘布局、pending 不被 reader 检索、TP/SL/unresolved/pending 四种 N 根规则、入场前 bar 被忽略、价格量级守卫、共享源在品种/周期/交易所任一不符时被拒、范围过滤、无数据源时保持 pending。其中一条测试一开始用 `entry=100 vs bars 60~70`（0.6 倍）当反例，被正确判为同标的 —— 守卫本身是对的，是例子不成立，已改用真正跨量级的场景
+- **文件**：`pa_agent/records/experience_writer.py`、`pa_agent/config/settings.py`、`web/api/{experience_verifier.py,routes_data.py,order_followup.py}`、`web/static/{index.html,js/app.js,js/chart.js,css/style.css}`
+- **验证**：阶段一门控 6 种情形逐个验证（合法写入 + 5 种拒绝）；API 返回 `status_counts={'pending':1}`；UI 显示 `待验证 (pending)` / `已走 0/20 根` / `入场 100 · 止盈 120 · 止损 90 · 多头`；点击后主图三条价格线与图例正确渲染；价格量级兜底按预期触发；全量 `tests/unit` 对基线新增失败 0
+
 ### 18. 经验库数据核查：36 条全部为合成数据，写入链路实为死链（含 3 个数据完整性缺陷）
 
 用户质疑「经验库的数据是不是真的」。核查结论：**一条真的都没有**。
