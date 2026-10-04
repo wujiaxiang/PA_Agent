@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from typing import Optional
 
 from pa_agent.data.base import (
     DataSource,
@@ -410,10 +411,13 @@ TV_SYMBOL_PRESETS: dict[str, list[str]] = {
         "300059", "300124", "000568", "002352", "300760",
     ],
     # ── 港股 ─────────────────────────────────────────────────────────────
+    # 注意：TradingView 的港股代码**不补前导零**。此前写成 0700 / 0388 / 0688 / 0961
+    # 的那些代码在 TV 上根本不存在，订阅必然取不到数据；已按 scanner 实测校正为
+    # 700（腾讯）/ 388（港交所）/ 688（中国海外发展）/ 1193（华润燃气）等。
     "HKEX": [
-        "0700", "1810", "9988", "3690", "1299",
+        "700", "1810", "9988", "3690", "1299",
         "9618", "9888", "1024", "9999", "9868",
-        "2318", "0388", "0688", "0961", "9992",
+        "2318", "388", "688", "1193", "9992",
     ],
     # ── 美股 ─────────────────────────────────────────────────────────────
     "SP": ["SPX", "SPX500", "NDX", "VIX", "DJI", "RUT", "MID", "S5TH"],
@@ -497,11 +501,11 @@ TV_SYMBOL_NAMES: dict[str, str] = {
     "002230": "科大讯飞", "300059": "东方财富", "300124": "汇川技术",
     "000568": "泸州老窖", "300760": "迈瑞医疗", "002352": "顺丰控股",
     # ── 港股 ────────────────────────────────────────────────────────────
-    "0700": "腾讯控股", "1810": "小米集团", "9988": "阿里巴巴",
+    "700": "腾讯控股", "1810": "小米集团", "9988": "阿里巴巴",
     "3690": "美团", "1299": "友邦保险", "9618": "京东集团",
     "9888": "百度", "1024": "快手", "9999": "网易", "9868": "小鹏汽车",
-    "2318": "中国平安(H)", "0388": "香港交易所", "0688": "中国海外发展",
-    "0961": "华润啤酒", "9992": "泡泡玛特",
+    "2318": "中国平安(H)", "388": "香港交易所", "688": "中国海外发展",
+    "1193": "华润燃气", "9992": "泡泡玛特", "1698": "腾讯音乐",
     # ── 期货 ────────────────────────────────────────────────────────────
     "ZC": "玉米", "ZS": "大豆", "ZW": "小麦", "ZL": "豆油",
     "ZM": "豆粕", "ZO": "燕麦", "LE": "活牛", "GF": " feeder cattle",
@@ -1013,3 +1017,217 @@ def _row_ts_ms(row) -> int:
     except ImportError:
         pass
     return datetime_to_ts_ms(dt)
+
+
+# ── TradingView scanner 品种搜索 ─────────────────────────────────────────────
+# tvDatafeed 2.1.0 自带的 search_symbol() 已失效（对任意查询都返回非 JSON），
+# 但 scanner.tradingview.com 走的是另一条路径，无需登录且实测可用：
+#   crypto totalCount=64412 / america=20069 / futures=52721 / china=7476
+#   / forex=6333 / hongkong=3060
+# 这里用它提供真正的全市场品种搜索，返回值只取「币种/品种 code」，
+# 格式与 TV_SYMBOL_PRESETS 中的 code 一致（不含 "EXCHANGE:" 前缀）。
+TV_SEARCH_URL_TEMPLATE = "https://scanner.tradingview.com/{market}/scan"
+
+#: 我们的 exchange → scanner market 端点
+TV_SEARCH_MARKET_BY_EXCHANGE: dict[str, str] = {
+    "GATEIO": "crypto", "BINANCE": "crypto", "BYBIT": "crypto",
+    "OKX": "crypto", "BITSTAMP": "crypto", "COINBASE": "crypto",
+    "NASDAQ": "america", "NYSE": "america", "SP": "america", "AMEX": "america",
+    "OANDA": "forex", "PEPPERSTONE": "forex", "FOREXCOM": "forex",
+    "CAPITALCOM": "forex", "TVC": "forex",
+    "SSE": "china", "SZSE": "china",
+    "HKEX": "hongkong",
+    "CBOT": "futures", "CME_MINI": "futures",
+}
+
+#: 我们的 exchange → scanner 里的交易所名（不一致的在这里映射）
+TV_SEARCH_EXCHANGE_ALIASES: dict[str, str] = {
+    "GATEIO": "GATE",
+    "CME_MINI": "CBOT_MINI",
+}
+
+#: 默认市场（未指定交易所时）
+TV_SEARCH_DEFAULT_MARKET = "global"
+
+_TV_SEARCH_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120 Safari/537.36",
+}
+
+
+#: 衍生品后缀特征：永续 .P / .F、杠杆代币 3L/3S/5L/5S、期权 .C/.P、
+#: 指数/币本位合约、wrapped 与质押变体。
+_DERIV_SUFFIXES = (".P", ".F", ".C", ".I", ".PERP", ".PERPETUAL")
+#: 外汇/指数的「同品种不同券商」变体：EURUSD 在 OANDA 上同时存在
+#: EURUSD / EURUSD.ONE / EURUSD.SML.ONE / EURUSD.PRO.OTMS 等十余个变种，
+#: 用户要的是主代码，不是各家的合约规格。
+_DERIV_TAIL_TOKENS = (
+    "ONE", "PRO", "SML", "ECN", "RAW", "MIC", "SB", "CENT", "MINI", "ULTRA",
+    "OTMS", "ECN2", "SPOT", "FUT", "MTM", "PREM", "INV",
+)
+_DERIV_INFIXES = ("3L", "3S", "5L", "5S", "UP", "DOWN", "BULL", "BEAR")
+
+
+def _is_derivative(code: str) -> bool:
+    """Heuristic: is this ticker a derivative rather than a plain spot pair?"""
+    import re as _re
+    c = str(code or "").upper()
+    if c.endswith(_DERIV_SUFFIXES):
+        return True
+    # 杠杆代币后缀形如 .3L / .5S / .2L（"BASE" 部分是现货、后面才是杠杆）
+    if _re.search(r"\.\d+[LS]$", c):
+        return True
+    # 券商/规格变体：EURUSD.PRO.OTMS / EURUSD.SML.ONE / GBPUSD.ECN
+    for part in c.split(".")[1:]:
+        if part in _DERIV_TAIL_TOKENS:
+            return True
+    base = c.split(".")[0]
+    # WBTC / STETH / PUMPBTC —— wrapped / staked / 杠杆包装币不是现货对
+    if base.startswith(("W", "ST")) and base[2:5].isalpha() and len(base) > 5:
+        if base not in ("WIFUSDT",):
+            return True
+    # 含计价币之外的中间段，例如 ETHFIUSDT.3L
+    if any(seg in base for seg in ("UP", "DOWN", "BULL", "BEAR")):
+        return True
+    return False
+
+
+def _relevance(code: str, query: str) -> tuple:
+    """Rank: exact > prefix > word-start > plain substring > other."""
+    c = str(code or "").upper()
+    q = str(query or "").upper()
+    if not q:
+        return (5, c)
+    if c == q:
+        return (0, c)
+    if c.startswith(q):
+        # BTCUSDT 比 BTCUSD.P 更贴合直觉：紧跟计价币的优先
+        tail = c[len(q):]
+        return (1, len(tail), c)
+    if q in c:
+        return (2, c.index(q), c)
+    return (3, c)
+
+
+def _tv_search_request(payload: dict, timeout: float = 8.0) -> dict:
+    """POST 到 scanner 并返回解析后的 JSON（失败抛异常，由调用方兜底）。"""
+    import json as _json
+    import urllib.request as _urlreq
+
+    market = payload.get("market") or TV_SEARCH_DEFAULT_MARKET
+    url = TV_SEARCH_URL_TEMPLATE.format(market=market)
+    body = {k: v for k, v in payload.items() if k != "market"}
+    req = _urlreq.Request(
+        url,
+        data=_json.dumps(body).encode("utf-8"),
+        headers=_TV_SEARCH_HEADERS,
+        method="POST",
+    )
+    with _urlreq.urlopen(req, timeout=timeout) as resp:
+        return _json.loads(resp.read().decode("utf-8"))
+
+
+def search_tv_symbols(
+    query: str = "",
+    exchange: str = "",
+    limit: int = 50,
+    logger: Optional[logging.Logger] = None,
+) -> list[dict]:
+    """Search TradingView's live symbol universe via the scanner API.
+
+    Parameters
+    ----------
+    query:
+        Free text matched against the instrument name. Empty means "list the
+        most active symbols on this exchange".
+    exchange:
+        Our exchange id (e.g. ``GATEIO``); mapped to a scanner market and
+        exchange. Empty searches across the whole global universe.
+    limit:
+        Maximum rows to return (capped at 150).
+
+    Returns
+    -------
+    list[dict]
+        ``{"code", "name", "exchange", "description", "close"}`` per row, where
+        ``code`` is the bare ticker (``BTCUSDT``) suitable for
+        ``get_hist(symbol=..., exchange=...)`` — i.e. exactly the format used by
+        ``TV_SYMBOL_PRESETS``.
+
+    Never raises: any network/protocol failure yields ``[]`` so callers can fall
+    back to the curated preset list.
+    """
+    log = logger or logging.getLogger(__name__)
+    ex = (exchange or "").strip().upper()
+    market = TV_SEARCH_MARKET_BY_EXCHANGE.get(ex, "")
+    scanner_ex = TV_SEARCH_EXCHANGE_ALIASES.get(ex, ex)
+    if not ex:
+        market = TV_SEARCH_DEFAULT_MARKET
+    limit = max(1, min(int(limit or 50), 150))
+    q = (query or "").strip()
+
+    filters: list[dict] = []
+    if scanner_ex:
+        filters.append({"left": "exchange", "operation": "match", "right": scanner_ex})
+    if q:
+        filters.append({"left": "name", "operation": "match", "right": q})
+
+    payload: dict = {
+        "symbols": {"query": {"types": []}, "tickers": []},
+        "columns": ["name", "description", "close", "exchange", "volume"],
+        "options": {"lang": "en"},
+        "range": [0, limit],
+    }
+    if filters:
+        payload["filter"] = filters
+    # 全市场浏览时按成交量降序；仅加密市场有意义（股票/外汇的 volume 列
+    # 会返回一批毫无意义的冷门代码，反而更难用）。
+    if not q and not scanner_ex and market == "crypto":
+        payload["sort"] = {"sortBy": "volume", "sortOrder": "desc"}
+    # 多取一些再做清洗与排序，否则清洗掉衍生品后结果不足 limit
+    payload["range"] = [0, min(300, limit * 4)]
+    payload["market"] = market or TV_SEARCH_DEFAULT_MARKET
+
+    try:
+        data = _tv_search_request(payload)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("search_tv_symbols failed (market=%s q=%r): %s", market, q, exc)
+        return []
+
+    rows: list[dict] = []
+    for item in (data.get("data") or []):
+        cols = item.get("d") or []
+        raw = item.get("s") or ""
+        code = raw.split(":", 1)[1] if ":" in raw else raw
+        if not code:
+            continue
+        rows.append({
+            "code": code,
+            "name": cols[1] if len(cols) > 1 else code,
+            "close": cols[2] if len(cols) > 2 else None,
+            "exchange": cols[3] if len(cols) > 3 else ex,
+            "description": cols[1] if len(cols) > 1 else "",
+            "volume": cols[4] if len(cols) > 4 else None,
+            "_deriv": _is_derivative(code),
+        })
+
+    # 现货优先：scanner 对 "BTC" 会返回 PUMPBTCUSDT / WBTCUSDT / BTCUSD.P，
+    # 对 "EURUSD" 会返回 EURUSD.ONE / EURUSD.PRO.OTMS 等券商变种 ——
+    # 用户要的是能直接订阅的主品种。
+    #
+    # 注意顺序：必须**先按相关性排序、再过滤**，反过来会把衍生品重新混进来
+    # （分组后又整体重排等于没过滤）。
+    if q:
+        rows.sort(key=lambda r: _relevance(r["code"], q))
+        spot = [r for r in rows if not r["_deriv"]]
+        if spot:
+            rows = spot
+        # 现货一个都没有（如用户搜的是某个合约代码）才退回全部结果
+    else:
+        # 浏览模式：按成交量给回顺序，只把衍生品压后
+        rows.sort(key=lambda r: (1 if r["_deriv"] else 0, -(r.get("volume") or 0)))
+
+    for r in rows:
+        r.pop("_deriv", None)
+    return rows[:limit]

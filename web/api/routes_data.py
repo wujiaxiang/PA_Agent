@@ -386,3 +386,26 @@ async def list_experience(cycle: str = Query(default="", description="按市场�
 
     result = await asyncio.to_thread(_scan)
     return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/tv/search")
+async def search_tv_symbols(
+    q: str = Query(default="", description="搜索关键词（代码或名称）"),
+    exchange: str = Query(default="", description="交易所 id，空=全市场"),
+    limit: int = Query(default=50, ge=1, le=150),
+):
+    """Live TradingView symbol search via the scanner API.
+
+    ``/api/tv/symbols`` returns only a small curated preset (offline, instant);
+    this endpoint hits ``scanner.tradingview.com`` so users can find the full
+    universe (64k crypto pairs / 20k US stocks / 52k futures / …). Any network
+    failure yields ``[]`` instead of raising, so the frontend can fall back to
+    the preset list.
+    """
+    from pa_agent.data.tradingview import search_tv_symbols as _search
+
+    rows = await asyncio.to_thread(_search, q, exchange, limit)
+    return JSONResponse(
+        content={"query": q, "exchange": exchange, "count": len(rows), "results": rows},
+        headers={"Cache-Control": "no-store"},
+    )

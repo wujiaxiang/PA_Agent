@@ -1655,10 +1655,64 @@ function groupOfSymbol(code) {
   return '其他';
 }
 
+// ── 在线搜索（TradingView scanner）──────────────────────────────────────────
+// /api/tv/symbols 只是离线内置表（195 个），用户要的「随便搜哪个币种」需要
+// 全市场实时检索：scanner 返回 crypto 64k / america 20k / futures 52k 个品种。
+// 策略：空查询用内置表（瞬时、离线可用、带中文名与分组），
+// 有输入时防抖 260ms 走在线搜索；在线失败或无结果则回退到内置表模糊匹配。
+
+const SYMBOL_SEARCH_DEBOUNCE_MS = 260;
+let _symbolSearchTimer = null;
+let _symbolSearchSeq = 0;   // 竞态守卫：只认最后一次输入的结果
+
+async function fetchRemoteSymbols(query) {
+  const ex = $('#ds-exchange')?.value || '';
+  const seq = ++_symbolSearchSeq;
+  try {
+    const d = await API.get(
+      `/api/tv/search?q=${encodeURIComponent(query)}&exchange=${encodeURIComponent(ex)}&limit=50`
+    );
+    if (seq !== _symbolSearchSeq) return;      // 已有更新的输入，丢弃
+    if (d && Array.isArray(d.results) && d.results.length) {
+      renderSymbolResults(d.results.map(r => ({
+        sym: { code: r.code, name: r.name || r.description || r.code },
+        group: null,
+        sub: r.exchange || ex,
+      })));
+    } else {
+      _renderLocalMatch(query);
+    }
+  } catch (e) {
+    if (seq !== _symbolSearchSeq) return;
+    _renderLocalMatch(query);   // 在线不可用 → 内置表模糊匹配兜底
+  }
+}
+
+function _renderLocalMatch(query) {
+  const scored = [];
+  symbolList.forEach((sym, i) => {
+    const r = scoreSymbol(query, sym);
+    if (r) scored.push({ sym, score: r.score, tier: r.tier, i });
+  });
+  scored.sort((a, b) => (a.tier - b.tier) || (b.score - a.score) || (a.i - b.i));
+  symbolMatchTotal = scored.length;
+  renderSymbolResults(scored.map(x => ({ sym: x.sym, group: null })));
+}
+
 function filterSymbolList(query) {
   const dropdown = $('#symbol-search-dropdown');
   const resultsContainer = $('.symbol-search-results');
   if (!dropdown || !resultsContainer) return;
+
+  // 有输入 → 走在线全市场搜索
+  if (query) {
+    if (_symbolSearchTimer) clearTimeout(_symbolSearchTimer);
+    symbolSearchSelectedIndex = 0;
+    resultsContainer.innerHTML = '<div class="symbol-search-hint">搜索中…</div>';
+    dropdown.removeAttribute('hidden');
+    _symbolSearchTimer = setTimeout(() => fetchRemoteSymbols(query), SYMBOL_SEARCH_DEBOUNCE_MS);
+    return;
+  }
 
   let rows;
   if (query) {
@@ -1721,7 +1775,7 @@ function renderSymbolResults(rows) {
       <div class="symbol-search-item${isSelected ? ' selected' : ''}"
            data-symbol="${escapeHtml(code)}" data-index="${idx}" role="option">
         <span class="symbol-name">${escapeHtml(name || code)}</span>
-        <span class="symbol-code">${escapeHtml(code)}</span>
+        <span class="symbol-code">${escapeHtml(row.sub ? escapeHtml(row.sub) + ' · ' : '')}${escapeHtml(code)}</span>
       </div>`);
     idx += 1;
   }
