@@ -3598,3 +3598,40 @@ button.secondary:hover { background: var(--border); }
 .exp-summary { color: #cbd5e1; }
 .exp-patterns { color: #6b7280; font-size: 11px; margin-top: 2px; }
 .exp-empty { color: #6b7280; padding: 18px 0; text-align: center; font-size: 12px; }
+
+/* ── 面板内子 tab ───────────────────────────────────────────────────────────
+   侧边栏顶层 tab 从 8 个收敛到 6 个：「可视化」并入「决策树」、
+   「调试」并入「原始」。两个面板原本就是同级兄弟、共享同一个槽位
+   （.tab-panel 默认 display:none，.active 时才占位），因此无需嵌套 DOM，
+   只需在面板内加一条子 tab 条切换两者的 .active。
+   控件 id（#btn-tree-viz-* 等）保持不变，JS 引用无需改动。 */
+.subtabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  margin: -4px 0 8px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+  flex: none;
+}
+.subtab {
+  flex: 1;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-family: inherit;
+  color: #9ca3af;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+.subtab:hover { color: #e5e7eb; background: rgba(255, 255, 255, 0.05); }
+.subtab.active {
+  color: #e0e6ed;
+  background: rgba(41, 98, 255, 0.18);
+  border-color: rgba(41, 98, 255, 0.45);
+}
+/* 子面板是 .tab-panel 的兄弟时，仍需保证滚动容器正常 */
+#tab-tree-viz, #tab-debug { padding-top: 4px; }

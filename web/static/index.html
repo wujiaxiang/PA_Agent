@@ -9,7 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="/css/style.css?v=23">
+<link rel="stylesheet" href="/css/style.css?v=24">
 </head>
 <body>
 
@@ -132,10 +132,8 @@
       <button class="tab active" data-tab="stream" data-tip="流式观看两阶段 AI 分析的推理与输出过程">实时分析</button>
       <button class="tab" data-tab="decision" data-tip="AI 最终决策：结论 / 市场状态 / 详细依据（三段式）">决策</button>
       <button class="tab" data-tab="future" data-tip="下一根 K 线与下一市场周期的概率预测">预测</button>
-      <button class="tab" data-tab="tree" data-tip="阶段一闸门 + 阶段二策略的逐步问答回放">决策树</button>
-      <button class="tab" data-tab="tree-viz" data-tip="决策树流程图可视化（可播放逐步高亮）">可视化</button>
-      <button class="tab" data-tab="raw" data-tip="查看 AI 请求/响应原始数据（调试用）">原始</button>
-      <button class="tab" data-tab="debug" data-tip="查看本次分析加载的策略文件与经验库">调试</button>
+      <button class="tab" data-tab="tree" data-tip="决策路径回放：问答回放 / 流程图（面板内切换）">决策树</button>
+      <button class="tab" data-tab="raw" data-tip="AI 请求响应原始数据 / 策略文件与经验库（面板内切换）">原始</button>
       <button class="tab" data-tab="experience" data-tip="浏览经验库：每次下单信号在 TP1/SL 触达后自动回写的成败样本">经验库</button>
     </div>
 
@@ -314,6 +312,11 @@
     </div>
 
     <div id="tab-tree" class="tab-panel">
+      <div class="subtabs" role="tablist">
+        <button class="subtab active" data-subtab="tree" data-target="tree" role="tab">问答回放</button>
+        <button class="subtab" data-subtab="tree-viz" data-target="tree-viz" role="tab">流程图</button>
+      </div>
+
       <details class="tab-help" data-help-key="tree">
         <summary>❓ 这个 tab 是什么？怎么用？</summary>
         <div class="tab-help-content">
@@ -335,6 +338,11 @@
     </div>
 
     <div id="tab-tree-viz" class="tab-panel">
+      <div class="subtabs" role="tablist">
+        <button class="subtab active" data-subtab="tree" data-target="tree" role="tab">问答回放</button>
+        <button class="subtab" data-subtab="tree-viz" data-target="tree-viz" role="tab">流程图</button>
+      </div>
+
       <details class="tab-help" data-help-key="tree-viz">
         <summary>❓ 这个 tab 是什么？怎么用？</summary>
         <div class="tab-help-content">
@@ -369,6 +377,11 @@
     </div>
 
     <div id="tab-raw" class="tab-panel">
+      <div class="subtabs" role="tablist">
+        <button class="subtab active" data-subtab="raw" data-target="raw" role="tab">原始数据</button>
+        <button class="subtab" data-subtab="debug" data-target="debug" role="tab">文件与经验</button>
+      </div>
+
       <details class="tab-help" data-help-key="raw">
         <summary>❓ 这个 tab 是什么？怎么用？</summary>
         <div class="tab-help-content">
@@ -398,6 +411,11 @@
     </div>
 
     <div id="tab-debug" class="tab-panel">
+      <div class="subtabs" role="tablist">
+        <button class="subtab active" data-subtab="raw" data-target="raw" role="tab">原始数据</button>
+        <button class="subtab" data-subtab="debug" data-target="debug" role="tab">文件与经验</button>
+      </div>
+
       <details class="tab-help" data-help-key="debug">
         <summary>❓ 这个 tab 是什么？怎么用？</summary>
         <div class="tab-help-content">
@@ -612,6 +630,6 @@
 <script src="/js/chart.js?v=6"></script>
 <script src="/js/indicators.js?v=5"></script>
 <script src="/js/continuous_gate.js?v=1"></script>
-<script src="/js/app.js?v=37"></script>
+<script src="/js/app.js?v=39"></script>
 </body>
 </html>

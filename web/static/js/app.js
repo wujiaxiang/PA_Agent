@@ -888,6 +888,51 @@ function bindEvents() {
     });
   });
 
+// ── 面板内子 tab（可视化→决策树、调试→原始）────────────────────────────
+  // 两组被合并的面板是同级兄弟、共享同一槽位，切换即在两者间转移 .active。
+  const SUBTAB_GROUPS = [['tree', 'tree-viz'], ['raw', 'debug']];
+
+  // 组是「所属顶层 tab」，必须按成员反查；
+  // 直接 SUBTAB_GROUPS[target] 在 target='tree-viz' 时查不到，
+  // 导致旧的 #tab-tree 没被移除，两个面板同时占位。
+  function groupOf(target) {
+    return SUBTAB_GROUPS.find(g => g.includes(target)) || null;
+  }
+
+  function syncSubtabBar(activeKey) {
+    $$('.subtabs').forEach(bar => {
+      $$('.subtab', bar).forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.subtab === activeKey);
+      });
+    });
+  }
+
+  $$('.subtab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const target = btn.dataset.target;
+      const panel = document.querySelector(`#tab-${target}`);
+      if (!panel) return;
+      const group = groupOf(target);
+      if (group) {
+        group.forEach(k => document.querySelector(`#tab-${k}`)?.classList.remove('active'));
+      }
+      panel.classList.add('active');
+      btn.parentElement.querySelectorAll('.subtab').forEach(b => {
+        b.classList.toggle('active', b === btn);
+      });
+      // 切到流程图时需要按需重渲染（内部状态可能陈旧）
+      if (target === 'tree-viz' && lastRecord && typeof renderTreeViz === 'function') {
+        renderTreeViz(lastRecord);
+      } else if (target === 'debug' && lastRecord && typeof renderDebug === 'function') {
+        renderDebug(lastRecord);
+      } else if (target === 'tree' && lastRecord && typeof renderDecisionTree === 'function') {
+        renderDecisionTree(lastRecord);
+      } else if (target === 'raw' && lastRecord && typeof renderRaw === 'function') {
+        renderRaw(lastRecord);
+      }
+    });
+  });
+
   // Sidebar tabs
   $$('.sidebar-tabs .tab').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -907,6 +952,8 @@ function bindEvents() {
       if (tab === 'experience' && typeof initExperienceTab === 'function') {
         initExperienceTab();
       }
+      // 合并后的两组面板：把当前激活的子 tab 状态同步到条上
+      syncSubtabBar(tab);
       // Phase A Task 1.3：决策 / 决策树 / 预测 tab 切回时重新渲染，避免显示陈旧内容
       if (tab === 'decision' && lastRecord && typeof renderDecision === 'function') {
         renderDecision(lastRecord);
