@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from pa_agent.ai.display_labels import (  # noqa: E402
     bilingual_case_type as _bilingual_case_type,
@@ -332,8 +334,17 @@ async def get_next_close(
 # 经验库此前只有 reader、没有任何写入方，也没有浏览入口 —— Web 端完全看不到
 # 库里到底有什么、Stage2 到底检索到了什么。这里补上只读浏览接口。
 
+def _status_label(status: str) -> str:
+    """Bilingual label for a two-stage experience status."""
+    return {
+        "pending": "待验证 (pending)",
+        "win": "盈利 (win)",
+        "loss": "亏损 (loss)",
+        "unresolved": "未触及 (unresolved)",
+    }.get(str(status or "").strip().lower(), "")
+
+
 @router.get("/experience")
-# 枚举中英标签（Qt-free，展示层专用，不影响业务判定）
 async def list_experience(
     cycle: str = Query(default="", description="按市场周期过滤，空=全部"),
     symbol: str = Query(default="", description="按交易对过滤，如 BTCUSDT；空=全部"),
@@ -372,30 +383,82 @@ async def list_experience(
         entries: list[dict] = []
         counts: dict[str, dict[str, int]] = {}
         all_rows: list[dict] = []
+
+        def _read_status_dir(cycle_dir_name: str, status: str, limit: int = 60):
+            """Read pending_cases / unresolved_cases directly.
+
+            ``ExperienceReader`` only knows success/failure by design — an
+            undecided setup must not be retrievable as an experience. But the
+            browser still needs to *see* pending records, otherwise the two-stage
+            flow is invisible: the user cannot tell "nothing happened yet" from
+            "the system is broken".
+            """
+            from pa_agent.records.experience_writer import STATUS_DIRS
+
+            d = root / cycle_dir_name / STATUS_DIRS[status]
+            if not d.is_dir():
+                return []
+            out = []
+            for f in sorted(d.glob("*.json")):
+                try:
+                    out.append((f, json.loads(f.read_text(encoding="utf-8"))))
+                except Exception:  # noqa: BLE001
+                    continue
+                if len(out) >= limit:
+                    break
+            return out
+
+        def _fake_entry(f, content, cycle_name, case_type):
+            """Adapt a raw (path, content) pair to the reader's entry shape."""
+            return SimpleNamespace(
+                filename=f.name,
+                case_type=case_type,
+                cycle_position=content.get("cycle_position") or cycle_name,
+                timestamp_ms=int(f.stat().st_mtime * 1000),
+                content=content,
+            )
+
         for name in cycles:
             try:
-                found = reader.read_top5(name)
+                found = list(reader.read_top5(name))
             except Exception:  # noqa: BLE001
                 found = []
+            for status, case_type in (("pending", "pending"), ("unresolved", "failure")):
+                for f, content in _read_status_dir(name, status):
+                    found.append(_fake_entry(f, content, name, case_type))
             success = 0
             failure = 0
             for e in found:
                 content = getattr(e, "content", {}) or {}
-                case_type = getattr(e, "case_type", "")
+                case_type = str(getattr(e, "case_type", "") or "")
                 if case_type == "success":
                     success += 1
-                elif case_type == "failure":
+                elif case_type in ("failure", "unresolved"):
                     failure += 1
                 cycle_pos = getattr(e, "cycle_position", None) or content.get("cycle_position") or name
+                st = str(content.get("status") or "").strip().lower()
+                if st not in ("pending", "win", "loss", "unresolved"):
+                    # 老条目没有 status 字段，按所在目录推断
+                    st = "win" if case_type == "success" else "loss"
                 all_rows.append({
                     "filename": getattr(e, "filename", ""),
                     "case_type": case_type,
+                    "status": st,
+                    "is_pending": st == "pending",
+                    "exchange": content.get("exchange", ""),
+                    "entry_price": content.get("entry_price"),
+                    "take_profit_price": content.get("take_profit_price"),
+                    "stop_loss_price": content.get("stop_loss_price"),
+                    "is_long": content.get("is_long", True),
+                    "entry_ts_open_ms": content.get("entry_ts_open_ms"),
+                    "resolved_ts_open_ms": content.get("resolved_ts_open_ms"),
+                    "bars_seen": content.get("bars_seen"),
                     "cycle_position": cycle_pos,
                     # 枚举同时给出中英标签：中文给操作者看，raw 给提示词/落盘路径对齐
                     "cycle_label": _bilingual_cycle(cycle_pos),
                     "direction_label": _bilingual_direction(content.get("direction", "")),
                     "result_label": _bilingual_result(content.get("result", "")),
-                    "case_type_label": _bilingual_case_type(case_type),
+                    "case_type_label": _status_label(st),
                     "timestamp_ms": getattr(e, "timestamp_ms", 0),
                     "symbol": content.get("symbol", ""),
                     "timeframe": content.get("timeframe", ""),
@@ -431,11 +494,16 @@ async def list_experience(
         cycle_options = [
             {"value": c, "label": _bilingual_cycle(c)} for c in sorted(counts)
         ]
+        status_counts: dict[str, int] = {}
+        for r in rows:
+            status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
+
         return {
             "total": len(rows),
             "entries": rows,
             "cycles": counts,
             "cycle_options": cycle_options,
+            "status_counts": status_counts,
             "symbols": symbols,
             "timeframes": timeframes,
         }
@@ -465,3 +533,29 @@ async def search_tv_symbols(
         content={"query": q, "exchange": exchange, "count": len(rows), "results": rows},
         headers={"Cache-Control": "no-store"},
     )
+
+
+@router.post("/experience/verify")
+async def verify_experience(request: Request, scope_current: bool = Query(default=True)):
+    """Settle pending experience records that have enough post-entry bars.
+
+    ``scope_current=true`` (the UI's "验证" button) settles only the records for
+    the currently-viewed instrument, so the panel always reflects the chart.
+    Off-thread: each non-matching record may need its own data source.
+    """
+    from web.api.experience_verifier import verify_pending
+
+    ctx = request.app.state.ctx
+    scope = None
+    if scope_current:
+        scope = (str(getattr(ctx.settings.general, "last_symbol", "") or ""),
+                 str(getattr(ctx.settings.general, "last_timeframe", "") or ""))
+
+    summary = await asyncio.to_thread(
+        verify_pending,
+        shared_source=ctx.data_source,
+        source_factory=None,
+        settings=ctx.settings,
+        scope=scope,
+    )
+    return JSONResponse(content=summary, headers={"Cache-Control": "no-store"})

@@ -46,6 +46,11 @@ class PromptSettings(BaseModel):
     # 单笔计划最长观察时长（秒）。超时仍未触及 TP/SL 则不写入 ——
     # 未了结的交易无法说明这个 setup 好不好。
     experience_max_wait_s: float = Field(default=86400.0, ge=300.0, le=604800.0)
+    # 两阶段经验库：入场即写 pending，再按入场后的 N 根 K 线判定终态。
+    # N 太小容易在噪音里误判 TP/SL 触及，太大则迟迟不结算。
+    experience_verify_bars: int = Field(default=20, ge=3, le=500)
+    # 一次验证最多处理多少条待验证记录（每条可能要单独拉一次行情）
+    experience_verify_batch: int = Field(default=5, ge=1, le=50)
     experience_max_chars_per_entry: int = Field(default=400, ge=100, le=4000)
     #: Inject pattern判定表 + 速查 brief into Stage 1 user prompt (reduces missed tags).
     stage1_inject_pattern_briefs: bool = True

@@ -3758,3 +3758,47 @@ button.secondary:hover { background: var(--border); }
   text-underline-offset: 2px;
 }
 .exp-link-btn:hover { color: #a9c2ff; }
+
+/* ── 经验回放图例 ─────────────────────────────────────────────────────────── */
+.exp-legend:empty { display: none; }
+.exp-legend {
+  position: absolute;
+  top: 38px;
+  left: 8px;
+  z-index: 5;
+  max-width: 300px;
+  padding: 7px 10px;
+  font-size: 11px;
+  line-height: 1.7;
+  color: #cbd5e1;
+  background: rgba(12, 16, 24, 0.86);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 5px;
+  backdrop-filter: blur(3px);
+  pointer-events: none;
+}
+.exp-lg-title {
+  font-weight: 600;
+  color: #e5e7eb;
+  margin-bottom: 2px;
+}
+.exp-lg-row { white-space: nowrap; }
+.exp-lg-row.dim { color: #7b8794; }
+.exp-lg-row b { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+
+/* 经验条目可点击 */
+.exp-item { cursor: pointer; transition: background .12s ease, border-color .12s ease; }
+.exp-item:hover { background: rgba(255, 255, 255, 0.035); }
+.exp-item.is-replaying { border-color: rgba(41, 98, 255, 0.75); background: rgba(41, 98, 255, 0.10); }
+/* 待验证：视觉上要和终态区分开 */
+.exp-item.is-pending { border-left: 3px solid #94a3b8; }
+.exp-item.is-unresolved { border-left: 3px solid #64748b; }
+.exp-levels {
+  margin-top: 3px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 10.5px;
+  color: #7b8794;
+}
+.exp-tag.pending { color: #cbd5e1; border-color: rgba(148, 163, 184, 0.5); }
+.exp-tag.unresolved { color: #94a3b8; }
+.exp-tag.win, .exp-tag.loss { font-weight: 600; }

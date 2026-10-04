@@ -5247,8 +5247,7 @@ async function loadExperienceLibrary(opts) {
   const list = $('#exp-list');
   if (!list) return;
   // 交易对与周期**恒定取自当前 K 线订阅**，不提供手动选择：
-  // 经验库的意义就是「我正在看的这个标的、这个周期上 Historically 怎么走」，
-  // 让用户另选一份等于把它变成另一个功能。
+  // 经验库的意义就是「我正在看的这个标的、这个周期上历史上怎么走」。
   const sym = ($('#ds-symbol')?.value || currentSettings?.general?.last_symbol || '').toUpperCase();
   const tf = ($('#ds-timeframe')?.value || currentSettings?.general?.last_timeframe || '');
   const showAll = !!(opts && opts.all);
@@ -5262,10 +5261,16 @@ async function loadExperienceLibrary(opts) {
   }
   if (cyc) q.set('cycle', cyc);
 
+  // N 根 K 线的判定窗口长度，用于在条目上显示「已走 k/N 根」
+  try {
+    const n = Number(currentSettings?.prompt?.experience_verify_bars || 0);
+    if (n > 0) window.__expVerifyBars = n;
+  } catch (e) { /* 设置未加载时用默认值 */ }
+
   const scopeEl = $('#exp-scope');
   if (scopeEl) {
     scopeEl.textContent = showAll ? '全部品种与周期' : `${sym} · ${tf}`;
-    scopeEl.title = showAll ? '点击「查看全部品种与周期」已取消' : '经验库范围始终与当前 K 线一致';
+    scopeEl.title = showAll ? '当前浏览全库' : '经验库范围始终与当前 K 线一致';
   }
 
   list.innerHTML = '<div class="exp-empty">加载中…</div>';
@@ -5273,13 +5278,28 @@ async function loadExperienceLibrary(opts) {
     const d = await API.get(`/api/experience${q.toString() ? '?' + q.toString() : ''}`);
     const entries = d.entries || [];
     _fillExpSelect('#exp-cycle', d.cycle_options || [], '全部市场周期');
+
+    const sc = d.status_counts || {};
+    const pending = sc.pending || 0;
+    const wins = entries.filter(e => e.result === 'win').length;
+    const losses = entries.filter(e => e.result === 'loss').length;
+    const decided = wins + losses;
+    const parts = [`共 ${entries.length} 条`];
+    if (decided) parts.push(`盈利 ${wins} / 亏损 ${losses}，胜率 ${Math.round(wins / decided * 100)}%`);
+    if (pending) parts.push(`待验证 ${pending}`);
+    if (sc.unresolved) parts.push(`未触及 ${sc.unresolved}`);
+    if (cyc) parts.push(`市场周期 ${cyc}`);
+
     const summary = $('#exp-summary');
-    if (summary) {
-      const win = entries.filter(e => e.result === 'win').length;
-      const loss = entries.length - win;
-      summary.textContent = `共 ${entries.length} 条`
-        + (entries.length ? `（盈利 ${win} / 亏损 ${loss}，胜率 ${Math.round(win / entries.length * 100)}%）` : '')
-        + (cyc ? ` · 市场周期 ${cyc}` : '');
+    if (summary) summary.textContent = parts.join(' · ');
+
+    const vBtn = $('#btn-exp-verify');
+    if (vBtn) {
+      vBtn.disabled = pending === 0;
+      vBtn.textContent = pending ? `验证 (${pending})` : '验证';
+      vBtn.title = pending
+        ? `按入场后的 N 根 K 线结算待验证记录（当前 N=${window.__expVerifyBars || 20}）`
+        : '当前范围没有待验证记录';
     }
     const allBtn = $('#exp-show-all');
     if (allBtn) allBtn.hidden = !showAll || entries.length > 0;
@@ -5288,32 +5308,58 @@ async function loadExperienceLibrary(opts) {
       list.innerHTML = showAll
         ? '<div class="exp-empty">经验库暂无任何条目。</div>'
         : `<div class="exp-empty">${escapeHtml(sym)} ${escapeHtml(tf)} 下暂无经验条目。<br>`
-          + '出现下单信号后，系统会在 TP1/SL 触达时自动回写。</div>';
+          + '出现下单信号后系统会立刻写入一条「待验证」，K 线走完后自动结算。</div>';
       return;
     }
-    list.innerHTML = entries.map((e) => {
-      const win = e.result === 'win';
+    list.innerHTML = entries.map((e, i) => {
+      const st = e.status || (e.result === 'win' ? 'win' : 'loss');
       const pnl = typeof e.pnl_pct === 'number' ? e.pnl_pct : null;
-      const pats = (e.detected_patterns || []).slice(0, 4).join('、');
-      // 枚举一律中英展示：中文给操作者看，括号里的 raw 值用于和提示词、
-      // 落盘目录名对账。缺 label 时（老数据）回退到裸值。
+      const pats = (e.detected_patterns || []).slice(0, 3).join('、');
       const cycL = e.cycle_label || e.cycle_position || '';
-      const dir = e.direction_label || e.direction || '';
-      const res = e.case_type_label || (win ? '盈利 (win)' : '亏损 (loss)');
-      return `<div class="exp-item ${win ? 'is-success' : 'is-failure'}">
+      const dirL = e.direction_label || e.direction || '';
+      const dir = e.is_long === false ? '空头' : '多头';
+      const cls = st === 'pending' ? 'is-pending' : st === 'unresolved' ? 'is-unresolved'
+                : st === 'win' ? 'is-success' : 'is-failure';
+      const N = window.__expVerifyBars || 20;
+      const prog = st === 'pending'
+        ? `<span class="exp-tag">已走 ${e.bars_seen || 0}/${N} 根</span>` : '';
+      return `<div class="exp-item ${cls}" data-exp-index="${i}">
         <div class="exp-head">
           <span class="exp-symbol">${escapeHtml(e.symbol || '—')}</span>
           <span class="exp-tag">${escapeHtml(e.timeframe || '')}</span>
           ${cycL ? `<span class="exp-tag" title="${escapeHtml(e.cycle_position || '')}">${escapeHtml(cycL)}</span>` : ''}
-          ${dir ? `<span class="exp-tag">${escapeHtml(dir)}</span>` : ''}
-          <span class="exp-tag ${win ? 'win' : 'loss'}">${escapeHtml(res)}</span>
+          ${dirL ? `<span class="exp-tag">${escapeHtml(dirL)}</span>` : ''}
+          <span class="exp-tag ${st}">${escapeHtml(e.case_type_label || st)}</span>
           ${e.confidence != null ? `<span class="exp-tag">置信 ${e.confidence}</span>` : ''}
+          ${prog}
           ${pnl != null ? `<span class="exp-pnl ${pnl >= 0 ? 'pos' : 'neg'}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</span>` : ''}
         </div>
         <div class="exp-summary">${escapeHtml(e.summary || '')}</div>
+        <div class="exp-levels">入场 ${escapeHtml(String(e.entry_price ?? '—'))} · 止盈 ${escapeHtml(String(e.take_profit_price ?? '—'))} · 止损 ${escapeHtml(String(e.stop_loss_price ?? '—'))} · ${dir}</div>
         ${pats ? `<div class="exp-patterns">形态：${escapeHtml(pats)}</div>` : ''}
       </div>`;
     }).join('');
+
+    // 点击条目 → 主图回放入场点 / 止盈 / 止损 / 判定区间
+    list.querySelectorAll('.exp-item').forEach((el) => {
+      el.addEventListener('click', () => {
+        const rec = entries[Number(el.dataset.expIndex)];
+        if (!rec) return;
+        list.querySelectorAll('.exp-item.is-replaying').forEach(x => x.classList.remove('is-replaying'));
+        el.classList.add('is-replaying');
+        if (typeof window.setExperienceReplay === 'function') {
+          window.setExperienceReplay(candleSeries, rec);
+          const anchor = Number(rec.entry_ts_open_ms || 0);
+          const win = Number(window.__PA_LAST_BAR_TIME__ || 0);
+          if (anchor > 0 && win > 0) {
+            const sec = anchor / 1000;
+            const from = Math.max(0, Math.round((sec - win) / 3600) - 10);
+            chart.timeScale().setVisibleLogicalRange({ from, to: from + 80 });
+          }
+        }
+        showToast(`已在主图标出：${rec.symbol} ${rec.timeframe} 的入场 / 止盈 / 止损`, 'success');
+      });
+    });
   } catch (err) {
     list.innerHTML = `<div class="exp-empty">加载失败：${escapeHtml(String(err.message || err))}</div>`;
   }
@@ -5357,6 +5403,31 @@ async function initExperienceTab() {
   if (cycSel && !cycSel.dataset.bound) {
     cycSel.dataset.bound = '1';
     cycSel.addEventListener('change', () => loadExperienceLibrary({ all: _expShowAll }));
+  }
+  const vBtn = $('#btn-exp-verify');
+  if (vBtn && !vBtn.dataset.bound) {
+    vBtn.dataset.bound = '1';
+    vBtn.addEventListener('click', async () => {
+      vBtn.disabled = true;
+      const prev = vBtn.textContent;
+      vBtn.textContent = '验证中…';
+      try {
+        const r = await API.post('/api/experience/verify?scope_current=true');
+        const decided = (r.win || 0) + (r.loss || 0) + (r.unresolved || 0);
+        if (decided) {
+          showToast(`结算 ${decided} 条：盈利 ${r.win} / 亏损 ${r.loss} / 未触及 ${r.unresolved}`, 'success');
+        } else if (r.pending) {
+          showToast(`还有 ${r.pending} 条 K 线未走满，继续等待`, 'warning');
+        } else {
+          showToast('暂无可结算的记录', 'warning');
+        }
+        await loadExperienceLibrary({ all: _expShowAll });
+      } catch (e) {
+        showToast('验证失败：' + (e.message || e), 'error');
+        vBtn.textContent = prev;
+        vBtn.disabled = false;
+      }
+    });
   }
   const allBtn = $('#exp-show-all');
   if (allBtn && !allBtn.dataset.bound) {

@@ -580,3 +580,92 @@ function _toNum(v) {
   }
   return null;
 }
+
+// ── 经验条目回放 ────────────────────────────────────────────────────────────
+// 点开经验库里的一条记录时，把它的入场点、TP/SL 以及被判定的 K 线区间
+// 画回主图。只有价格数字很难想象"当时发生了什么"，画出来才直观。
+// 数据契约见 GET /api/experience 的 entry：{entry_price, take_profit_price,
+// stop_loss_price, is_long, entry_ts_open_ms, status, pnl_pct}。
+
+function setExperienceReplay(series, entry) {
+  _clearPriceLines(series);
+  if (!entry || !series) return;
+
+  const isLong = entry.is_long !== false;
+  const dir = isLong ? '多' : '空';
+  const statusLabel = {
+    pending: '待验证', win: '盈利', loss: '亏损', unresolved: '未触及',
+  }[entry.status] || entry.status || '—';
+
+  const lines = [
+    { price: Number(entry.entry_price), color: '#2962ff',
+      title: `入场 ${entry.entry_price}`, lineStyle: 0, lineWidth: 2 },
+    { price: Number(entry.take_profit_price), color: '#22c55e',
+      title: `止盈 ${entry.take_profit_price}`, lineStyle: 2, lineWidth: 1 },
+    { price: Number(entry.stop_loss_price), color: '#ef4444',
+      title: `止损 ${entry.stop_loss_price}`, lineStyle: 2, lineWidth: 1 },
+  ];
+  for (const l of lines) {
+    if (!Number.isFinite(l.price) || l.price <= 0) continue;
+    try {
+      series.createPriceLine({
+        price: l.price, color: l.color, lineWidth: l.lineWidth,
+        lineStyle: l.lineStyle, axisLabelVisible: true, title: l.title,
+      });
+    } catch (e) { /* 价格线失败不应影响回放整体 */ }
+  }
+
+  // 把"被判定的 K 线区间"圈出来：入场之后的第一根到最后结算的那根
+  const markers = [];
+  const from = Number(entry.entry_ts_open_ms || 0);
+  if (from > 0 && Number.isFinite(from)) {
+    const sec = Math.floor(from / 1000);
+    markers.push({ time: sec, position: 'aboveBar', shape: 'arrowDown',
+                   color: '#2962ff', text: '入场' });
+  }
+  if (entry.resolved_ts_open_ms) {
+    const sec = Math.floor(Number(entry.resolved_ts_open_ms) / 1000);
+    if (Number.isFinite(sec) && (!from || sec > from)) {
+      markers.push({ time: sec, position: 'belowBar', shape: 'circle',
+                     color: statusLabel === '盈利' ? '#22c55e'
+                          : statusLabel === '亏损' ? '#ef4444' : '#94a3b8',
+                     text: statusLabel });
+    }
+  }
+  if (markers.length) {
+    try { series.setMarkers(markers); } catch (e) { /* 忽略 */ }
+  }
+
+  _renderExperienceLegend(entry, statusLabel, isLong, dir);
+}
+
+function clearExperienceReplay(series) {
+  _clearPriceLines(series);
+  try { series.setMarkers([]); } catch (e) { /* 忽略 */ }
+  const el = document.getElementById('experience-legend');
+  if (el) el.innerHTML = '';
+}
+
+function _renderExperienceLegend(entry, statusLabel, isLong, dir) {
+  const el = document.getElementById('experience-legend');
+  if (!el) return;
+  const pnl = typeof entry.pnl_pct === 'number' ? entry.pnl_pct : null;
+  const pnlText = pnl == null ? ''
+    : `<span style="color:${pnl >= 0 ? '#22c55e' : '#ef4444'}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</span>`;
+  const bars = entry.bars_seen != null ? `${entry.bars_seen} 根 K 线内` : '';
+  el.innerHTML = `
+    <div class="exp-lg-title">经验回放 · ${escapeHtml(statusLabel)}</div>
+    <div class="exp-lg-row">${escapeHtml(entry.symbol || '')} ${escapeHtml(entry.timeframe || '')} · ${dir}头</div>
+    ${entry.cycle_label ? `<div class="exp-lg-row">${escapeHtml(entry.cycle_label)}</div>` : ''}
+    <div class="exp-lg-row">入场 <b>${entry.entry_price}</b> → 止盈 ${entry.take_profit_price} / 止损 ${entry.stop_loss_price}</div>
+    ${bars ? `<div class="exp-lg-row">判定窗口 ${escapeHtml(bars)} ${pnlText}</div>` : ''}
+    ${entry.status === 'pending' ? '<div class="exp-lg-row dim">K 线尚未走完，继续等待结算</div>' : ''}
+    ${entry.status === 'unresolved' ? '<div class="exp-lg-row dim">窗口内未触及任一价位</div>' : ''}
+  `;
+}
+
+// 挂到全局，供 app.js 调用
+if (typeof window !== 'undefined') {
+  window.setExperienceReplay = setExperienceReplay;
+  window.clearExperienceReplay = clearExperienceReplay;
+}

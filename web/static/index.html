@@ -9,7 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="/css/style.css?v=30">
+<link rel="stylesheet" href="/css/style.css?v=32">
 </head>
 <body>
 
@@ -62,7 +62,11 @@
       <div id="chart-main"></div>
       <div id="chart-osc-wrap"></div>
       <div id="tz-label">⏰ 浏览器本地时区</div>
+      <!-- #chart-legend 的 innerHTML 会被 indicators.js 整体重写，
+           因此 #experience-legend 必须是它的**兄弟**而非子节点，
+           否则每次刷新指标图例都会把经验回放图例一并抹掉。 -->
       <div id="chart-legend" aria-label="主图指标图例"></div>
+      <div id="experience-legend" class="exp-legend" aria-label="经验回放图例"></div>
       <div id="trade-legend" aria-label="交易价位图例"></div>
     </div>
   </div>
@@ -464,6 +468,7 @@
       <div class="exp-toolbar">
         <span id="exp-scope" class="exp-scope" title="经验库始终与当前 K 线保持一致"></span>
         <select id="exp-cycle" class="seg-select" title="按市场周期过滤"></select>
+        <button id="btn-exp-verify" class="compact-btn" title="按入场后的 N 根 K 线结算待验证记录">验证</button>
         <button id="btn-exp-refresh" class="compact-btn" title="刷新经验库">刷新</button>
       </div>
       <div id="exp-summary" class="muted-text exp-summary"></div>
@@ -651,9 +656,9 @@
 <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
 <script src="/js/api.js?v=3"></script>
-<script src="/js/chart.js?v=6"></script>
+<script src="/js/chart.js?v=7"></script>
 <script src="/js/indicators.js?v=5"></script>
 <script src="/js/continuous_gate.js?v=1"></script>
-<script src="/js/app.js?v=47"></script>
+<script src="/js/app.js?v=50"></script>
 </body>
 </html>
