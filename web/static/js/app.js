@@ -281,6 +281,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadBars();          // 最后拉 K 线
   loadHistoryList();         // 拉当前 (exchange, symbol, timeframe) 的历史分析记录
   refreshIncrementalButtonState();  // 初始化增量分析按钮可用性
+  // 经验库范围恒等于当前订阅（交易对 + 周期），切品种/周期后必须同步刷新，
+  // 否则面板会停在上一个标的的结果上。
+  if (typeof loadExperienceLibrary === 'function') {
+    loadExperienceLibrary({ all: typeof _expShowAll !== 'undefined' && _expShowAll });
+  }
 
   // 注册指标库上下文（主图 + 副图容器），恢复已保存的指标
   if (window._indicatorsAPI) {
@@ -5238,49 +5243,52 @@ function exportRecordJson() {
 // 临时 Toast 提示（不依赖 toast-container，使用简易浮层）
 // ── 经验库浏览 ──────────────────────────────────────────────────────────────
 // 经验库此前没有写入方也没有浏览入口，这里是只读面板。
-async function loadExperienceLibrary() {
+async function loadExperienceLibrary(opts) {
   const list = $('#exp-list');
   if (!list) return;
-  const follow = $('#exp-follow-current')?.checked;
+  // 交易对与周期**恒定取自当前 K 线订阅**，不提供手动选择：
+  // 经验库的意义就是「我正在看的这个标的、这个周期上 Historically 怎么走」，
+  // 让用户另选一份等于把它变成另一个功能。
+  const sym = ($('#ds-symbol')?.value || currentSettings?.general?.last_symbol || '').toUpperCase();
+  const tf = ($('#ds-timeframe')?.value || currentSettings?.general?.last_timeframe || '');
+  const showAll = !!(opts && opts.all);
+  const cyc = showAll ? '' : ($('#exp-cycle')?.value || '');
+  _expShowAll = showAll;
+
   const q = new URLSearchParams();
-  if (follow) {
-    // 跟随当前订阅：只看你正在看的这个品种 / 周期下的经验
-    const sym = $('#ds-symbol')?.value || currentSettings?.general?.last_symbol || '';
-    const tf = $('#ds-timeframe')?.value || currentSettings?.general?.last_timeframe || '';
-    if (sym) q.set('symbol', sym);
-    if (tf) q.set('timeframe', tf);
-  } else {
-    const cyc = $('#exp-cycle')?.value || '';
-    const sym = $('#exp-symbol')?.value || '';
-    const tf = $('#exp-timeframe')?.value || '';
-    if (cyc) q.set('cycle', cyc);
+  if (!showAll) {
     if (sym) q.set('symbol', sym);
     if (tf) q.set('timeframe', tf);
   }
-  const qs = q.toString();
+  if (cyc) q.set('cycle', cyc);
+
+  const scopeEl = $('#exp-scope');
+  if (scopeEl) {
+    scopeEl.textContent = showAll ? '全部品种与周期' : `${sym} · ${tf}`;
+    scopeEl.title = showAll ? '点击「查看全部品种与周期」已取消' : '经验库范围始终与当前 K 线一致';
+  }
+
   list.innerHTML = '<div class="exp-empty">加载中…</div>';
   try {
-    const d = await API.get(`/api/experience${qs ? '?' + qs : ''}`);
+    const d = await API.get(`/api/experience${q.toString() ? '?' + q.toString() : ''}`);
     const entries = d.entries || [];
-    _fillExpSelect('#exp-symbol', d.symbols, '全部交易对');
-    _fillExpSelect('#exp-timeframe', d.timeframes, '全部周期');
-    _fillExpSelect('#exp-cycle', Object.keys(d.cycles || {}), '全部市场周期');
+    _fillExpSelect('#exp-cycle', d.cycle_options || [], '全部市场周期');
     const summary = $('#exp-summary');
     if (summary) {
       const win = entries.filter(e => e.result === 'win').length;
       const loss = entries.length - win;
-      const scope = follow
-        ? `${$('#ds-symbol')?.value || ''} · ${$('#ds-timeframe')?.value || ''}`
-        : '全部';
-      summary.textContent = `${scope} — 共 ${entries.length} 条`
-        + (entries.length ? `（盈利 ${win} / 亏损 ${loss}，胜率 ${entries.length ? Math.round(win / entries.length * 100) : 0}%）` : '');
+      summary.textContent = `共 ${entries.length} 条`
+        + (entries.length ? `（盈利 ${win} / 亏损 ${loss}，胜率 ${Math.round(win / entries.length * 100)}%）` : '')
+        + (cyc ? ` · 市场周期 ${cyc}` : '');
     }
+    const allBtn = $('#exp-show-all');
+    if (allBtn) allBtn.hidden = !showAll || entries.length > 0;
+
     if (!entries.length) {
-      list.innerHTML = follow
-        ? '<div class="exp-empty">当前品种/周期下暂无经验条目。<br>'
-          + '出现下单信号后，系统会在 TP1/SL 触达时自动回写；'
-          + '也可取消「跟随当前」查看其它品种。</div>'
-        : '<div class="exp-empty">没有匹配的条目。</div>';
+      list.innerHTML = showAll
+        ? '<div class="exp-empty">经验库暂无任何条目。</div>'
+        : `<div class="exp-empty">${escapeHtml(sym)} ${escapeHtml(tf)} 下暂无经验条目。<br>`
+          + '出现下单信号后，系统会在 TP1/SL 触达时自动回写。</div>';
       return;
     }
     list.innerHTML = entries.map((e) => {
@@ -5289,14 +5297,14 @@ async function loadExperienceLibrary() {
       const pats = (e.detected_patterns || []).slice(0, 4).join('、');
       // 枚举一律中英展示：中文给操作者看，括号里的 raw 值用于和提示词、
       // 落盘目录名对账。缺 label 时（老数据）回退到裸值。
-      const cyc = e.cycle_label || e.cycle_position || '';
+      const cycL = e.cycle_label || e.cycle_position || '';
       const dir = e.direction_label || e.direction || '';
       const res = e.case_type_label || (win ? '盈利 (win)' : '亏损 (loss)');
       return `<div class="exp-item ${win ? 'is-success' : 'is-failure'}">
         <div class="exp-head">
           <span class="exp-symbol">${escapeHtml(e.symbol || '—')}</span>
           <span class="exp-tag">${escapeHtml(e.timeframe || '')}</span>
-          ${cyc ? `<span class="exp-tag" title="${escapeHtml(e.cycle_position || '')}">${escapeHtml(cyc)}</span>` : ''}
+          ${cycL ? `<span class="exp-tag" title="${escapeHtml(e.cycle_position || '')}">${escapeHtml(cycL)}</span>` : ''}
           ${dir ? `<span class="exp-tag">${escapeHtml(dir)}</span>` : ''}
           <span class="exp-tag ${win ? 'win' : 'loss'}">${escapeHtml(res)}</span>
           ${e.confidence != null ? `<span class="exp-tag">置信 ${e.confidence}</span>` : ''}
@@ -5311,14 +5319,18 @@ async function loadExperienceLibrary() {
   }
 }
 
+let _expShowAll = false;
+
 function _fillExpSelect(sel, values, allLabel) {
   const el = document.querySelector(sel);
   if (!el) return;
   const cur = el.value;
-  const opts = Array.isArray(values) ? values : [];
-  el.innerHTML = `<option value="">${allLabel}</option>`
-    + opts.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join('');
-  if (opts.includes(cur)) el.value = cur;
+  // 兼容两种形态：字符串数组，或 {value,label} 对象数组（枚举一律中英展示）
+  const opts = (Array.isArray(values) ? values : []).map(v =>
+    (v && typeof v === 'object') ? v : { value: v, label: String(v) });
+  el.innerHTML = `<option value="">${escapeHtml(allLabel)}</option>`
+    + opts.map(o => `<option value="${escapeHtml(o.value)}">${escapeHtml(o.label)}</option>`).join('');
+  if (opts.some(o => o.value === cur)) el.value = cur;
 }
 
 async function initExperienceTab() {
@@ -5341,22 +5353,18 @@ async function initExperienceTab() {
     btn.dataset.bound = '1';
     btn.addEventListener('click', loadExperienceLibrary);
   }
-  // 手动下拉：一旦用户自己选，取消「跟随当前」避免两个控件互相覆盖
-  ['#exp-symbol', '#exp-timeframe', '#exp-cycle'].forEach((sel) => {
-    const el = $(sel);
-    if (el && !el.dataset.bound) {
-      el.dataset.bound = '1';
-      el.addEventListener('change', () => {
-        const follow = $('#exp-follow-current');
-        if (follow && follow.checked) { follow.checked = false; }
-        loadExperienceLibrary();
-      });
-    }
-  });
-  const follow = $('#exp-follow-current');
-  if (follow && !follow.dataset.bound) {
-    follow.dataset.bound = '1';
-    follow.addEventListener('change', loadExperienceLibrary);
+  const cycSel = $('#exp-cycle');
+  if (cycSel && !cycSel.dataset.bound) {
+    cycSel.dataset.bound = '1';
+    cycSel.addEventListener('change', () => loadExperienceLibrary({ all: _expShowAll }));
+  }
+  const allBtn = $('#exp-show-all');
+  if (allBtn && !allBtn.dataset.bound) {
+    allBtn.dataset.bound = '1';
+    allBtn.addEventListener('click', () => {
+      _expShowAll = !_expShowAll;
+      loadExperienceLibrary({ all: _expShowAll });
+    });
   }
   loadExperienceLibrary();
 }

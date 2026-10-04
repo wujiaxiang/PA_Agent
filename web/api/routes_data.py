@@ -426,10 +426,16 @@ async def list_experience(
             counts = {k: v for k, v in per.items() if v["success"] or v["failure"]}
 
         rows.sort(key=lambda x: x.get("timestamp_ms") or 0, reverse=True)
+        # 市场周期下拉选项：value 仍是 raw（用于过滤），label 走中英标签，
+        # 避免前端出现 broad_channel / unknown 这类裸枚举
+        cycle_options = [
+            {"value": c, "label": _bilingual_cycle(c)} for c in sorted(counts)
+        ]
         return {
             "total": len(rows),
             "entries": rows,
             "cycles": counts,
+            "cycle_options": cycle_options,
             "symbols": symbols,
             "timeframes": timeframes,
         }
