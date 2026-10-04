@@ -212,6 +212,8 @@ class ExperienceWriter:
         is_long: bool,
         entry_ts_open_ms: int,
         created_ts_ms: int | None = None,
+        analysis_context: dict[str, Any] | None = None,
+        bars_snapshot: list[dict[str, Any]] | None = None,
         extra: dict[str, Any] | None = None,
     ) -> Path:
         """Stage 1 — record the plan the moment the signal fires.
@@ -242,6 +244,13 @@ class ExperienceWriter:
             "created_ts_ms": int(created_ts_ms if created_ts_ms is not None else _time.time() * 1000),
             "bars_seen": 0,
         }
+        # 复盘所需的完整上下文：只存决策要点，不存 prompt/response 原文
+        # （后者动辄几万 token，一条记录存全会让库迅速膨胀且无复盘价值）。
+        if analysis_context:
+            content["analysis_context"] = _compact_analysis_context(analysis_context)
+        # 进场前后的 K 线窗口：让复盘能对照「当时看到的形态」与「实际走势」
+        if bars_snapshot:
+            content["bars_snapshot"] = _compact_bars(bars_snapshot)
         if extra:
             for k, v in extra.items():
                 if k not in content:
@@ -430,6 +439,7 @@ def save_pending_if_resolvable(
     stage1: dict[str, Any],
     stage2_flat: dict[str, Any],
     entry_ts_open_ms: int,
+    bars: list[Any] | None = None,
 ) -> Optional[Path]:
     """Stage-1 gate: write a pending record only when the plan is resolvable.
 
@@ -466,6 +476,12 @@ def save_pending_if_resolvable(
     if int(entry_ts_open_ms or 0) <= 0:
         return None
 
+    # 复盘上下文：阶段一原始判断 + 扁平化的阶段二决策 + K 线窗口
+    context = {
+        "stage1": dict(stage1 or {}),
+        "stage2": dict(stage2_flat or {}),
+    }
+
     return writer.save_pending(
         cycle_position=str(stage1.get("cycle_position") or "trending_tr"),
         direction=direction,
@@ -480,6 +496,8 @@ def save_pending_if_resolvable(
         stop_loss_price=sl,
         is_long=is_long,
         entry_ts_open_ms=int(entry_ts_open_ms),
+        analysis_context=context,
+        bars_snapshot=list(bars or []),
     )
 
 
@@ -487,3 +505,85 @@ def _num(v: Any) -> Optional[float]:
     if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v:
         return float(v)
     return None
+
+
+# ── 复盘上下文的压缩 ──────────────────────────────────────────────────────────
+# LLM 复盘需要知道「当时我们看到了什么、为什么这么判」，否则它只会对着
+# 一个 pnl 数字事后诸葛亮。保留决策要点，丢弃冗长原文。
+
+_CONTEXT_KEEP: dict[str, tuple[str, ...]] = {
+    "stage1": (
+        "cycle_position", "alternative_cycle_position", "direction",
+        "detected_patterns", "diagnosis_confidence", "entry_setup",
+        "gate_result", "bar_by_bar_summary", "htf_context", "climax_risk",
+        "trend", "market_cycle", "next_cycle", "support_resistance",
+    ),
+    "stage2": (
+        "order_type", "order_direction", "entry_price", "stop_loss_price",
+        "take_profit_price", "take_profit2_price", "trade_confidence",
+        "risk_reward_ratio", "estimated_win_rate", "diagnosis_summary",
+        "reasoning", "decision", "terminal",
+    ),
+}
+
+
+def _compact_analysis_context(ctx: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for section, keys in _CONTEXT_KEEP.items():
+        block = ctx.get(section) or {}
+        if not isinstance(block, dict):
+            continue
+        keep: dict[str, Any] = {}
+        for k in keys:
+            if k not in block:
+                continue
+            v = block[k]
+            # 长文本截断：保留结论，丢弃展开叙述
+            if isinstance(v, str):
+                keep[k] = v[:600]
+            elif isinstance(v, (int, float, bool)) or v is None:
+                keep[k] = v
+            elif isinstance(v, list):
+                keep[k] = v[:12]
+            elif isinstance(v, dict):
+                keep[k] = {kk: vv for kk, vv in list(v.items())[:12]}
+        if keep:
+            out[section] = keep
+    for extra_key in ("order_type", "order_direction", "entry_price",
+                      "stop_loss_price", "take_profit_price",
+                      "trade_confidence", "reasoning"):
+        if extra_key in ctx and extra_key not in (out.get("stage2") or {}):
+            out.setdefault("stage2_flat", {})[extra_key] = ctx[extra_key]
+    return out
+
+
+def _compact_bars(bars: list[Any], *, before: int = 20, after: int = 20) -> list[dict[str, Any]]:
+    """Keep a bounded window around the entry so review can see both sides."""
+    rows: list[dict[str, Any]] = []
+    for b in bars or []:
+        if isinstance(b, dict):
+            get = b.get
+        else:
+            get = lambda k, d=None: getattr(b, k, d)  # noqa: E731
+        try:
+            rows.append({
+                "ts_open": int(get("ts_open", 0) or 0),
+                "o": _rnd(get("open")),
+                "h": _rnd(get("high")),
+                "l": _rnd(get("low")),
+                "c": _rnd(get("close")),
+            })
+        except (TypeError, ValueError):
+            continue
+    rows.sort(key=lambda r: r["ts_open"])
+    if len(rows) <= before + after:
+        return rows
+    mid = len(rows) // 2
+    return rows[max(0, mid - before): mid + after]
+
+
+def _rnd(v: Any) -> float | None:
+    try:
+        return round(float(v), 8) if v is not None else None
+    except (TypeError, ValueError):
+        return None

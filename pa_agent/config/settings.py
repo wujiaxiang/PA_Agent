@@ -51,6 +51,13 @@ class PromptSettings(BaseModel):
     experience_verify_bars: int = Field(default=20, ge=3, le=500)
     # 一次验证最多处理多少条待验证记录（每条可能要单独拉一次行情）
     experience_verify_batch: int = Field(default=5, ge=1, le=50)
+    # 后台自动结算的轮询间隔（秒）。下限 30，由 scheduler 强制。
+    experience_verify_interval_s: float = Field(default=180.0, ge=30.0, le=3600.0)
+    # 结算方式：
+    #   "auto"  — 定时器自动结算（另有「验证」按钮可手动触发）
+    #   "manual" — 只在用户点「验证」按钮时结算
+    # 用 "manual" 的场景：需要人工逐条确认、或行情源不稳定时避免后台频繁取数
+    experience_verify_mode: str = Field(default="auto", pattern="^(auto|manual)$")
     experience_max_chars_per_entry: int = Field(default=400, ge=100, le=4000)
     #: Inject pattern判定表 + 速查 brief into Stage 1 user prompt (reduces missed tags).
     stage1_inject_pattern_briefs: bool = True

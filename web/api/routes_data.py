@@ -559,3 +559,19 @@ async def verify_experience(request: Request, scope_current: bool = Query(defaul
         scope=scope,
     )
     return JSONResponse(content=summary, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/experience/verify/once")
+async def verify_experience_once(request: Request):
+    """Run exactly one background settlement pass (the scheduler's unit of work).
+
+    Exposed so the UI can nudge settlement on demand without duplicating the
+    scheduler's scope/guard logic — and so it stays testable.
+    """
+    from web.api import experience_scheduler
+
+    # force=True：manual 模式只关掉**定时器**，不关掉用户点的「验证」按钮
+    summary = await asyncio.to_thread(experience_scheduler.run_once,
+                                      request.app.state.ctx, True)
+    return JSONResponse(content=summary or {"skipped": True},
+                        headers={"Cache-Control": "no-store"})

@@ -5337,8 +5337,22 @@ async function loadExperienceLibrary(opts) {
         <div class="exp-summary">${escapeHtml(e.summary || '')}</div>
         <div class="exp-levels">入场 ${escapeHtml(String(e.entry_price ?? '—'))} · 止盈 ${escapeHtml(String(e.take_profit_price ?? '—'))} · 止损 ${escapeHtml(String(e.stop_loss_price ?? '—'))} · ${dir}</div>
         ${pats ? `<div class="exp-patterns">形态：${escapeHtml(pats)}</div>` : ''}
+        <div class="exp-actions">
+          <button class="exp-mini" data-review="${escapeHtml(e.filename || '')}"
+                  title="让 AI 基于这条记录的完整上下文（当时的判断 + K 线窗口 + 实际结果）做事后复盘">复盘</button>
+        </div>
+        <div class="exp-review" data-review-for="${escapeHtml(e.filename || '')}"></div>
       </div>`;
     }).join('');
+
+    // 复盘按钮：每条记录独立，不设全局按钮。事件委托 + stopPropagation，
+    // 避免触发条目的图表回放。
+    list.querySelectorAll('.exp-mini').forEach((btn) => {
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        startExperienceReview(btn.dataset.review);
+      });
+    });
 
     // 点击条目 → 主图回放入场点 / 止盈 / 止损 / 判定区间
     list.querySelectorAll('.exp-item').forEach((el) => {
@@ -5366,6 +5380,69 @@ async function loadExperienceLibrary(opts) {
 }
 
 let _expShowAll = false;
+let _expReviewAbort = null;
+
+// 单条经验的 LLM 复盘。刻意做成「就地展开」而不是跳到追问 tab：
+// 复盘针对的是这一条记录，和当前图表/追问会话不是一回事，混在一起会
+// 污染追问的上下文。
+async function startExperienceReview(recordId) {
+  if (!recordId) return;
+  const box = document.querySelector(`.exp-review[data-review-for="${CSS.escape(recordId)}"]`);
+  if (!box) return;
+  if (_expReviewAbort) { try { _expReviewAbort.abort(); } catch (e) {} _expReviewAbort = null; }
+
+  const running = box.querySelector('.exp-review-body');
+  if (running) { box.innerHTML = ''; return; }   // 再点一次 = 收起
+
+  box.innerHTML = '<div class="exp-review-head">复盘中…</div>'
+    + '<div class="exp-review-body muted-text">正在读取档案并请求模型…</div>';
+  box.scrollIntoView({ block: 'nearest' });
+
+  const ctrl = new AbortController();
+  _expReviewAbort = ctrl;
+  let reasoning = '', content = '';
+  try {
+    const res = await fetch(`/api/experience/review/stream?record_id=${encodeURIComponent(recordId)}`,
+      { signal: ctrl.signal });
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    const paint = () => {
+      box.innerHTML = '<div class="exp-review-head">复盘 · 基于该记录的完整上下文</div>'
+        + (reasoning ? `<details class="exp-review-reasoning"><summary>推理过程</summary>`
+            + `<div class="exp-review-reasoning-body">${escapeHtml(reasoning)}</div></details>` : '')
+        + `<div class="exp-review-body">${escapeHtml(content) || '<span class="muted-text">生成中…</span>'}</div>`;
+    };
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      // sse_starlette 用 CRLF 分隔事件；不归一化就永远切不出完整事件。
+      buf += dec.decode(value, { stream: true }).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      const parts = buf.split('\n\n');
+      buf = parts.pop() || '';
+      for (const part of parts) {
+        let ev = '', data = '';
+        for (const line of part.split('\n')) {
+          if (line.startsWith('event:')) ev = line.slice(6).trim();
+          else if (line.startsWith('data:')) data += line.slice(5).replace(/^ /, '');
+        }
+        if (ev === 'reasoning') reasoning += data;
+        else if (ev === 'content') { content += data; paint(); }
+        else if (ev === 'error') { box.innerHTML += `<div class="exp-review-error">复盘失败：${escapeHtml(data)}</div>`; }
+      }
+    }
+    paint();
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      box.innerHTML = `<div class="exp-review-error">复盘失败：${escapeHtml(String(e.message || e))}</div>`;
+    }
+  } finally {
+    _expReviewAbort = null;
+  }
+}
+
+
 
 function _fillExpSelect(sel, values, allLabel) {
   const el = document.querySelector(sel);
@@ -5412,12 +5489,15 @@ async function initExperienceTab() {
       const prev = vBtn.textContent;
       vBtn.textContent = '验证中…';
       try {
-        const r = await API.post('/api/experience/verify?scope_current=true');
+        // 走调度器的单飞守卫，避免与后台定时轮询并发读行情
+        const r = await API.post('/api/experience/verify/once');
         const decided = (r.win || 0) + (r.loss || 0) + (r.unresolved || 0);
         if (decided) {
           showToast(`结算 ${decided} 条：盈利 ${r.win} / 亏损 ${r.loss} / 未触及 ${r.unresolved}`, 'success');
         } else if (r.pending) {
           showToast(`还有 ${r.pending} 条 K 线未走满，继续等待`, 'warning');
+        } else if (r && r.skipped) {
+          showToast('正在结算中，请稍后再试', 'warning');
         } else {
           showToast('暂无可结算的记录', 'warning');
         }

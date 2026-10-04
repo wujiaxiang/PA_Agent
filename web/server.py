@@ -56,6 +56,15 @@ async def lifespan(app: FastAPI):
     heartbeat_task = asyncio.create_task(_health_heartbeat(app))
     logger.info("Health heartbeat task created")
 
+    # Start the two-stage experience settler (pending → win/loss/unresolved).
+    # Without it a record stays pending forever unless the user presses 验证.
+    try:
+        from web.api import experience_scheduler
+
+        experience_scheduler.start(ctx)
+    except Exception as exc:
+        logger.warning("Failed to start experience scheduler: %s", exc)
+
     # Start background bars-stream task (SSE /api/bars/stream)
     from web.api import routes_bars_stream
     logger.info("Starting bars stream background task...")
@@ -73,6 +82,12 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     await routes_bars_stream.stop_background_task()
+    try:
+        from web.api import experience_scheduler
+
+        experience_scheduler.stop()
+    except Exception:
+        pass
     try:
         ctx.data_source.disconnect()
     except Exception:
@@ -187,6 +202,7 @@ from web.api.routes_data import router as data_router
 from web.api.routes_analyze import router as analyze_router
 from web.api.routes_chat import router as chat_router
 from web.api.routes_records import router as records_router
+from web.api.routes_experience_review import router as experience_review_router
 from web.api.routes_bars_stream import router as bars_stream_router
 from web.api.routes_demo import router as demo_router
 
@@ -197,6 +213,7 @@ app.include_router(chat_router, prefix="/api")
 app.include_router(records_router, prefix="/api")
 app.include_router(bars_stream_router, prefix="/api")
 app.include_router(demo_router, prefix="/api")
+app.include_router(experience_review_router, prefix="/api")
 
 
 @app.get("/api/health")

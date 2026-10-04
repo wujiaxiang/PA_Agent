@@ -3802,3 +3802,62 @@ button.secondary:hover { background: var(--border); }
 .exp-tag.pending { color: #cbd5e1; border-color: rgba(148, 163, 184, 0.5); }
 .exp-tag.unresolved { color: #94a3b8; }
 .exp-tag.win, .exp-tag.loss { font-weight: 600; }
+
+/* ── 经验复盘（每条记录一个按钮，就地展开）───────────────────────────────── */
+.exp-actions { margin-top: 6px; }
+.exp-mini {
+  padding: 3px 10px;
+  font-size: 11px;
+  font-family: inherit;
+  color: #9db6ff;
+  background: rgba(41, 98, 255, 0.12);
+  border: 1px solid rgba(41, 98, 255, 0.35);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease;
+}
+.exp-mini:hover { background: rgba(41, 98, 255, 0.24); color: #c3d4ff; }
+.exp-review:empty { display: none; }
+.exp-review {
+  margin-top: 8px;
+  padding: 9px 11px;
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-left: 2px solid rgba(41, 98, 255, 0.5);
+  border-radius: 4px;
+}
+.exp-review-head {
+  font-size: 11px;
+  color: #9db6ff;
+  margin-bottom: 5px;
+}
+.exp-review-body {
+  font-size: 12px;
+  line-height: 1.75;
+  color: #d1d5db;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.exp-review-reasoning { margin-bottom: 6px; }
+.exp-review-reasoning summary {
+  font-size: 11px;
+  color: #7b8794;
+  cursor: pointer;
+}
+.exp-review-reasoning-body {
+  margin-top: 4px;
+  padding: 6px 8px;
+  font-size: 11px;
+  line-height: 1.65;
+  color: #8b93a1;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 3px;
+  max-height: 220px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
+.exp-review-error {
+  margin-top: 5px;
+  font-size: 11px;
+  color: #ef4444;
+}

@@ -6,6 +6,7 @@ callbacks to an SSE stream so the web frontend sees tokens in real time.
 from __future__ import annotations
 
 import asyncio
+import threading
 import json
 import logging
 import time
@@ -493,6 +494,19 @@ def _run_analysis(
                     ctx.settings.general.last_symbol,
                     ctx.settings.general.last_timeframe,
                 )
+            # 刚写下的 pending 最可能马上够 N 根 K 线，顺带结算一轮。
+            # 后台线程，不阻塞本次分析响应；与定时器共用单飞守卫不会重叠。
+            # experience_verify_mode="manual" 时这里是空操作 —— 用户选了
+            # 手工验证，就不要在后台偷偷结算。
+            try:
+                from web.api import experience_scheduler
+
+                threading.Thread(
+                    target=experience_scheduler.run_once, args=(ctx,),
+                    name="experience-verify-once", daemon=True,
+                ).start()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("experience verify kickoff failed: %s", exc)
         except Exception as exc:  # noqa: BLE001
             logger.warning("post-order followup dispatch failed: %s", exc)
         # 脱敏：递归替换 payload 中出现的 api_key（含 raw_debug_payload 内的 prompt/response）

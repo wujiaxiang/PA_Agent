@@ -174,36 +174,39 @@ def spawn_post_order_followup(
         logger.warning("order opportunity gate failed: %s", exc)
         return False
 
-    # 经验库闭环：下单信号时同步起一个观察线程，等 TP1/SL 之一被触发后
-    # 把本次分析作为一条经验写回 experience/，让后续 Stage1/Stage2 能检索到。
-    # 与通知线程同样：失败只记 warning，绝不冒泡进分析主流程。
+    # ── 经验库阶段一：入场瞬间写 pending ──────────────────────────────────
+    # 「我们做了什么」是事实，不需要等结果；终态由 experience_verifier /
+    # experience_scheduler 按 N 根 K 线另行判定。与通知线程同样：
+    # 失败只记 warning，绝不冒泡进分析主流程。
     try:
-        from web.api.experience_watcher import spawn_experience_watch
+        from pa_agent.records.experience_writer import (
+            ExperienceWriter,
+            save_pending_if_resolvable,
+        )
 
-        # data_source 必须由调用方显式传入。
-        # 此前这里取 getattr(record, "_data_source", None) 或
-        # getattr(frame, "data_source", None)，而 AnalysisRecord 与 KlineFrame
-        # **都没有**这两个属性 → ds 恒为 None → spawn_experience_watch 从未被
-        # 调用过 → 经验库写入链路自打通以来就是死的（库里 36 条全是种子数据）。
-        ds = data_source
-        if ds is not None:
-            # 入场锚点：必须晚于最后一根**已收盘** bar，否则 watcher 会拿入场
-            # 之前的历史 K 线去判定这笔单。bars[0] 是未收盘 forming bar，
-            # bars[1] 才是最后一根已收盘。
-            bars = list(getattr(frame, "bars", None) or [])
-            closed = [b for b in bars if getattr(b, "closed", False)] or bars[1:]
-            anchor = int(getattr(closed[0], "ts_open", 0)) if closed else 0
-            spawn_experience_watch(
-                data_source=ds,
-                settings=settings,
-                symbol=symbol,
-                timeframe=timeframe,
-                stage1=dict(getattr(record, "stage1_diagnosis", None) or {}),
-                stage2_flat=_flat_stage2(record),
-                last_closed_ts_open_ms=anchor,
-            )
+        bars = list(getattr(frame, "bars", None) or [])
+        # 入场锚点必须是最后一根**已收盘** bar：bars[0] 是 forming bar，
+        # 用它会把尚未收盘的走势算进「入场之后」。
+        closed = [b for b in bars if getattr(b, "closed", False)]
+        anchor_bar = closed[0] if closed else (bars[1] if len(bars) > 1 else None)
+        anchor = int(getattr(anchor_bar, "ts_open", 0)) if anchor_bar is not None else 0
+
+        staged = save_pending_if_resolvable(
+            writer=ExperienceWriter(logger=logger),
+            settings=settings,
+            exchange=str(getattr(settings.general, "last_tradingview_exchange", "") or ""),
+            symbol=symbol,
+            timeframe=timeframe,
+            stage1=dict(getattr(record, "stage1_diagnosis", None) or {}),
+            stage2_flat=_flat_stage2(record),
+            entry_ts_open_ms=anchor,
+            bars=bars,
+        )
+        if staged is not None:
+            logger.info("experience stage-1 pending written: %s %s -> %s",
+                        symbol, timeframe, staged.name)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("experience watch spawn failed: %s", exc)
+        logger.warning("experience stage-1 failed: %s", exc)
 
     try:
         threading.Thread(
