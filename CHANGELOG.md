@@ -19,6 +19,19 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 17. 追问移到「决策」右侧 + 全部 tab tip 重写 + 经验库范围恒等于当前 K 线
+
+- **tab 顺序调整**：追问从「决策树」右侧移到「决策」右侧 → 分析 / 预测 / 决策树 / 决策 / 追问 / 经验库
+- **逐条核对并重写全部 tab tip，发现 1 条过期**：
+  - 经验库 tip 写着「浏览经验库」，但该面板上一轮已改为跟随当前 K 线范围、不再展示全库 → 已改为「当前 K 线品种与周期上的历史成败样本」
+  - 追问 tip 补充「切换品种或回看历史记录会重设锚点」—— 最易误解的点，不提示会让用户以为还在追问上一份结论
+  - 其余 4 条核对无误（预测确实是「下一根 K 线 + 下一市场周期」两段；决策确实是「结论 / 市场状态 / 详细依据」三段 + 置信度/胜率/盈亏比），一并补充更具体的要点
+  - 经验库的 tab 内说明补上范围规则与「查看全部品种与周期」入口
+- **经验库范围改为恒等于当前 K 线（不可手动选）**：移除「全部交易对」「全部周期」下拉与「跟随当前」复选框，改为只读标签 `#exp-scope`（如 `ETHUSDT · 4h`）。`applySubscribe()` 末尾主动刷新，切品种/周期后面板不会停在旧结果上。空结果时提供「查看全部品种与周期」逃生口，避免严格过滤把用户堵死
+- **市场周期下拉改为中英**：`GET /api/experience` 新增 `cycle_options`（`{value,label}` 数组，value 仍是 raw 用于过滤，label 走 `display_labels`）→ `宽通道 (broad_channel)` / `趋势型交易区间 (trending_tr)` / `未知周期 (unknown)`；`_fillExpSelect()` 兼容字符串数组与对象数组
+- **文件**：`web/static/{index.html,js/app.js,css/style.css}`、`web/api/routes_data.py`
+- **验证**：6 个 tab 逐一点击均只显示单个面板、互不重叠；周期下拉 9 项全中英；范围标签跟随 `ETHUSDT · 4h`；无 JS 错误；全量 `tests/unit` 对基线新增失败 0
+
 ### 16. 经验库枚举改为中英展示
 
 - 经验条目里的枚举一直是裸英文 snake_case（`trending_tr` / `up` / `success`），对实际操作者不可读；但只给中文又会丢掉提示词、落盘目录名里真正在用的 raw 值，对不上账。改为 `中文 (raw)`
