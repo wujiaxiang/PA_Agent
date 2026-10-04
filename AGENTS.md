@@ -142,6 +142,21 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **GUI 侧保留兼容层**：抽离后 `pa_agent/gui/<mod>.py` 改为 re-export 同名符号，GUI 现有 import 不受影响
 - **默认数据源必须是 `tradingview`**：`pa_agent/data/factory.py::DATA_SOURCE_CHOICES` 只暴露 tradingview，MT5 仅 Windows 可用；而 `config/settings.json` 在 `.gitignore` 中，全新 Docker volume 无该文件会走代码默认值，若默认 `mt5` 则 `create_data_source()` 抛 `DataSourceTransientError` 且被 `AppContext.bootstrap()` 的 `except Exception` 吞掉 → **应用静默启动但完全没有数据源**。修改 `GeneralSettings` 默认值时必须同步这条
 
+### 经验库闭环（写入端）
+
+- **写入方唯一入口**：`pa_agent.records.experience_writer.ExperienceWriter.save()`，落盘布局必须与 `ExperienceReader` 期望的一致（`experience/<cycle>/{success,failure}_cases/`），否则读端检索不到
+- **胜负判定**：`evaluate_outcome()` 按后续 K 线判定 TP1/SL 谁先触及。**同一根 bar 同时触及两者时必须按止损计** —— OHLC 无法还原 intrabar 路径，按乐观计会把经验库偏向虚高胜率
+- **未了结的计划不写入**：触及任一价位前超时（`experience_max_wait_s`，默认 24h）即丢弃
+- **触发点**：`order_followup.spawn_post_order_followup()`（与通知同一入口，AGENTS.md 单一入口约束）
+- **必须 daemon 线程 + 分步 try/except**：轮询数据源可能失败/超时，任何异常只记 warning，**绝不能冒泡进分析主流程**
+- **读取端默认必须 > 0**：`experience_max_entries` 默认 0 会让整条检索链路空跑；新增/修改 PromptSettings 时注意该默认值
+
+### 图表数据唯一入口
+
+- **必须经 `applyBarsToChart(bars)`**：`setBars` + `setSeqMarkers` + 指标重算（`_indicatorsAPI.onBarsUpdated`）+ `__PA_LAST_BAR_TIME__` 更新是**成套**动作
+- 只调 `setBars` 会让 EMA/MACD 继续持有**上一个品种**的数据（例如切到 BTCUSDT 后 EMA 仍是 NVDA 的 210~234，而蜡烛是 48000~64000），主图自动缩放把两个数量级一起纳入 → 价格轴被拉到 -8000~66000，K 线被压成顶部一条、指标线贴地
+- `setBars` 的契约是**原始 bar**（带 `ts_open`/`closed`），由它内部升序排序并换算 LWC 的秒级 `time`；**不要**预先映射成 `{time,...}`，否则 `a.ts_open === undefined` 会让时间变成 NaN 并被 LWC 抛 `Value is null`
+
 ### 下单信号推送（交易记录 + Feishu/PushPlus）
 
 - **判定门控唯一来源**：`pa_agent.ai.order_opportunity.has_order_opportunity()`（Qt-free）。判定「是否下单机会」必须调用它，禁止在前端或路由里另写一份
@@ -207,7 +222,11 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 ## 已知问题
 
 - **模型 API 连接失败**：本地模型 API 服务器 `192.168.2.177:8082` 未运行，导致分析失败（已通过 `.env` 配置切换到可用 endpoint 解决，但配置项仍可能被误填回内网地址）。注意 2026-10 实测还存在「模型免费期结束」类 404（`base_url` 可达但模型不可用），`/api/health` 会显示 `degraded`/`model_api: error`
-- **经验库系统数据为空**：`experience/` 目录无数据文件，经验库检索与应用功能空跑
+- ~~**经验库系统数据为空**~~（2026-10 已闭环）：`experience/` 实际有 59 条数据（此前文档记载有误）。
+  缺失的是**写入方**（`ExperienceReader` 文档明写 strictly read-only，全仓无写入代码）
+  与**浏览入口**，且 `experience_max_entries` 默认为 0 导致读取链路长期空跑。
+  现已补齐：`experience_writer.ExperienceWriter` + `experience_watcher`（TP/SL 触达后回写）
+  + `GET /api/experience` + 侧边栏「经验库」tab + `experience_max_entries` 默认 3
 - **移动端未适配**：当前 UI 为桌面端设计，移动端显示效果差
 - **国际化缺失**：所有文案硬编码中文，无多语言支持
 - **`/api/bars` 忽略查询参数**：该端点只接受 `count`，实际数据取自当前订阅状态（`settings.general.last_symbol/last_timeframe`）；而 `/api/bars/next-close` 却接受并回显 `symbol/timeframe/exchange`。两个端点对同一请求会返回不同品种，属于**已知接口不一致**，前端必须先 `POST /api/subscribe` 再 `GET /api/bars`。待统一

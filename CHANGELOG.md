@@ -19,6 +19,21 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 10. 经验库闭环 + 指标图例配色修正 + 图表数据入口收口
+
+- **问题**：经验库（素材库）没有写入方、没有浏览入口、读取默认关闭；主图指标图例色块全黄；图表数据更新存在「只做一半」的隐患
+- **根因与修复**：
+  1. **经验库是条死路**：`ExperienceReader` 文档明写 *strictly read-only*，全仓无任何写入代码；`PromptSettings.experience_max_entries` 默认 **0** 导致检索链路空跑（实测 `experience_loaded` 恒为 `[]`）；Web 端也没有浏览入口。另修正 AGENTS.md 过时记载——`experience/` 实际有 59 条数据
+     - 新增 `pa_agent/records/experience_writer.py`：`ExperienceWriter.save()` 原子落盘（tmp + `os.replace`），同秒多次写入不覆盖，`symbol`/`cycle` 经 `_safe_segment` 防路径穿越
+     - 新增 `evaluate_outcome()`：按后续 K 线判定 TP1/SL 先后；**同一根 bar 同时触及两者时保守按止损计**（OHLC 无法还原 intrabar 路径，按乐观计会把经验库偏向虚高胜率）
+     - 新增 `web/api/experience_watcher.py`：下单信号时起 daemon 线程轮询数据源，TP/SL 触达即回写一条经验；超时未了结则不写入。与通知线程一致：失败只记 warning，绝不冒泡进分析主流程
+     - 接入 `order_followup.spawn_post_order_followup()`（AGENTS.md 单一入口）；新增 `GET /api/experience` 与侧边栏「经验库」tab
+     - `experience_max_entries` 0 → 3，新增 `experience_auto_write` / `experience_max_wait_s`
+  2. **指标图例全黄**：图例用 `series.applyOptions()` 无参调用想读回颜色，但该 API 是写入型的，无参调用抛 `Cannot read properties of undefined (reading 'priceScaleId')`，被 catch 吞掉后退回 registry 声明色（`ema` 对所有周期均为 `#ffc800`），故 6 个色块全黄、与主图实际 6 色不符。改用 `series.options().color`
+  3. **图表数据入口不收口**：`setBars` + `setSeqMarkers` + 指标重算 + 时间锚点是成套动作，只做一半就会让指标持有上个品种数据（上一轮 demo 即如此）。收口为唯一入口 `applyBarsToChart(bars)`
+- **文件**：`pa_agent/records/experience_writer.py`(新)、`web/api/experience_watcher.py`(新)、`web/api/order_followup.py`、`web/api/routes_data.py`、`pa_agent/config/settings.py`、`web/static/{index.html,js/app.js,js/indicators.js,css/style.css}`、`AGENTS.md`
+- **验证**：新增 `tests/unit/test_experience_library_loop.py`(19)。写→读闭环实测成立（写出的文件立刻被 `ExperienceReader` 检索到）；胜负判定含同根双触保守按止损；`/api/experience` 返回 36 条 / 9 个周期；图例色块实测 `rgb(178,108,255) / rgb(255,152,0) / rgb(255,82,82) / rgb(255,235,59) / rgb(38,166,154) / rgb(41,182,246)`；无 JS 错误。全量 `tests/unit` 对基线：新增失败 0，修复 2
+
 ### 9. 功能键联动 review：demo 三方脱钩 / 交易价位图例 / 死代码
 
 - **背景**：用 Playwright 逐个操作功能键并量取 DOM/canvas，核对 AGENTS.md 的联动规则
