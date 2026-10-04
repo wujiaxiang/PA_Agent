@@ -269,10 +269,15 @@ curl http://localhost:8000/api/health/check    # 完整健康检查（模型 API
 
 ### 5.1 功能补齐（来自 AGENTS.md 已知缺失）
 
-1. **经验库系统完善** ⭐ 高优
-   - 现状：`experience/` 目录无数据文件，经验库检索与应用功能空跑
-   - 目标：补齐经验数据文件，实现 Stage1/Stage2 经验库检索
-   - 影响范围：[pa_agent/orchestrator/two_stage.py](pa_agent/orchestrator/two_stage.py)、`prompt_engineering/`
+1. ~~**经验库系统完善**~~ ✅ 已闭环（2026-10-04）
+   - 当时现状（记载有误，需更正）：`experience/` 实有 59 条数据；真正缺的是
+     **写入方**（`ExperienceReader` 只读、全仓无写代码）、**浏览入口**，
+     且 `experience_max_entries` 默认 0 使检索链路空跑
+   - 已完成：`records/experience_writer.py`（写入 + `evaluate_outcome` 胜负判定）、
+     `web/api/experience_watcher.py`（TP/SL 触达后回写，接入 `spawn_post_order_followup`）、
+     `GET /api/experience`、侧边栏「经验库」tab、`experience_max_entries` 默认 3
+   - 遗留：经验条目缺少人工审核/淘汰机制，库会随时间单调增长；
+     `evaluate_outcome` 仅用 OHLC 判定，intrabar 路径未知时保守按止损计
 
 2. **Web UI Demo 模式**
    - 现状：桌面 GUI 有 demo 模式，Web UI 缺失
