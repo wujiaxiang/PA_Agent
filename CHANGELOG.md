@@ -19,6 +19,22 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 11. Demo 决策树/可视化渲染成空壳
+
+- **问题**：Demo 模式下「决策树」卡片只有节点号没有内容，「可视化」节点显示 `→ — —`
+- **结论先行**：**真实分析链路未被改坏** —— 历史记录回放实测 47 张卡片全部带 `question`+`reason`、可视化 200 个 SVG 节点、无 JS 错误。问题只出在 demo 数据
+- **根因**：上一轮重写 `routes_demo.py` 时，决策树 trace 是「凭想象编的形状」，与真实流水线不同构：
+  | 字段 | 真实记录 | demo（改前） |
+  |---|---|---|
+  | `gate_trace` | dict 列表 ×8 | 纯字符串列表 |
+  | `decision_trace` | dict ×15 | dict ×3，缺 `question`/`bar_range`/`skipped`/`section` |
+  | `terminal.outcome` | `reject` 等真实取值 | `trade`（不在真实集合内） |
+  
+  前端 `renderTraceCard` 与决策树可视化读 `item.question` / `item.reason`，demo 缺失 → 渲染为空壳
+- **修复**：按真实记录结构重建 demo trace —— gate_trace 4 节点（含 `branch`/`section`）、decision_trace 6 节点覆盖四个 section 并含一个 `skipped=True` 未走分支、`terminal.outcome` 改为 `accept`
+- **文件**：`web/api/routes_demo.py`、`tests/unit/test_demo_decision_tree_shape.py`(新，6 例)
+- **验证**：新增测试含一条直接读取真实历史记录做**逐字段对齐**，demo 再漂移即失败；实机截图确认决策树 10 张卡片全部带问题/理由/K线依据，可视化节点显示完整问题与回答。全量 `tests/unit` 对基线：新增失败 0
+
 ### 10. 经验库闭环 + 指标图例配色修正 + 图表数据入口收口
 
 - **问题**：经验库（素材库）没有写入方、没有浏览入口、读取默认关闭；主图指标图例色块全黄；图表数据更新存在「只做一半」的隐患
