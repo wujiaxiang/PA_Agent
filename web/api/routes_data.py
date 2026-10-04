@@ -326,20 +326,32 @@ async def get_next_close(
 # 库里到底有什么、Stage2 到底检索到了什么。这里补上只读浏览接口。
 
 @router.get("/experience")
-async def list_experience(cycle: str = Query(default="", description="按市场周期过滤，空=全部")):
+async def list_experience(
+    cycle: str = Query(default="", description="按市场周期过滤，空=全部"),
+    symbol: str = Query(default="", description="按交易对过滤，如 BTCUSDT；空=全部"),
+    timeframe: str = Query(default="", description="按 K 线周期过滤，如 15m；空=全部"),
+):
     """List experience-library entries, newest first, grouped by cycle.
 
     Scans on a worker thread: the library can hold many JSON files and this
     endpoint must not block the event loop.
+
+    ``symbol`` / ``timeframe`` filter on the **entry content** rather than the
+    filename, because the same code appears under different cycles. The UI
+    defaults both to the currently-subscribed instrument so the panel shows
+    "经验来自你正在看的这个品种" instead of an undifferentiated pile.
     """
     from pa_agent.config.paths import EXPERIENCE_DIR
+
+    sym_filter = (symbol or "").strip().upper()
+    tf_filter = (timeframe or "").strip().lower()
 
     def _scan() -> dict:
         from pa_agent.records.experience_reader import ExperienceReader
 
         root = Path(EXPERIENCE_DIR)
         if not root.is_dir():
-            return {"total": 0, "entries": [], "cycles": {}}
+            return {"total": 0, "entries": [], "cycles": {}, "symbols": [], "timeframes": []}
 
         cycles = sorted(
             d.name for d in root.iterdir()
@@ -351,13 +363,14 @@ async def list_experience(cycle: str = Query(default="", description="按市场�
         reader = ExperienceReader(experience_dir=root)
         entries: list[dict] = []
         counts: dict[str, dict[str, int]] = {}
+        all_rows: list[dict] = []
         for name in cycles:
-            success = 0
-            failure = 0
             try:
                 found = reader.read_top5(name)
             except Exception:  # noqa: BLE001
                 found = []
+            success = 0
+            failure = 0
             for e in found:
                 content = getattr(e, "content", {}) or {}
                 case_type = getattr(e, "case_type", "")
@@ -365,7 +378,7 @@ async def list_experience(cycle: str = Query(default="", description="按市场�
                     success += 1
                 elif case_type == "failure":
                     failure += 1
-                entries.append({
+                all_rows.append({
                     "filename": getattr(e, "filename", ""),
                     "case_type": case_type,
                     "cycle_position": getattr(e, "cycle_position", name),
@@ -381,8 +394,31 @@ async def list_experience(cycle: str = Query(default="", description="按市场�
                 })
             counts[name] = {"success": success, "failure": failure}
 
-        entries.sort(key=lambda x: x.get("timestamp_ms") or 0, reverse=True)
-        return {"total": len(entries), "entries": entries, "cycles": counts}
+        # 可选维度：来自全量（未按 symbol/tf 过滤）的集合，供前端下拉用
+        symbols = sorted({r["symbol"] for r in all_rows if r["symbol"]})
+        timeframes = sorted({r["timeframe"] for r in all_rows if r["timeframe"]})
+
+        rows = all_rows
+        if sym_filter:
+            rows = [r for r in rows if str(r["symbol"]).upper() == sym_filter]
+        if tf_filter:
+            rows = [r for r in rows if str(r["timeframe"]).lower() == tf_filter]
+        # counts 也要跟着过滤，否则前端汇总数字对不上
+        if sym_filter or tf_filter:
+            per = {}
+            for r in rows:
+                c = per.setdefault(r["cycle_position"], {"success": 0, "failure": 0})
+                c["failure" if r["case_type"] == "failure" else "success"] += 1
+            counts = {k: v for k, v in per.items() if v["success"] or v["failure"]}
+
+        rows.sort(key=lambda x: x.get("timestamp_ms") or 0, reverse=True)
+        return {
+            "total": len(rows),
+            "entries": rows,
+            "cycles": counts,
+            "symbols": symbols,
+            "timeframes": timeframes,
+        }
 
     result = await asyncio.to_thread(_scan)
     return JSONResponse(content=result, headers={"Cache-Control": "no-store"})

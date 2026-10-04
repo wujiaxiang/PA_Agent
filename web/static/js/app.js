@@ -785,6 +785,11 @@ function bindEvents() {
         const overlay = data.decision_overlay || data.stage2_decision || {};
         setDecisionOverlays(candleSeries, overlay);
         setDirectionMarker(candleSeries, overlay);
+        // Demo 同样代表一次完整分析，走完后必须解锁追问 ——
+        // 此前只在真实分析的 done 事件里调 enableChat()，导致 demo 下
+        // 追问输入框始终禁用，等于演示时这条主交互根本用不了。
+        enableChat();
+        renderChatContext();
         // 切换到决策 tab
         $$('.sidebar-tabs .tab').forEach(b => b.classList.remove('active'));
         document.querySelector('.sidebar-tabs .tab[data-tab="decision"]')?.classList.add('active');
@@ -976,7 +981,12 @@ function bindEvents() {
       if (tab === 'experience' && typeof initExperienceTab === 'function') {
         initExperienceTab();
       }
-      // 合并后的两组面板：把当前激活的子 tab 状态同步到条上
+      // 「追问」tab：切过去时滚到最新一条
+      if (tab === 'chat') {
+        const box = $('#chat-messages');
+        if (box) box.scrollTop = box.scrollHeight;
+      }
+      // 合并后的各组面板：把当前激活的子 tab 状态同步到条上
       syncSubtabBar(tab);
       // Phase A Task 1.3：决策 / 决策树 / 预测 tab 切回时重新渲染，避免显示陈旧内容
       if (tab === 'decision' && lastRecord && typeof renderDecision === 'function') {
@@ -4612,6 +4622,29 @@ function enableChat() {
   const sendBtn = $('#btn-chat-send');
   if (input) input.disabled = false;
   if (sendBtn) sendBtn.disabled = false;
+  renderChatContext();
+}
+
+// 追问会话锚在哪一次分析上，必须让用户看得见 —— 否则切换品种/回看历史后
+// 仍以为在追问上一份结论，实际早就换成了另一个锚点。
+function renderChatContext() {
+  const box = $('#chat-context');
+  if (!box) return;
+  const r = lastRecord;
+  if (!r) {
+    box.innerHTML = '<span class="chat-context-empty">尚未进行交易分析，完成后可在此追问</span>';
+    return;
+  }
+  const sym = r.symbol || r.meta?.symbol || $('#ds-symbol')?.value || '';
+  const tf = r.timeframe || r.meta?.timeframe || $('#ds-timeframe')?.value || '';
+  const ts = r.timestamp_local_iso || r.meta?.timestamp_local_iso || '';
+  const ot = (r.stage2_decision && (r.stage2_decision.order_type
+        || r.stage2_decision.decision?.order_type)) || '';
+  const time = ts ? new Date(ts).toLocaleString('zh-CN', { hour12: false }) : '';
+  box.innerHTML = `<span class="chat-context-tag">锚定分析</span>`
+    + `<span class="chat-context-item">${escapeHtml(sym)} · ${escapeHtml(tf)}</span>`
+    + (ot ? `<span class="chat-context-item">${escapeHtml(ot)}</span>` : '')
+    + (time ? `<span class="chat-context-time">${escapeHtml(time)}</span>` : '');
 }
 
 async function sendChat() {
@@ -4691,8 +4724,9 @@ async function sendChat() {
 }
 
 function appendChatMsg(role, text) {
-  // 追加到实时 tab 的流式区（#tab-stream）
-  const streamPanel = $('#tab-stream');
+  // 追加到「追问」tab 的消息区（#tab-chat）。此前挂在 #tab-stream 里，
+  // 追问作为主交互之一被埋在流式输出末尾，且需要滚动才能看到。
+  const streamPanel = $('#chat-messages') || $('#tab-chat');
   if (!streamPanel) return null;
 
   const div = document.createElement('div');
@@ -4711,9 +4745,11 @@ function appendChatMsg(role, text) {
 
 // 清空实时 tab 中的追问消息（保留 stage1/stage2 流式输出）
 function clearChatOutput() {
-  const streamPanel = $('#tab-stream');
+  const streamPanel = $('#chat-messages') || $('#tab-chat');
   if (!streamPanel) return;
   streamPanel.querySelectorAll('.chat-msg').forEach(el => el.remove());
+  const ctxEl = $('#chat-context');
+  if (ctxEl) ctxEl.innerHTML = '';
   chatReasoningText = '';
   chatContentText = '';
   stageCharCounts.chat = { reasoning: 0, content: 0 };
@@ -5204,23 +5240,47 @@ function exportRecordJson() {
 // 经验库此前没有写入方也没有浏览入口，这里是只读面板。
 async function loadExperienceLibrary() {
   const list = $('#exp-list');
-  const summary = $('#exp-summary');
   if (!list) return;
-  const sel = $('#exp-cycle');
-  const cycle = sel && sel.value ? sel.value : '';
+  const follow = $('#exp-follow-current')?.checked;
+  const q = new URLSearchParams();
+  if (follow) {
+    // 跟随当前订阅：只看你正在看的这个品种 / 周期下的经验
+    const sym = $('#ds-symbol')?.value || currentSettings?.general?.last_symbol || '';
+    const tf = $('#ds-timeframe')?.value || currentSettings?.general?.last_timeframe || '';
+    if (sym) q.set('symbol', sym);
+    if (tf) q.set('timeframe', tf);
+  } else {
+    const cyc = $('#exp-cycle')?.value || '';
+    const sym = $('#exp-symbol')?.value || '';
+    const tf = $('#exp-timeframe')?.value || '';
+    if (cyc) q.set('cycle', cyc);
+    if (sym) q.set('symbol', sym);
+    if (tf) q.set('timeframe', tf);
+  }
+  const qs = q.toString();
   list.innerHTML = '<div class="exp-empty">加载中…</div>';
   try {
-    const d = await API.get(`/api/experience${cycle ? `?cycle=${encodeURIComponent(cycle)}` : ''}`);
+    const d = await API.get(`/api/experience${qs ? '?' + qs : ''}`);
     const entries = d.entries || [];
-    const counts = d.cycles || {};
+    _fillExpSelect('#exp-symbol', d.symbols, '全部交易对');
+    _fillExpSelect('#exp-timeframe', d.timeframes, '全部周期');
+    _fillExpSelect('#exp-cycle', Object.keys(d.cycles || {}), '全部市场周期');
+    const summary = $('#exp-summary');
     if (summary) {
-      const total = Object.values(counts).reduce(
-        (a, c) => a + (c.success || 0) + (c.failure || 0), 0);
-      summary.textContent = `共 ${total} 条 · 当前筛选 ${entries.length} 条`;
+      const win = entries.filter(e => e.result === 'win').length;
+      const loss = entries.length - win;
+      const scope = follow
+        ? `${$('#ds-symbol')?.value || ''} · ${$('#ds-timeframe')?.value || ''}`
+        : '全部';
+      summary.textContent = `${scope} — 共 ${entries.length} 条`
+        + (entries.length ? `（盈利 ${win} / 亏损 ${loss}，胜率 ${entries.length ? Math.round(win / entries.length * 100) : 0}%）` : '');
     }
     if (!entries.length) {
-      list.innerHTML = '<div class="exp-empty">该周期暂无经验条目。'
-        + '出现下单信号后，系统会在 TP1/SL 触达后自动回写。</div>';
+      list.innerHTML = follow
+        ? '<div class="exp-empty">当前品种/周期下暂无经验条目。<br>'
+          + '出现下单信号后，系统会在 TP1/SL 触达时自动回写；'
+          + '也可取消「跟随当前」查看其它品种。</div>'
+        : '<div class="exp-empty">没有匹配的条目。</div>';
       return;
     }
     list.innerHTML = entries.map((e) => {
@@ -5245,6 +5305,16 @@ async function loadExperienceLibrary() {
   }
 }
 
+function _fillExpSelect(sel, values, allLabel) {
+  const el = document.querySelector(sel);
+  if (!el) return;
+  const cur = el.value;
+  const opts = Array.isArray(values) ? values : [];
+  el.innerHTML = `<option value="">${allLabel}</option>`
+    + opts.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join('');
+  if (opts.includes(cur)) el.value = cur;
+}
+
 async function initExperienceTab() {
   const sel = $('#exp-cycle');
   if (sel && !sel.dataset.filled) {
@@ -5264,6 +5334,23 @@ async function initExperienceTab() {
   if (btn && !btn.dataset.bound) {
     btn.dataset.bound = '1';
     btn.addEventListener('click', loadExperienceLibrary);
+  }
+  // 手动下拉：一旦用户自己选，取消「跟随当前」避免两个控件互相覆盖
+  ['#exp-symbol', '#exp-timeframe', '#exp-cycle'].forEach((sel) => {
+    const el = $(sel);
+    if (el && !el.dataset.bound) {
+      el.dataset.bound = '1';
+      el.addEventListener('change', () => {
+        const follow = $('#exp-follow-current');
+        if (follow && follow.checked) { follow.checked = false; }
+        loadExperienceLibrary();
+      });
+    }
+  });
+  const follow = $('#exp-follow-current');
+  if (follow && !follow.dataset.bound) {
+    follow.dataset.bound = '1';
+    follow.addEventListener('change', loadExperienceLibrary);
   }
   loadExperienceLibrary();
 }
