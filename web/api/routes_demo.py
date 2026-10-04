@@ -104,7 +104,21 @@ def _build_demo_record():
             "second_entry": {"is_second_entry": False, "type": "none"},
         },
         "bar_by_bar_summary": [],
-        "gate_trace": ["数据验证通过", "市场结构分析完成"],
+        # gate_trace / decision_trace 必须与真实流水线同构（dict，带
+        # node_id/question/answer/reason/bar_range/skipped/section）。
+        # 此前 demo 用了纯字符串 + 缺字段的 dict，前端决策树与可视化读不到
+        # question/reason，于是节点渲染成 "→ — —" 的空壳。
+        "gate_trace": [
+            {"node_id": "1.1", "question": "数据是否足够？", "answer": "是",
+             "reason": f"已收盘K线 {len(kline_data)} 根 ≥ 20 根阈值，数据量满足分析要求。",
+             "bar_range": f"K{len(kline_data)}-K1", "skipped": False},
+            {"node_id": "1.2", "question": "是否能识别市场周期？", "answer": "是",
+             "reason": "—", "branch": "trending_tr", "section": "K线识别", "bar_range": "K5-K1"},
+            {"node_id": "1.3", "question": "当前市场是否极端混乱？", "answer": "否",
+             "reason": "—", "branch": "none", "section": "K线识别", "bar_range": "K40-K1"},
+            {"node_id": "2.1", "question": "是否存在明确惯性方向？", "answer": "是",
+             "reason": "—", "branch": "bullish", "section": "方向判断", "bar_range": "K8-K1"},
+        ],
         "gate_result": "proceed",
         "gate_shortcircuited": False,
     }
@@ -142,13 +156,23 @@ def _build_demo_record():
         # 之前这里写成 True，渲染出来是 "proceed" 的空串。
         "terminal": {
             "node_id": "10.3",
-            "outcome": "trade",
-            "label": "顺势限价做多，止损置于结构下方",
+            "outcome": "accept",
+            "label": "回踩支撑顺势限价做多，止损置于结构失效位",
         },
         "decision_trace": [
-            {"node_id": "9.0", "answer": "是", "reason": "K1 为顺势信号棒"},
-            {"node_id": "10.1", "answer": "是", "reason": "止损置于结构失效位"},
-            {"node_id": "10.3", "answer": "是", "reason": "盈亏比满足均衡档位"},
+            {"node_id": "9.0", "section": "信号棒", "question": "信号棒是否已经收盘且质量足够？",
+             "answer": "是", "reason": "K1 为 bull_flag 顺势信号棒并已收盘", "skipped": False, "bar_range": "K1"},
+            {"node_id": "9.1", "question": "信号K线是否已经收盘？",
+             "answer": "是", "reason": "K1 已收盘，可作为入场依据", "skipped": False, "bar_range": "K1"},
+            {"node_id": "10.1", "section": "止损", "question": "止损是否置于结构失效位之外？",
+             "answer": "是", "reason": "止损位于前低与区间下沿之下，不在结构内被扫", "skipped": False, "bar_range": "K3-K1"},
+            {"node_id": "10.2", "section": "交易者方程", "question": "盈亏比是否满足最低要求？",
+             "answer": "是", "reason": "2.00:1 高于 MIN_RISK_REWARD_RATIO=1.0", "skipped": False, "bar_range": "K3-K1"},
+            {"node_id": "10.3", "section": "下单方式", "question": "是否满足均衡档下单条件？",
+             "answer": "是", "reason": "回踩支撑挂限价单，等待顺势入场", "skipped": False, "bar_range": "K1"},
+            {"node_id": "9.5", "question": "是否满足突破追单条件？",
+             "answer": "不适用", "reason": "§9.0=是且走限价档，突破分支不适用，程序跳过",
+             "bar_range": "K1", "skipped": True},
         ],
         "gate_shortcircuited": False,
         # 前端读 probabilities 对象，单个 probability 会让所有概率芯片显示 0%。
