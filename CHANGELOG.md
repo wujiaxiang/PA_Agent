@@ -19,6 +19,30 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 18. 经验库数据核查：36 条全部为合成数据，写入链路实为死链（含 3 个数据完整性缺陷）
+
+用户质疑「经验库的数据是不是真的」。核查结论：**一条真的都没有**。
+
+- **现有 36 条全是合成的种子数据**，证据：
+  - 36 个文件 mtime 集中在两分钟内（`21:35:23`×32、`21:36:19`×4）
+  - 文件名时间戳严格等差：日期每次 +2 天、小时每次 +1、**秒位恒为 `35-23`**
+  - `pnl_pct` 只用了 4 个取值（`-2.1/-1.8/+3.0/+2.5`），各出现 8 次
+  - `confidence` 只用了 4 个取值（`65/70/75/80`）
+  - `entry_price` 等差递减，每次**恰好 -100**
+  - `summary` 为占位文案（「区间内反复」「建议观望」）
+  - git 从未跟踪这些 JSON（只有 `.gitkeep` 在版本控制内）
+- **根因：写入链路根本没接上（致命）**
+  - `spawn_post_order_followup()` 取 `getattr(record, "_data_source", None) or getattr(frame, "data_source", None)`
+  - 但 `AnalysisRecord` 字段为 `[meta, kline_data, htf_text, stage1_*, stage2_*, strategy_files_used, experience_loaded, exception, usage_total]`、`KlineFrame` 为 `[symbol, timeframe, bars, indicators, snapshot_ts_local_ms]` —— **两者都没有这两个属性**，全仓也从未给 `_data_source` 赋过值
+  - ⇒ `ds` 恒为 `None` ⇒ `spawn_experience_watch()` **从未被调用** ⇒ 写入链路自打通以来就是死的。那些条目不可能是任何一次真实分析的产物
+- **另外两个一旦接通就会写入编造数据的缺陷**
+  1. **订阅漂移**：`data_source` 是全局共享、订阅绑定的单例（`subscribe()` 会改写 `self._symbol/_timeframe`），watcher 捕获了 `ds` 却没锁订阅。可复现：BTCUSDT 单（entry=100/TP=120/SL=80）→ 用户切到 ETHUSDT → 读到的 ETH 暴跌 bar 把它判成 `('loss', -20.0)` 写入库。**修复**：每轮轮询**前后各校验一次**订阅（只做前置校验仍有竞态窗口）
+  2. **入场锚点为 0**：`order_followup` 硬编码 `last_closed_ts_open_ms=0`，过滤条件退化为 `ts_open > 0`，入场**之前**的历史 K 线被当成本单走势。可复现：入场前一根暴跌 bar 触及 SL，第一次轮询（15 秒后）就写下 `pnl=-20%` 的假亏损。**修复**：改传最后一根**已收盘** bar 的 `ts_open`；锚点缺失时直接放弃写入
+- **数据处置**：36 条种子移入 `experience/.seed_demo_20260817/`（点号前缀会被 `GET /api/experience` 的目录枚举过滤），避免被 `ExperienceReader` 检索并注入 Stage1/Stage2 提示词当成"参考经验"——否则等于用编造盈亏污染 AI 决策。附 README 记录判定依据。经验库现从干净状态起步（0 条）
+- **测试**：新增 `tests/unit/test_experience_watch_integrity.py`(10) —— 锚点缺失/入场前 bar 排除/正常触及仍写入/两次轮询间漂移/取数期间漂移/显式传入 data_source/record 与 frame 确无该属性/routes_analyze 确实传参/可检索库不得含合成数据/隔离目录不得泄漏进 API。其中两条漂移测试是在实现过程中**发现我第一版只做了前置校验**才补上的。另修正 `test_experience_library_loop.py` 中一条按 bug 行为写的旧用例
+- **文件**：`web/api/{order_followup.py,routes_analyze.py,experience_watcher.py}`、`tests/unit/{test_experience_watch_integrity.py,test_experience_library_loop.py}`、`.gitignore`
+- **验证**：部署后 `GET /api/experience` 返回 0 条；全量 `tests/unit` 对基线新增失败 0
+
 ### 17. 追问移到「决策」右侧 + 全部 tab tip 重写 + 经验库范围恒等于当前 K 线
 
 - **tab 顺序调整**：追问从「决策树」右侧移到「决策」右侧 → 分析 / 预测 / 决策树 / 决策 / 追问 / 经验库

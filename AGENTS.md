@@ -149,6 +149,10 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **未了结的计划不写入**：触及任一价位前超时（`experience_max_wait_s`，默认 24h）即丢弃
 - **触发点**：`order_followup.spawn_post_order_followup()`（与通知同一入口，AGENTS.md 单一入口约束）
 - **必须 daemon 线程 + 分步 try/except**：轮询数据源可能失败/超时，任何异常只记 warning，**绝不能冒泡进分析主流程**
+- **数据来源必须可追溯**：`experience/` 下的条目只有两种来源 —— ① `ExperienceWriter.save()` 真实写入；② 早期手工种子数据。**不得手写 JSON 造经验**。真实盈亏是连续分布，若发现 `pnl_pct` 取值高度重复、`entry_price` 成等差数列、文件 mtime 集中在同一分钟，即为合成数据，必须隔离（`experience/.seed_demo_*/`，点号前缀会被 API 目录枚举过滤）并告知用户
+- **watcher 必须在轮询前后各校验一次订阅**：`data_source` 是全局共享、订阅绑定的单例，用户随时会切品种/周期。只做前置校验仍有竞态窗口（取数过程中被改掉）→ 两种情况都会拿**另一个标的**的 K 线判定本单，凭空写出胜负
+- **入场锚点不得为 0**：`after_ts_open_ms` 必须晚于最后一根**已收盘** bar（`bars[0]` 是 forming bar，取 `bars[1]`）。为 0 时过滤条件退化成 `ts_open > 0`，入场**之前**的历史 K 线会被当成本单走势。锚点缺失一律放弃写入
+- **`data_source` 必须显式传参**：不要用 `getattr(record, "_data_source")` / `getattr(frame, "data_source")` —— `AnalysisRecord` 与 `KlineFrame` 都没有这些属性，会恒为 `None` 导致整条链路静默变死（曾如此）
 - **枚举展示统一走 `pa_agent.ai.display_labels`**：格式 `中文 (raw)` —— 中文给操作者读，括号里的 raw 值用于和提示词、落盘目录名对账。新增枚举展示字段必须用 `label_for()`，不要在模板里就地翻译
 - **空值必须返回 `''`**：`label_for('')` 返回空串而非「未知 ()」，这样模板能整块隐藏该字段
 - **经验库范围恒等于当前 K 线**：`GET /api/experience` 的 `symbol` / `timeframe` **始终**取自 `#ds-symbol` / `#ds-timeframe`，前端不提供手动选择控件（只有「市场周期」可筛）。经验库的意义是「我正在看的这个标的、这个周期上历史上怎么走」，让用户另选等于把它变成另一个功能。`applySubscribe()` 末尾必须调 `loadExperienceLibrary()`，否则切品种后面板停在旧结果上
