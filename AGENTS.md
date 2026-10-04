@@ -105,6 +105,9 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **按钮按域分组**：工具栏=数据流开关（仅「实时」）；侧边栏=分析控制（分析/等待收盘/持续分析/增量）
 - **持续分析联动规则**：开启时强制勾选并禁用「实时」+「等待收盘」（依赖 SSE bar_close 事件）；关闭时恢复可编辑
 - **哨兵去重**：`keepAnalysisLastClosedTs` 变量，bar_close 事件仅在 `ts_open` 变化时触发分析
+- **持续分析触发时禁止再次等待收盘**：`startAnalysis` / `startIncrementalAnalysis` 必须接受 `triggerSource`（`'user'` / `'continuous'`），由 `web/static/js/continuous_gate.js::shouldWaitForClose` 判定。`'continuous'` 表示本次调用本身就是被 `bar_close` 触发的，此时 bar 刚刚收盘，**再等一根必然出错**——与「持续分析强制勾选等待收盘」的联动规则叠加后会形成自等待，被下一次 `bar_close` 内的 `stopWaitCloseCountdown()` 取消成 `resolve(false)`，表现为持续分析整周期延迟或时灵时不灵。新增触发路径时必须透传 `'continuous'`
+- **纯逻辑抽到 `continuous_gate.js`**：「刚收盘 bar 的 ts_open」与「是否需要等待收盘」是无 DOM 依赖的纯逻辑，禁止再内联回 `app.js`。三处哨兵计算曾重复三份且必须永远一致，抽成唯一实现由 Node 单测 `continuous_gate.test.js` 守护
+- **取消「等待收盘」勾选必须调用 `stopWaitCloseCountdown()`**：只停显示定时器不够。`refreshAnalyzeButtonWaitingState()` 会把按钮置回 `idle`，而 `updateSSEStatusWithExpiry` 中 `if (btn.dataset.state !== 'waiting') return` 会提前返回，导致 pending resolver 无人 resolve，`startAnalysis` 永久 await
 - **图表暂停**：分析期间暂停 `bar_update` 的 K线渲染（仍更新 next_close_ts 和状态栏），完成后调用 `loadBars()` 刷新
 - **倒计时统一 HMS 格式**：所有倒计时使用 `formatCountdownHMS()` 函数显示 `HH:MM:SS`
 - **倒计时共享 tick**：SSE 活跃时「等待收盘」按钮必须复用 `sseStatusExpiryTimer`（由 `updateSSEStatusWithExpiry` 统一更新），不创建独立 setInterval。通过 `waitCloseCountdownResolver` 全局变量在 remaining <= 0 时触发分析。禁止维护两个独立定时器——会导致两个 UI 不同步、算法不一致、sanity check 逻辑分叉

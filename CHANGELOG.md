@@ -19,6 +19,19 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 7. 持续分析 / 等待收盘 前端联动缺陷修复
+
+- **问题**：持续分析在 SSE 模式下无法真正发起分析；用户取消「等待收盘」勾选会永久挂起等待中的分析
+- **根因**：
+  1. 「持续分析」按联动规则强制勾选「等待收盘」，而 `startAnalysis` / `startIncrementalAnalysis` 开头无条件检查 `cbWaitClose.checked` 并 `await startWaitCloseCountdown()`。于是 `bar_close` 触发的持续分析会**再次等待一根收盘**——与触发它的语义直接冲突。倒计时归零（`remaining<=0`）与 `bar_close` 几乎同时到达：倒计时先到则正常发起；`bar_close` 先到则 `startWaitCloseCountdown()` 内的 `stopWaitCloseCountdown()` 把 pending resolver 取消成 `resolve(false)`，本根 bar 的分析被跳过
+  2. `#cb-wait-close` 的 change handler 只调用 `stopWaitingCountdownDisplay()`（停显示定时器），没有停 `stopWaitCloseCountdown()`（停 resolver）。此刻若 `startAnalysis` 正 await 在倒计时上，`refreshAnalyzeButtonWaitingState()` 把按钮置回 `idle`，而 `updateSSEStatusWithExpiry` 里 `if (btn.dataset.state !== 'waiting') return` 提前返回 → resolver 再无人 resolve → 分析永不发起、按钮卡住
+- **修复**：
+  - 新增 `triggerSource`（`'user'` / `'continuous'`）参数，判定收敛到 `continuous_gate.shouldWaitForClose()`；`'continuous'` 触发时不再等待，因为 bar 刚刚收盘
+  - 取消勾选时同时调用 `stopWaitCloseCountdown()`，`resolve(false)` 让 `startAnalysis` 正常 return
+  - 把「刚收盘 bar 的 `ts_open`」从 `app.js` 里重复的 3 份抽为 `continuous_gate.closedBarTs()` 唯一实现——三份必须永远一致，任一份漂移都会让 `bar_close` 与倒计时路径的哨兵去重互相打架
+- **文件**：`web/static/js/continuous_gate.js`（新增）、`web/static/js/continuous_gate.test.js`（新增）、`web/static/js/app.js`、`web/static/index.html`
+- **验证**：新增 Node 单测（`node web/static/js/continuous_gate.test.js`，无 DOM 依赖的纯逻辑可直接 require 求值），覆盖 `closedBarTs` 的正常/休市/乱序/空数组边界与 `shouldWaitForClose` 契约。`app.js?v=27→28`、新增 `continuous_gate.js?v=1`。全量 `tests/unit` 对基线：新增失败 0。已重建镜像并部署至 `:8005`，确认 `continuous_gate.js` 返回 200 且 `app.js` 中有 10 处 `PAContinuousGate` 引用
+
 ### 6. 设置接口凭据跨域暴露修复 + Docker 重新部署
 
 - **问题**：`GET /api/settings` 只脱敏 `provider.api_key`，其余通知凭据明文返回；配合 `allow_origins=["*"]` 且全站无鉴权，运营者访问的任意网页即可跨域读取并可驱动写接口
