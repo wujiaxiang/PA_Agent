@@ -707,16 +707,41 @@ function bindEvents() {
         updateTokenProgress(data.usage_total);
         renderTreeViz(data);
         // 更新 K 线图表
+        //
+        // 契约：setBars() 接收的是**原始 bar**（带 ts_open/closed），由它自己
+        // 升序排序并换算成 LightweightCharts 的秒级 time。此前这里先手工映射成
+        // {time, open, ...}，于是 setBars 拿到 a.ts_open === undefined：
+        //   - 排序比较 undefined → 退化成原序
+        //   - time: b.ts_open / 1000 → NaN
+        // LightweightCharts 直接抛 "Value is null" / "right should be >= left"，
+        // 结果是图表仍是上一个品种的 K 线，而 Entry/SL/TP 横线画在另一个价格
+        // 区间上（实测 NVDA 206-240 的图上出现 60413-68509 的决策价），
+        // 「决策 ↔ K 线」彻底脱钩。
         if (data.kline_data && data.kline_data.length) {
-          const bars = data.kline_data.map(bar => ({
-            time: bar.ts_open / 1000,
-            open: bar.open,
-            high: bar.high,
-            low: bar.low,
-            close: bar.close,
-          }));
-          setBars(candleSeries, bars);
+          setBars(candleSeries, data.kline_data);
+          lastBars = data.kline_data;
+          // 必须通知指标层重算：loadBars() 走的是 setBars + onBarsUpdated 两步，
+          // 漏掉 onBarsUpdated 会让 EMA/MACD 继续持有**上一个品种**的数据
+          // （实测切到 BTCUSDT 1d 后 EMA 仍是 NVDA 的 210~234），
+          // 而主图自动缩放会把两个数量级一起纳入，价格轴被拉到 -8000~66000，
+          // K 线被压成顶部一条、指标线贴地 —— 图表彻底失真。
+          if (window._indicatorsAPI && window._indicatorsAPI.onBarsUpdated) {
+            window._indicatorsAPI.onBarsUpdated(data.kline_data);
+          }
+          // setDirectionMarker 依赖 __PA_LAST_BAR_TIME__ 定位箭头；
+          // 不更新的话它仍是切换前的品种时间戳，落在新序列之外会被 LWC 拒绝。
+          const tsSorted = [...data.kline_data].sort((a, b) => a.ts_open - b.ts_open);
+          window.__PA_LAST_BAR_TIME__ = tsSorted[tsSorted.length - 1].ts_open / 1000;
           chart.timeScale().fitContent();
+          // 工具栏同步 demo 的品种/周期，避免「图上是 BTCUSDT、工具栏写 NVDA」。
+          // #ds-symbol 是隐藏域（真实订阅状态），#ds-symbol-search 是可见展示框，
+          // 两者都要更新，否则用户看到的品种与图上的数据对不上。
+          const demoSym = data.symbol, demoTf = data.timeframe;
+          if (demoSym) {
+            const hidden = $('#ds-symbol'); if (hidden) hidden.value = demoSym;
+            const shown = $('#ds-symbol-search'); if (shown) shown.value = demoSym;
+          }
+          if (demoTf) { const el = $('#ds-timeframe'); if (el) el.value = demoTf; }
         }
         // 更新决策叠加层
         const overlay = data.decision_overlay || data.stage2_decision || {};
@@ -984,16 +1009,9 @@ function bindEvents() {
       }
     });
   }
-  const dsSymbolSelect = $('#ds-symbol-select');
-  if (dsSymbolSelect) {
-    dsSymbolSelect.addEventListener('change', () => {
-      const alert = $('#symbol-alert');
-      if (alert) {
-        alert.setAttribute('hidden', '');
-        alert.textContent = '';
-      }
-    });
-  }
+  // 注：原此处监听 $('#ds-symbol-select')，但 index.html 里并不存在该 id
+  //（品种输入实际是隐藏域 #ds-symbol + .symbol-search-results 搜索下拉），
+  // 属于永不触发的死代码。清除错误提示的逻辑已由搜索结果的选中分支处理。
 
   // 「原始」tab 按钮事件委托：复制调试信息 / 导出 JSON
   // （renderRaw 每次重渲染会替换 innerHTML，所以用事件委托而非直接绑定）
@@ -3484,6 +3502,9 @@ function _renderDiagnosisSummary(ds) {
 }
 
 // ── Token 进度条 ──────────────────────────────────────────────────────
+// 95% 上下文告警只弹一次，避免流式期间反复刷屏
+let _ctxWarn95Shown = false;
+
 function updateTokenProgress(usage) {
   const wrap = $('#token-progress-wrap');
   if (!wrap) return;
@@ -3512,12 +3533,18 @@ function updateTokenProgress(usage) {
   if (pct >= dangerPct) wrap.classList.add('danger');
   else if (pct >= warnPct) wrap.classList.add('warn');
 
-  // Phase C Task 3 SubTask 3.12：95% 上下文用量警告
-  if (pct >= 95) {
+  // 95% 上下文用量警告。
+  // 原实现用 $('#token-progress-bar') 取元素，但页面上只有 class="token-progress-bar"
+  // 且没有这个 id —— 于是 bar.classList.add('danger') 从未执行，警示色永远不生效。
+  // 变红效果已由上面的 wrap.classList.add('danger') 生效（CSS:
+  // .token-progress.danger .token-progress-fill），此处只需弹提示。
+  // 另外提示必须去重：updateTokenProgress 在流式过程中会被调用多次，
+  // 原实现每次 >=95% 都弹一次，会连续刷屏。
+  if (pct >= 95 && !_ctxWarn95Shown) {
+    _ctxWarn95Shown = true;
     showToast('上下文用量已超过 95%，建议开始新会话', 'warning');
-    // 进度条变红
-    const bar = $('#token-progress-bar');
-    if (bar) bar.classList.add('danger');
+  } else if (pct < 95) {
+    _ctxWarn95Shown = false;
   }
 }
 

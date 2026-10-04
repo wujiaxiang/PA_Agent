@@ -197,6 +197,13 @@ def _build_demo_record():
 
     payload = _serialize_record(record)
 
+    # kline_data 必须由 demo 路由自己补：_serialize_record 是「真实分析流」的
+    # 序列化器，K 线是随 SSE 单独下发的，因此它刻意不含 kline_data。而前端
+    # demo handler 读 data.kline_data 来重绘图表 —— 缺了会导致图表仍显示上一个
+    # 品种（此处决策价是 BTC 的 ~64932，而图上是 NVDA 的 ~220），
+    # Entry/SL/TP1/TP2 横线全部落到视口外，等于「决策与 K 线完全脱钩」。
+    payload["kline_data"] = kline_data
+
     # 仅覆盖序列化之外的、由 demo 路由负责的调试面板字段
     payload["raw_debug_payload"] = {
         "stage1_system_prompt": "你是专业的加密货币交易分析师...",

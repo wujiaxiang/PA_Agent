@@ -19,6 +19,21 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 9. 功能键联动 review：demo 三方脱钩 / 交易价位图例 / 死代码
+
+- **背景**：用 Playwright 逐个操作功能键并量取 DOM/canvas，核对 AGENTS.md 的联动规则
+- **控件联动实测（均符合预期，未改动）**：等待收盘 ⇄ 分析按钮 waiting/idle；持续分析强制勾选并锁定「实时」「等待收盘」、关闭后恢复可编辑；取消实时只关数据流
+- **发现并修复**：
+  1. **Demo 的「决策 ↔ K 线 ↔ 指标」三方脱钩（High，四层成因）**
+     - `/api/demo/sample` 缺 `kline_data`：上一轮 demo 改用 `_serialize_record`，而该函数是「真实分析流」序列化器，K 线随 SSE 单独下发，刻意不含此字段
+     - **契约不匹配**：demo handler 把 bar 预映射成 `{time,...}`，但 `setBars` 的契约是**原始 bar**（`ts_open`/`closed`），于是 `a.ts_open === undefined` → 排序退化、time 为 `NaN`，LightweightCharts 抛 `Value is null` / `right should be >= left`
+     - **指标不重算**：`loadBars()` 是 `setBars` + `onBarsUpdated` 两步，demo 只做第一步。实测切到 BTCUSDT 1d 后 EMA 仍是 NVDA 的 210~234，蜡烛却是 48000~64000，自动缩放把两个数量级一起纳入 → 价格轴被拉到 **-8000~66000**，K 线压成顶部一条
+     - `__PA_LAST_BAR_TIME__` 未更新，方向箭头仍指向切换前的品种
+  2. **入场/止损/止盈在图上不可读（Med）**：`fitView` 只看最近 20 根，TP2/SL 常落在可见区间外。新增 `#trade-legend` 固定列出四个价位与颜色，超出区间时标注「视野外 ↑/↓」；位置由右上改为左上（右上与价格轴数值标签叠字）
+  3. **两处死代码（Low）**：`#token-progress-bar`（页面只有同名 class 无该 id，95% 告警变红从未生效，且 toast 反复触发）；`#ds-symbol-select`（HTML 中不存在，永不触发）
+- **文件**：`web/static/js/app.js`、`web/static/js/chart.js`、`web/static/index.html`、`web/static/css/style.css`、`web/api/routes_demo.py`
+- **验证**：Demo 实机截图确认蜡烛、EMA、MACD、Entry/SL/TP1/TP2 横线与图例、方向箭头全部对齐同一价格轴；指标值域由 `210~234` 变为 `56605~75385`（随品种）；工具栏品种同步为 BTCUSDT；无 JS 错误。全量 `tests/unit` 对基线：新增失败 0
+
 ### 8. UI 实机排查：追问入口不可见 / MACD 副图缺失 / 指标无图例 / 标记淹没 K 线
 
 - **背景**：改用 Playwright + headless Chromium 对部署实例（`:8005`）实机截图与 DOM 度量排查 UI，而非只读代码

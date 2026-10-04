@@ -3496,3 +3496,60 @@ button.secondary:hover { background: var(--border); }
   flex: none;
 }
 #chart-legend .lg-item.is-off { opacity: 0.35; text-decoration: line-through; }
+
+/* 交易价位图例（Entry / SL / TP1 / TP2）。
+   入场、止损、止盈横线画在主图上，但当决策价位落在当前可见价格区间之外
+   （例如 fitView 只看最近 20 根，而 TP2 在区间上方）时，用户只能靠猜。
+   这里固定列出四个价位与颜色，并标注「在视野内 / 在视野外」，
+   让「决策 ↔ K 线」的关系在数值层面始终可读。 */
+#trade-legend {
+  position: absolute;
+  /* 放在左上角指标图例**下方**：原先放右上时与价格轴的
+     TP1/TP2/SL 数值标签直接叠字（实测互相压字不可读），右侧留给价格轴。 */
+  top: 38px;
+  left: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 9px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #9ca3af;
+  background: rgba(17, 21, 31, 0.82);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 5px;
+  z-index: 3;
+  pointer-events: none;
+}
+#trade-legend:empty { display: none; }
+#trade-legend .tl-title {
+  font-size: 10px;
+  letter-spacing: .04em;
+  color: #6b7280;
+  margin-bottom: 1px;
+}
+#trade-legend .tl-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+#trade-legend .tl-swatch {
+  width: 12px;
+  height: 0;
+  border-top-width: 2px;
+  border-top-style: solid;
+  flex: none;
+}
+#trade-legend .tl-name { color: #cbd5e1; }
+#trade-legend .tl-price { color: #e5e7eb; font-variant-numeric: tabular-nums; }
+#trade-legend .tl-out {
+  font-size: 9px;
+  color: #6b7280;
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 3px;
+  padding: 0 3px;
+}
+#trade-legend .tl-out.up { color: #26a69a; border-color: rgba(38,166,154,.35); }
+#trade-legend .tl-out.down { color: #ef5350; border-color: rgba(239,83,80,.35); }

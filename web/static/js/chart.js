@@ -254,6 +254,84 @@ function setBars(candleSeries, bars) {
 // ── EMA 渲染已迁移到 indicators.js（统一指标管理器） ─────────────────
 
 // ── 决策价格线 ───────────────────────────────────────────────────────
+// ── 交易价位图例 ───────────────────────────────────────────────────────────
+// 四个价位（Entry/SL/TP1/TP2）虽然以横线画在主图上，但 fitView 只看最近
+// 20 根，TP2/SL 常常落在可见价格区间之外，界面就完全看不出这单的风险收益
+// 摆在哪里。这里按颜色把四个价位固定列出来，并标注是否落在当前视野内。
+function _renderTradeLegend(decision) {
+  const box = document.getElementById('trade-legend');
+  if (!box) return;
+  const noOrder = !decision || decision.order_type === '不下单' || decision.order_type === 'no_order';
+  const rows = [];
+  if (!noOrder) {
+    const dir = String(decision.order_direction || '').toLowerCase();
+    const isShort = dir === 'short' || dir === '做空' || dir === 'sell';
+    const dirColor = isShort ? COLOR_SHORT : COLOR_LONG;
+    const spec = [
+      ['入场', decision.entry_price, dirColor, 'solid'],
+      ['止损', decision.stop_loss_price, COLOR_DOWN, 'dashed'],
+      ['止盈1', decision.take_profit_price, COLOR_UP, 'dashed'],
+      ['止盈2', decision.take_profit_price_2, COLOR_UP, 'dashed'],
+    ];
+    // 可见价格区间：取蜡烛数据的高低点
+    let lo = null, hi = null;
+    try {
+      const d = candleSeries && candleSeries.data ? candleSeries.data() : [];
+      if (d && d.length) {
+        lo = Math.min(...d.map(x => x.low));
+        hi = Math.max(...d.map(x => x.high));
+      }
+    } catch (_) { /* data() 不可用时仅显示价位 */ }
+    for (const [name, price, color, style] of spec) {
+      if (!_isNum(price)) continue;
+      rows.push({ name, price, color, style, lo, hi });
+    }
+  }
+  const sig = rows.map(r => `${r.name}:${r.price}:${r.color}`).join('|') + (noOrder ? '#no' : '');
+  if (box.dataset.sig === sig) return;
+  box.dataset.sig = sig;
+  box.innerHTML = '';
+  if (!rows.length) return;
+
+  const title = document.createElement('div');
+  title.className = 'tl-title';
+  title.textContent = '交易价位';
+  box.appendChild(title);
+
+  for (const r of rows) {
+    const row = document.createElement('div');
+    row.className = 'tl-row';
+    const sw = document.createElement('span');
+    sw.className = 'tl-swatch';
+    sw.style.borderTopColor = r.color;
+    sw.style.borderTopStyle = r.style;
+    sw.style.borderTopWidth = r.name === '入场' ? '2px' : '1px';
+    const nm = document.createElement('span');
+    nm.className = 'tl-name';
+    nm.textContent = r.name;
+    const pr = document.createElement('span');
+    pr.className = 'tl-price';
+    pr.textContent = r.price.toFixed(2);
+    row.appendChild(sw); row.appendChild(nm); row.appendChild(pr);
+    if (r.lo != null) {
+      const outside = r.price > r.hi || r.price < r.lo;
+      const tag = document.createElement('span');
+      tag.className = 'tl-out ' + (r.price > r.hi ? 'up' : 'down');
+      tag.textContent = r.price > r.hi ? '视野外 ↑' : '视野外 ↓';
+      tag.title = `当前 K 线区间 ${r.lo.toFixed(2)} ~ ${r.hi.toFixed(2)}`;
+      if (outside) row.appendChild(tag);
+    }
+    box.appendChild(row);
+  }
+}
+
+function clearTradeLegend() {
+  const box = document.getElementById('trade-legend');
+  if (!box) return;
+  box.dataset.sig = '';
+  box.innerHTML = '';
+}
+
 function setDecisionOverlays(candleSeries, decision) {
   const st = _getOverlayState(candleSeries);
   // 清掉之前的决策价格线（保留 markers，由 setSeqMarkers/setDirectionMarker 管理）
@@ -262,7 +340,10 @@ function setDecisionOverlays(candleSeries, decision) {
   if (!decision) return;
   // 不下单 或 显式关闭叠加层 → 不画
   if (decision.order_type === '不下单' || decision.order_type === 'no_order') return;
-  if (decision.chart_overlay_active === false) return;
+  if (decision.chart_overlay_active === false) {
+    clearTradeLegend();
+    return;
+  }
 
   const dir = String(decision.order_direction || '').toLowerCase();
   const isLong = dir === 'long' || dir === '做多' || dir === 'buy';
@@ -294,6 +375,7 @@ function setDecisionOverlays(candleSeries, decision) {
     });
     st.priceLines.push(pl);
   }
+  _renderTradeLegend(decision);
 }
 
 // ── 支撑/阻力位 ──────────────────────────────────────────────────────
@@ -455,6 +537,7 @@ function fitView(chart, visibleBars = FIT_VISIBLE_BARS, totalBars = 0) {
 // ── 清空 overlays ───────────────────────────────────────────────────
 function clearOverlays(candleSeries) {
   _clearPriceLines(candleSeries);
+  clearTradeLegend();
   const st = _getOverlayState(candleSeries);
   st.markers = [];
   _applyMarkers(candleSeries);
