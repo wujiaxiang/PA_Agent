@@ -85,15 +85,55 @@ def _run_experience_watch(
         deadline = time.monotonic() + max(1.0, float(max_wait_s))
 
         while time.monotonic() < deadline:
+            # ── 订阅漂移防护（关键）────────────────────────────────────────
+            # data_source 是全局共享、订阅绑定的单例：用户随时会切品种/周期。
+            # 若不校验就继续读，拿到的会是**另一个标的**的 K 线，再拿它去判定
+            # 本单就会凭空捏造一条胜负记录（实测：BTCUSDT 单会被 ETHUSDT 的
+            # 暴跌判成 -20% 亏损）。宁可放弃这条经验，也不能写入编造数据。
+            cur_sym = str(getattr(data_source, "_symbol", symbol) or "").strip()
+            cur_tf = str(getattr(data_source, "_timeframe", timeframe) or "").strip()
+            if cur_sym != symbol or cur_tf != timeframe:
+                logger.warning(
+                    "experience watch: subscription drifted %s/%s -> %s/%s — "
+                    "abandoning watch rather than fabricating an outcome",
+                    symbol, timeframe, cur_sym, cur_tf,
+                )
+                return
+
             try:
                 snapshot = data_source.latest_snapshot(200)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("experience watch: snapshot failed: %s", exc)
                 return
 
+            # 轮询**后**再校验一次：订阅可能在「校验」与「取数」之间被改掉
+            # （用户点一下就发生）。只做前置校验仍有竞态窗口。
+            post_sym = str(getattr(data_source, "_symbol", symbol) or "").strip()
+            post_tf = str(getattr(data_source, "_timeframe", timeframe) or "").strip()
+            if post_sym != symbol or post_tf != timeframe:
+                logger.warning(
+                    "experience watch: subscription changed during fetch "
+                    "%s/%s -> %s/%s — discarding this snapshot",
+                    symbol, timeframe, post_sym, post_tf,
+                )
+                return
+
+            # 锚点必须有意义：锚点为 0 表示「不知道入场时刻」，此时若照常
+            # 判定，入场**之前**的历史 K 线会被当成本单走势（例如入场前一根
+            # 暴跌 bar 触及 SL，第一次轮询就写下一条 pnl=-20% 的假亏损）。
+            # 宁可不写。
+            anchor = int(after_ts_open_ms or 0)
+            if anchor <= 0:
+                logger.warning(
+                    "experience watch: %s %s has no entry anchor (ts_open) — "
+                    "not writing an entry to avoid evaluating pre-entry bars",
+                    symbol, timeframe,
+                )
+                return
+
             bars = [
                 b for b in _bar_dicts(snapshot)
-                if b["ts_open"] and b["ts_open"] > int(after_ts_open_ms or 0)
+                if b["ts_open"] and b["ts_open"] > anchor
             ]
             if bars:
                 outcome = evaluate_outcome(

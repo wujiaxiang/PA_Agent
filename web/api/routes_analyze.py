@@ -486,6 +486,7 @@ def _run_analysis(
                 settings=ctx.settings,
                 symbol=ctx.settings.general.last_symbol,
                 timeframe=ctx.settings.general.last_timeframe,
+                data_source=ctx.data_source,
             ):
                 logger.info(
                     "order signal dispatched for %s/%s",

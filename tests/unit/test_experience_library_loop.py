@@ -194,18 +194,24 @@ def test_watcher_writes_when_tp_resolves(tmp_path):
     ew.EXPERIENCE_DIR = tmp_path          # ExperienceWriter reads this default
 
     class _DS:
+        # 模拟订阅绑定的数据源：watcher 会校验 _symbol/_timeframe 是否漂移
+        _symbol = "BTCUSDT"
+        _timeframe = "1d"
+
         def latest_snapshot(self, n):
             return [
                 type("B", (), {"ts_open": 1, "high": 101.0, "low": 99.0, "close": 100.0})(),
                 type("B", (), {"ts_open": 2, "high": 106.0, "low": 100.0, "close": 105.0})(),
             ]
 
+    # 锚点必须晚于最后一根已收盘 bar：传 0 会让 watcher 拿入场**之前**的
+    # 历史 K 线去判定本单（已由 test_experience_watch_integrity 钉死）。
     _run_experience_watch(
         data_source=_DS(), symbol="BTCUSDT", timeframe="1d",
         entry_price=100.0, take_profit_price=105.0, stop_loss_price=97.0,
         is_long=True, cycle_position="trending_tr", direction="做多",
         detected_patterns=["test"], confidence=60, summary="闭环端到端",
-        after_ts_open_ms=0, max_wait_s=5,
+        after_ts_open_ms=1, max_wait_s=5,
     )
     files = list((tmp_path / "trending_tr" / "success_cases").glob("*.json"))
     assert len(files) == 1

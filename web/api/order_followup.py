@@ -148,6 +148,7 @@ def spawn_post_order_followup(
     settings: Any,
     symbol: str,
     timeframe: str,
+    data_source: Any = None,
 ) -> bool:
     """Spawn the trade-log + notification follow-up on a daemon thread.
 
@@ -179,8 +180,19 @@ def spawn_post_order_followup(
     try:
         from web.api.experience_watcher import spawn_experience_watch
 
-        ds = getattr(record, "_data_source", None) or getattr(frame, "data_source", None)
+        # data_source 必须由调用方显式传入。
+        # 此前这里取 getattr(record, "_data_source", None) 或
+        # getattr(frame, "data_source", None)，而 AnalysisRecord 与 KlineFrame
+        # **都没有**这两个属性 → ds 恒为 None → spawn_experience_watch 从未被
+        # 调用过 → 经验库写入链路自打通以来就是死的（库里 36 条全是种子数据）。
+        ds = data_source
         if ds is not None:
+            # 入场锚点：必须晚于最后一根**已收盘** bar，否则 watcher 会拿入场
+            # 之前的历史 K 线去判定这笔单。bars[0] 是未收盘 forming bar，
+            # bars[1] 才是最后一根已收盘。
+            bars = list(getattr(frame, "bars", None) or [])
+            closed = [b for b in bars if getattr(b, "closed", False)] or bars[1:]
+            anchor = int(getattr(closed[0], "ts_open", 0)) if closed else 0
             spawn_experience_watch(
                 data_source=ds,
                 settings=settings,
@@ -188,7 +200,7 @@ def spawn_post_order_followup(
                 timeframe=timeframe,
                 stage1=dict(getattr(record, "stage1_diagnosis", None) or {}),
                 stage2_flat=_flat_stage2(record),
-                last_closed_ts_open_ms=0,
+                last_closed_ts_open_ms=anchor,
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("experience watch spawn failed: %s", exc)
