@@ -905,8 +905,13 @@ function bindEvents() {
         // 勾选：立即启动倒计时显示
         startWaitingCountdownDisplay();
       } else {
-        // 取消：停止倒计时
+        // 取消：停止倒计时显示
         stopWaitingCountdownDisplay();
+        // 同时必须结束「等待收盘中」的分析流程。之前只停了显示定时器，
+        // 若此刻 startAnalysis 正 await 在 startWaitCloseCountdown() 上，
+        // resolver 会永远挂着 → 分析永不发起、按钮卡在 waiting/idle。
+        // stopWaitCloseCountdown() 会 resolve(false) 让 startAnalysis 正常 return。
+        stopWaitCloseCountdown();
       }
       // 同步分析按钮样式（waiting ⇄ idle）
       refreshAnalyzeButtonWaitingState();
@@ -1708,17 +1713,18 @@ function startSSEBarsStream() {
           isAnalyzing = false;
         }
         if (cbKeep && cbKeep.checked && !isAnalyzing) {
-          // 使用刚收盘 bar 的 ts_open（sorted[-2]）作为哨兵，而非 forming bar
-          const closedBarIdx = sorted.length >= 2 ? sorted.length - 2 : sorted.length - 1;
-          const newClosedTs = closedBarIdx >= 0 ? sorted[closedBarIdx].ts_open : 0;
+          // 刚收盘 bar 的 ts_open 作为哨兵（统一实现，见 continuous_gate.closedBarTs）
+          const newClosedTs = window.PAContinuousGate
+            ? window.PAContinuousGate.closedBarTs(bars)
+            : (sorted.length >= 2 ? sorted[sorted.length - 2].ts_open : 0);
           if (newClosedTs && newClosedTs !== keepAnalysisLastClosedTs) {
             keepAnalysisLastClosedTs = newClosedTs;
             // 自动增量：有增量基础记录时用增量分析，否则完整分析
             const btnInc = $('#btn-incremental');
             if (btnInc && !btnInc.disabled) {
-              startIncrementalAnalysis(true);
+              startIncrementalAnalysis(true, 'continuous');
             } else {
-              startAnalysis(true);
+              startAnalysis(true, 'continuous');
             }
           }
         }
@@ -2033,13 +2039,11 @@ function updateSSEStatusWithExpiry() {
       stopWaitCloseCountdown();
       loadBars()
         .then(() => {
-          // 更新持续分析去重哨兵（与 SSE bar_close handler 使用相同公式）
-          if (lastBars && lastBars.length) {
-            const sorted = [...lastBars].sort((a, b) => a.ts_open - b.ts_open);
-            const closedBarIdx = sorted.length >= 2 ? sorted.length - 2 : sorted.length - 1;
-            const newClosedTs = closedBarIdx >= 0 ? sorted[closedBarIdx].ts_open : 0;
-            if (newClosedTs) keepAnalysisLastClosedTs = newClosedTs;
-          }
+          // 更新持续分析去重哨兵（与 bar_close handler 同一实现，避免两处公式漂移）
+          const newClosedTs = window.PAContinuousGate
+            ? window.PAContinuousGate.closedBarTs(lastBars)
+            : 0;
+          if (newClosedTs) keepAnalysisLastClosedTs = newClosedTs;
         })
         .catch((e) => console.error('waitCloseCountdown loadBars:', e))
         .finally(() => { if (r) r(true); });
@@ -2255,11 +2259,19 @@ async function applyCancelKeepAnalysisOnRetry(stageLabel) {
   }
 }
 
-async function startAnalysis(continuousMode = false) {
+async function startAnalysis(continuousMode = false, triggerSource = 'user') {
   // 等待收盘：若勾选了「等待收盘」复选框，先调 /api/bars/next-close 拿到剩余
   // 秒数，每秒更新倒计时，归零后再实际发起 /api/analyze/stream 请求。
+  //
+  // triggerSource='continuous' 表示本次是由 bar_close 事件触发的（bar 刚刚收盘），
+  // 此时绝不能再等一根 —— 否则分析整整晚一个周期，且下一个 bar_close 会把
+  // pending 的 resolver resolve(false) 取消掉，表现为持续分析反复重置、永不
+  // 真正发起分析。详见 static/js/continuous_gate.js。
   const cbWaitClose = $('#cb-wait-close');
-  if (cbWaitClose && cbWaitClose.checked) {
+  const needWait = window.PAContinuousGate
+    ? window.PAContinuousGate.shouldWaitForClose(triggerSource, cbWaitClose && cbWaitClose.checked)
+    : !!(cbWaitClose && cbWaitClose.checked);
+  if (needWait) {
     const started = await startWaitCloseCountdown();
     if (!started) {
       // 用户在等待期间取消勾选，或后端无法获取剩余秒数 → 不发分析请求
@@ -2591,15 +2603,12 @@ async function startWaitCloseCountdown() {
         // 倒计时归零，await loadBars 刷新 K线（含新 bar 的 seq/指标）后再触发分析
         loadBars()
           .then(() => {
-            // 更新持续分析去重哨兵为最新 forming bar 的 ts_open（与 SSE bar_close
-            // 处理器使用相同的 sorted[last].ts_open 计算），防止 SSE 重复触发分析
-            if (lastBars && lastBars.length) {
-              const sorted = [...lastBars].sort((a, b) => a.ts_open - b.ts_open);
-              const closedBarIdx = sorted.length >= 2 ? sorted.length - 2 : sorted.length - 1;
-              const newClosedTs = closedBarIdx >= 0 ? sorted[closedBarIdx].ts_open : 0;
-              if (newClosedTs) {
-                keepAnalysisLastClosedTs = newClosedTs;
-              }
+            // 同上：统一用 continuous_gate.closedBarTs，防止 SSE 重复触发分析
+            const newClosedTs = window.PAContinuousGate
+              ? window.PAContinuousGate.closedBarTs(lastBars)
+              : 0;
+            if (newClosedTs) {
+              keepAnalysisLastClosedTs = newClosedTs;
             }
           })
           .catch((e) => console.error('startWaitCloseCountdown loadBars:', e))
@@ -2633,9 +2642,13 @@ function stopWaitCloseCountdown() {
 
 // ── 增量分析（基于上次成功记录） ──────────────────────────────────────
 // 复用 startAnalysis 的事件处理逻辑，仅切换 endpoint 为 /api/analyze/incremental/stream
-async function startIncrementalAnalysis(continuousMode = false) {
+async function startIncrementalAnalysis(continuousMode = false, triggerSource = 'user') {
   const cbWaitClose = $('#cb-wait-close');
-  if (cbWaitClose && cbWaitClose.checked) {
+  // 同 startAnalysis：持续分析由 bar_close 触发时不再等一根
+  const needWait = window.PAContinuousGate
+    ? window.PAContinuousGate.shouldWaitForClose(triggerSource, cbWaitClose && cbWaitClose.checked)
+    : !!(cbWaitClose && cbWaitClose.checked);
+  if (needWait) {
     const started = await startWaitCloseCountdown();
     if (!started) return;
   }
