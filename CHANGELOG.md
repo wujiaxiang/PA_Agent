@@ -19,6 +19,28 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 20. 后台定时结算 + 定时/手工模式开关 + 每条记录独立 LLM 复盘
+
+- **后台定时结算** `web/api/experience_scheduler.py`：此前待验证记录只能靠用户点「验证」才结算，不点就永远停在 pending，两阶段设计等于白做
+  - lifespan 启动 daemon 线程，默认每 180s 一轮（`experience_verify_interval_s`，下限 30s 强制）
+  - **单飞守卫**：两轮 pass 绝不重叠；任何异常只吞不冒泡且保证守卫释放（一次失败不能让调度器永久卡死）
+  - **只结算当前订阅范围 + 只用共享数据源**：结算其它品种需为每条记录单独建 TradingView 连接，定时器上做这个等于打爆上游；那些记录等用户切回去或点按钮时再结算
+  - 范围每轮**重读 settings** 而非取快照 —— 用户随时会切品种
+  - 首轮在启动后 20s，让重启能结算上次遗留的 pending；分析完成时另起线程顺带结算一轮
+- **定时 / 手工模式** `experience_verify_mode`: `auto` | `manual`。manual 时定时器与分析后触发都空操作，但「验证」按钮仍可用（`run_once(force=True)`）—— 用户选手工是不要后台偷偷结算，不是要禁用按钮
+- **每条记录独立「复盘」按钮**（不是总按钮）：`GET /api/experience/review/stream` SSE 流式 LLM 复盘，就地展开在该条目下方。不跳到追问 tab —— 复盘针对这一条记录，与当前图表/追问会话是两回事，混在一起会污染追问上下文。prompt 固定五段结构（结论 / 归因 / 当时能否预见 / 改进建议 / 下次判据），并明确要求「不要事后诸葛亮」；`unresolved` 单独说明为正常结局，评价对象是窗口长度是否合理
+- **案例库现在记录完整上下文**（复盘的前提）：`save_pending()` 新增 `analysis_context`（阶段一判断要点 + 阶段二决策）与 `bars_snapshot`（入场前后各 20 根 K 线）。只留决策要点、丢弃 prompt/response 原文与冗长叙述（长文本截 600 字、列表取前 12 项），实测单条约 3.8KB
+- **实现中修掉的问题**
+  1. **阶段一接线整体丢失**：`order_followup` 的 `save_pending_if_resolvable` 替换因后续 assert 失败导致写文件未执行，容器里跑的还是旧 `spawn_experience_watch` —— 两阶段根本没接进分析流程。现把断言放在写入之前
+  2. **前端 SSE 解析切不出事件**：sse_starlette 用 CRLF 分隔，前端按 `
+
+` 切，复盘永远停在「生成中…」。已归一化 CRLF
+  3. 调度测试直接调用 `_loop` 导致死循环（测试自身缺陷），改为用 `_stop` 收尾
+  4. 调度测试 mock 的 `data_source` 写成类而非实例，`latest_snapshot(n)` 把 `self` 变成了 int
+- **测试**：新增 `tests/unit/test_experience_scheduler.py`(15) —— 结算正确性、范围跟随 settings、跨品种不结算、单飞不重叠、异常后守卫释放、间隔下限、start 幂等、manual 跳过定时器但按钮仍可用、未知模式回退 auto、循环真跑起来仍空闲
+- **文件**：`web/api/{experience_scheduler.py,routes_experience_review.py,routes_data.py,routes_analyze.py,order_followup.py}`、`web/server.py`、`pa_agent/records/experience_writer.py`、`pa_agent/config/settings.py`、`web/static/{js/app.js,css/style.css,index.html}`、`tests/unit/test_experience_scheduler.py`
+- **验证**：造一条与真实 BTC 同量级的 pending → 调度器首轮自动结算为 `win / bars_seen=3 / pnl=+0.6%`；复盘按钮流式返回 1257 字并带推理折叠；39 项经验库相关测试全过；全量 `tests/unit` 对基线新增失败 0
+
 ### 19. 两阶段经验库：入场即写「待验证」+ 按 N 根 K 线结算 + 点击联动主图
 
 - **动机**：旧实现是一次性判定（起线程轮询到 TP/SL 触发才写一条），进程重启全丢，且只能验证「用户一直没换品种」的那些。改为两阶段，让「记录事实」与「判定结果」解耦
