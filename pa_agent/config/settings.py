@@ -13,6 +13,17 @@ class AIProviderSettings(BaseModel):
     """AI provider connection and behaviour settings."""
     model_config = ConfigDict(extra="ignore", validate_assignment=True)
 
+    # **用户是否自带模型配置**。False = 用系统出厂默认（前端不显示配置项，
+    # 后端整段取 baseline，完全忽略本用户对 provider 的任何覆盖）。
+    #
+    # 为什么不用「稀疏覆盖」隐式表达：那样用户既看不出哪些字段是继承来的，也
+    # 无法一键切回（得逐个清掉散落的覆盖键）。更隐蔽的是**遮蔽**——用户一旦覆盖过
+    # 某个字段，系统此后对该字段的更新就永远到不了他这里，而界面上毫无提示。
+    #
+    # 放在 provider 段内，但它与其他字段语义相反：**无论此开关取何值，它都由用户
+    # 自己决定**，不受「关闭时整段取 baseline」影响。
+    use_custom: bool = False
+
     # 服务端 prompt cache 预热：真实请求前先用同一稳定前缀发一条
     # max_tokens=1 的廉价请求。实测把缓存率从 0.2% 提到 100%，
     # 且不依赖对缓存 TTL 的猜测。设为 false 可关闭。

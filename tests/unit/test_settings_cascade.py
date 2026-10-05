@@ -117,11 +117,18 @@ def test_user_inherits_baseline_without_any_change(db):
 
 def test_user_change_saves_sparse_patch(db):
     seed_from_file(BASE)
+
+
+# ⚠ 下面三个用例测的是「稀疏覆盖机制」，不是「系统默认/自带模型」模式门控。
+# 自 2026-10-05 起 provider 覆盖需**显式选择**才生效（见文件末尾的 LLM 配置组），
+# 所以它们必须先打开 use_custom —— 否则覆盖被门控丢弃，测不到本来要测的东西。
+
     apply_user_change(
-        {**BASE, "provider": {**BASE["provider"], "model": "user-model"}}, "admin"
+        {**BASE, "provider": {**BASE["provider"], "use_custom": True, "model": "user-model"}},
+        "admin",
     )
     ov = load_overrides("admin")
-    assert ov == {"provider": {"model": "user-model"}}, (
+    assert ov == {"provider": {"use_custom": True, "model": "user-model"}}, (
         "只应存差异 —— 全量复制会让系统兜底后续更新传不到用户"
     )
     assert resolve("admin")["provider"]["model"] == "user-model"
@@ -130,14 +137,20 @@ def test_user_change_saves_sparse_patch(db):
 def test_user_change_does_not_mutate_baseline(db):
     """铁律：用户改动不得污染系统兜底 —— 那是所有用户的只读默认值。"""
     seed_from_file(BASE)
-    apply_user_change({**BASE, "provider": {**BASE["provider"], "model": "mine"}}, "admin")
+    apply_user_change(
+        {**BASE, "provider": {**BASE["provider"], "use_custom": True, "model": "mine"}},
+        "admin",
+    )
     assert load_baseline()["provider"]["model"] == BASE["provider"]["model"], "系统兜底被改了！"
 
 
 def test_baseline_update_propagates_to_untouched_users_only(db):
     """系统兜底更新后，没改过该字段的用户应拿到新值。"""
     seed_from_file(BASE)
-    apply_user_change({**BASE, "provider": {**BASE["provider"], "model": "mine"}}, "admin")
+    apply_user_change(
+        {**BASE, "provider": {**BASE["provider"], "use_custom": True, "model": "mine"}},
+        "admin",
+    )
 
     save_baseline({**BASE, "provider": {**BASE["provider"], "model": "system-v2"}})
 
@@ -147,7 +160,10 @@ def test_baseline_update_propagates_to_untouched_users_only(db):
 
 def test_reset_to_system_defaults(db):
     seed_from_file(BASE)
-    apply_user_change({**BASE, "provider": {**BASE["provider"], "model": "mine"}}, "admin")
+    apply_user_change(
+        {**BASE, "provider": {**BASE["provider"], "use_custom": True, "model": "mine"}},
+        "admin",
+    )
     assert reset_to_system_defaults("admin") is True
     assert load_overrides("admin") == {}
     assert resolve("admin")["provider"]["model"] == BASE["provider"]["model"]
@@ -155,8 +171,14 @@ def test_reset_to_system_defaults(db):
 
 def test_users_are_isolated(db):
     seed_from_file(BASE)
-    apply_user_change({**BASE, "provider": {**BASE["provider"], "model": "A"}}, "user-a")
-    apply_user_change({**BASE, "provider": {**BASE["provider"], "model": "B"}}, "user-b")
+    apply_user_change(
+        {**BASE, "provider": {**BASE["provider"], "use_custom": True, "model": "A"}},
+        "user-a",
+    )
+    apply_user_change(
+        {**BASE, "provider": {**BASE["provider"], "use_custom": True, "model": "B"}},
+        "user-b",
+    )
     assert resolve("user-a")["provider"]["model"] == "A"
     assert resolve("user-b")["provider"]["model"] == "B"
 
@@ -386,3 +408,85 @@ def test_promote_rejected_when_db_read_failed(db):
     # read_failed 是**线程局部**的（跨线程污染会让降级失效），必须设在线程局部上
     get_hub()._local.read_error = "no such table: global_config"
     assert promote_to_baseline({"general": {"analysis_bar_count": 999}}) is False
+
+
+# ── LLM 配置：系统默认 vs 自带模型 ────────────────────────────────────────────
+
+
+def _baseline_with(model="sys-model"):
+    from pa_agent.config.settings import Settings
+
+    d = Settings().model_dump(mode="json")
+    d["provider"]["model"] = model
+    return d
+
+
+def test_default_is_system_default(db):
+    """出厂默认就是「跟随系统」—— admin 也一样，不需要任何表态。"""
+    from pa_agent.storage.settings_store import resolve, save_baseline
+
+    save_baseline(_baseline_with())
+    p = resolve("admin")["provider"]
+    assert p["use_custom"] is False
+    assert p["model"] == "sys-model"
+
+
+def test_provider_overrides_ignored_until_opted_in(db):
+    """**没表态就不生效**：残留覆盖不得盖住系统默认。
+
+    否则用户既看不出自己遮住了什么，也无法一键切回 —— 而界面上毫无提示。
+    """
+    from pa_agent.storage.settings_store import (
+        resolve, save_baseline, save_overrides,
+    )
+
+    save_baseline(_baseline_with())
+    save_overrides({"provider": {"model": "stale", "base_url": "http://stale"}}, "admin")
+    r = resolve("admin")["provider"]
+    assert r["model"] == "sys-model"
+    assert r["base_url"] != "http://stale", "残留覆盖未被作废"
+
+
+def test_custom_mode_applies_user_overrides(db):
+    from pa_agent.storage.settings_store import (
+        resolve, save_baseline, save_overrides,
+    )
+
+    save_baseline(_baseline_with())
+    save_overrides({"provider": {"use_custom": True, "model": "mine"}}, "admin")
+    assert resolve("admin")["provider"]["model"] == "mine"
+
+
+def test_switching_back_to_system_wipes_stale_overrides(db):
+    """回归守卫：切回系统默认后，**残留的 provider 覆盖必须全部作废**。
+
+    实现一度只重置 use_custom 却保留了其余键，于是界面上写着「使用系统默认」、
+    实际却在用自己那个已被删除的模型 —— 名存实亡，比不做这个功能更糟。
+    """
+    from pa_agent.storage.settings_store import (
+        resolve, save_baseline, save_overrides,
+    )
+
+    save_baseline(_baseline_with())
+    save_overrides(
+        {"provider": {"use_custom": False, "model": "stale", "base_url": "http://old"}},
+        "admin",
+    )
+    p = resolve("admin")["provider"]
+    assert p["model"] == "sys-model", "切回系统默认后仍在用陈旧覆盖"
+    assert p["base_url"] != "http://old", "残留字段未被作废"
+
+
+def test_llm_switch_does_not_affect_other_sections(db):
+    """provider 的开关只管 provider —— 偏好类配置不受影响。"""
+    from pa_agent.storage.settings_store import (
+        resolve, save_baseline, save_overrides,
+    )
+
+    save_baseline(_baseline_with())
+    save_overrides(
+        {"provider": {"use_custom": False, "model": "x"},
+         "general": {"analysis_bar_count": 250}},
+        "admin",
+    )
+    assert resolve("admin")["general"]["analysis_bar_count"] == 250

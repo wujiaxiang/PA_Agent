@@ -184,7 +184,48 @@ def resolve(user_id: str, file_fallback: dict[str, Any] | None = None) -> dict |
         save_baseline(baseline)
     if baseline is None:
         return None
-    return deep_merge(baseline, load_overrides(user_id))
+    return deep_merge(baseline, _apply_llm_source(baseline, load_overrides(user_id)))
+
+
+#: 用户关闭「自带模型」时，其 provider 覆盖里这些键一律作废。
+#: ``use_custom`` **不在其中** —— 它是开关本身，必须由用户决定。
+_LLM_CONTROL_KEY = "use_custom"
+
+
+def _apply_llm_source(baseline: dict, overrides: dict) -> dict:
+    """按「系统默认 / 自带模型」开关裁剪 provider 覆盖。
+
+    ``provider.use_custom`` 为假（默认，含出厂兜底自己设的假）时，用户对
+    provider 的覆盖**整段作废** —— 他们的 LLM 配置完全来自系统出厂默认。
+
+    为什么不能靠「稀疏覆盖」自然表达：用户覆盖过某个字段后，系统对该字段的
+    后续更新就再也到不了他这里（遮蔽），而界面上完全看不出自己遮住了什么。
+    显式开关让「跟随系统」成为一个可见、可一键撤销的状态。
+
+    其它 section（general / prompt / validation / feishu …）不受影响 —— 它们是
+    偏好而非凭证，稀疏覆盖的语义本来就正确。
+    """
+    if not overrides:
+        return overrides
+
+    provider_ov = overrides.get("provider")
+    if not isinstance(provider_ov, dict):
+        return overrides
+
+    use_custom = provider_ov.get(_LLM_CONTROL_KEY)
+    if use_custom is None:
+        # 用户从未表达过偏好 → 跟随系统。注意不能把「baseline 设了 false」
+        # 当作用户的显式选择：出厂配置不是用户的意愿。
+        return {k: v for k, v in overrides.items() if k != "provider"}
+
+    if use_custom:
+        return overrides
+
+    # 关：**只**保留开关本身，其余 provider 覆盖全部作废 ——
+    # 留着它们就会盖住 baseline，让「跟随系统」名存实亡。
+    rest = {k: v for k, v in overrides.items() if k != "provider"}
+    rest["provider"] = {_LLM_CONTROL_KEY: False}
+    return rest
 
 
 def seed_from_file(file_data: dict[str, Any]) -> bool:
