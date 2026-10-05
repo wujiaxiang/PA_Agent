@@ -29,15 +29,18 @@ logger = logging.getLogger("pa_agent.storage")
 
 T = TypeVar("T")
 
-# 默认 DB 位置：records/ 已在 docker-compose bind mount 内（docker-compose.yml:13）
-DEFAULT_DB_PATH: Path = Path(__file__).resolve().parent.parent.parent / "records" / "pa_agent.db"
-
-# 单用户默认值。所有 L2/L3 表的 user_id 默认值；接入多用户后由请求头/鉴权填充。
-DEFAULT_USER_ID = "default"
+# 单机部署下的默认用户。**这是 user_id 的唯一真源** —— 所有 L2/L3 表的
+# user_id 都要等于它，users.py 直接别名引用本常量。此前 db.py 定义 "default"
+# 而 users.py 定义 "admin"，两处并存导致所有记录都写进了 users 表里根本不存在的
+# 用户名下（评审 H5）。将来接入鉴权时改 users.default_user_id() 一处即可。
+DEFAULT_USER_ID: str = "admin"
 
 # busy_timeout：并发写（后台调度器 + 分析主流程 + 多 tag 轮询）撞锁时等待而非立刻抛
 # sqlite3.OperationalError。5s 足够覆盖一次短事务。
 _BUSY_TIMEOUT_MS = 5000
+
+# 默认 DB 位置：records/ 已在 docker-compose bind mount 内（docker-compose.yml:13）
+DEFAULT_DB_PATH: Path = Path(__file__).resolve().parent.parent.parent / "records" / "pa_agent.db"
 
 
 def db_path() -> Path:

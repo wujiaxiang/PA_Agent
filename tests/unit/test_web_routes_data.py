@@ -104,8 +104,14 @@ def test_get_bars_returns_closed_field(client):
 
 
 def test_get_bars_count_param(client):
-    """GET /api/bars?count=N 调用 latest_snapshot(N)。"""
+    """GET /api/bars?count=N 把 count 与**会话游标**一起传给 latest_snapshot。
+
+    契约变更（评审 H1）：游标从「订阅绑定」变成「入参」。原先只传 count、取的是
+    全局订阅 —— 多标签页各看各的标的时，A tab 会拿到 B tab 的 K 线，而分析记录
+    里写的是 A 的标的，于是「记录的标的」与「图上的 K 线」对不上。
+    """
     resp = client.get("/api/bars?count=3")
     assert resp.status_code == 200
-    # 验证 latest_snapshot 收到 count 参数
-    client.app.state.ctx.data_source.latest_snapshot.assert_called_with(3)
+    _, kwargs = client.app.state.ctx.data_source.latest_snapshot.call_args
+    assert kwargs.get("symbol") == "XAUUSD"
+    assert kwargs.get("timeframe") == "1h"

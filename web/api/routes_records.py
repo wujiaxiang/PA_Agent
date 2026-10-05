@@ -150,17 +150,21 @@ def _glob_partitioned(
     return unique_files[:limit]
 
 
-def _browse_filtered(
-    exchange: str, symbol: str, timeframe: str, limit: int
+def _db_candidates(
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    include_partial: bool,
 ) -> list[Path]:
-    """缺任一过滤条件时的路径：SQLite 优先，DB 未命中/不可用则回退全扫描。
+    """**数据库为唯一真源**：返回 DB 指向的、确实存在于 RECORDS_DIR 的记录文件。
 
-    分区目录需要三者齐全才能定位，所以部分过滤（如只给 symbol）无法走
-    ``_glob_partitioned``。SQLite 的索引天然支持可选过滤条件，故优先用它。
+    ``include_partial`` 必须下推到 SQL —— 否则失败记录先占掉 LIMIT 配额，
+    真实记录被挤掉，历史面板表现为「明明有记录却显示为空」（评审 H4）。
+
+    返回空列表 = 「库里没有」或「库不可用」，调用方据此回退磁盘（自愈路径，
+    不是双轨：磁盘只是补种来源，读的权威始终是库）。
     """
-    from pa_agent.records.analysis_history import list_record_paths, load_record
-
-    # ① SQLite：有索引，跨品种浏览的主要快路径
     try:
         from pa_agent.storage.repositories import list_records as db_list
 
@@ -168,42 +172,53 @@ def _browse_filtered(
             exchange=exchange,
             symbol=symbol,
             timeframe=timeframe,
+            include_partial=include_partial,
             limit=limit,
         )
-        # 必须同时校验「文件存在」**且「位于 RECORDS_DIR 内」**：
-        # DB 里的 file_path 可能是历史残留或已被移动的路径，而本函数的契约是
-        # 只返回 RECORDS_DIR 下的记录（RECORDS_DIR 可被 monkeypatch）。
-        # 少了后一个校验，DB 结果会盖过调用方指定的目录 —— 实测会让
-        # 「跨品种浏览」返回真实库里的记录而非夹具目录的记录。
+        # 校验「文件存在」且「位于 RECORDS_DIR 内」：DB 里的 file_path 可能已
+        # 移动，而本函数契约是只返回 RECORDS_DIR 下的记录（该目录可被 monkeypatch）。
         root = RECORDS_DIR.resolve()
         paths: list[Path] = []
         for r in rows:
             fp = r.get("file_path")
             if not fp:
                 continue
-            p = Path(fp)
-            if not p.is_file():
+            f = Path(fp)
+            if not f.is_file():
                 continue
             try:
-                p.resolve().relative_to(root)
+                f.resolve().relative_to(root)
             except ValueError:
                 continue
-            paths.append(p)
-        if paths:
-            return paths
+            paths.append(f)
+        return paths
     except Exception:  # noqa: BLE001
-        logger.debug("SQLite browse failed, falling back to full scan", exc_info=True)
+        logger.warning("SQLite browse failed, falling back to files", exc_info=True)
+        return []
 
-    # ② 回退：全扫描 + 按记录 meta 过滤（DB 未导入或已降级时）
+
+def _file_candidates(
+    exchange: str, symbol: str, timeframe: str, limit: int
+) -> list[Path]:
+    """自愈回退：直接从磁盘定位记录文件。
+
+    三条件齐全 → 分区目录 glob（快）；缺任意一个 → 分区路径无法定位，
+    退化为全扫描 + 按记录 meta 过滤。仅用于「库里还没有这条记录」的场景。
+    """
+    from pa_agent.records.analysis_history import list_record_paths, load_record
+
+    if exchange and symbol and timeframe:
+        return _glob_partitioned(exchange, symbol, timeframe, limit)
+
     paths = list_record_paths(RECORDS_DIR)
     if not (exchange or symbol or timeframe):
         return paths[:limit]
 
     out: list[Path] = []
-    for p in paths:
+    for f in paths:
         if len(out) >= limit:
             break
-        rec = load_record(p)
+        rec = load_record(f)
         if rec is None:
             continue
         meta = rec.meta
@@ -213,7 +228,7 @@ def _browse_filtered(
             continue
         if timeframe and meta.timeframe != timeframe:
             continue
-        out.append(p)
+        out.append(f)
     return out
 
 
@@ -224,25 +239,23 @@ def _list_records(
     limit: int,
     include_partial: bool,
 ) -> list[dict]:
-    """列出记录摘要，按 mtime 倒序、去重、截断到 limit。
+    """列出记录摘要。
+
+    **数据库是唯一真源**：先查 SQLite，只有「库里没有 / 库不可用」才回退磁盘
+    自愈。老的文件体系不再参与读取决策 —— 它只是补种来源，不是权威。
 
     ``exchange``/``symbol``/``timeframe`` **全部可选**：三者皆空时跨全部品种
     浏览（历史是 L2 用户级共享资产，A tab 分析出的记录 B tab 也要能查到，
-    见 docs/SESSION_STORAGE_DESIGN.md §2.1）。给定过滤条件时行为与改造前一致。
-    损坏的记录文件被静默跳过。
-
-    两条路径：
-    - **三个过滤条件齐全** → 分区目录 glob（既有快路径，行为完全不变）
-    - **缺任意一个** → 无法用分区路径定位，改用 SQLite 索引查询；
-      DB 未命中或不可用时回退全扫描 + 按记录 meta 过滤
+    见 docs/SESSION_STORAGE_DESIGN.md §2.1）。
     """
     if not RECORDS_DIR.exists():
         return []
 
-    if exchange and symbol and timeframe:
-        candidates = _glob_partitioned(exchange, symbol, timeframe, limit)
-    else:
-        candidates = _browse_filtered(exchange, symbol, timeframe, limit)
+    candidates = _db_candidates(
+        exchange, symbol, timeframe, limit, include_partial
+    )
+    if not candidates:
+        candidates = _file_candidates(exchange, symbol, timeframe, limit)
 
     result: list[dict] = []
     for f in candidates:

@@ -250,6 +250,18 @@ async def subscribe(req: SubscribeRequest, request: Request):
     }
 
 
+
+def _resolve_view(request: Request, ctx) -> tuple[str, str, str]:
+    """本请求的 (symbol, timeframe, exchange)，优先取会话游标。
+
+    统一入口：bars / next-close / analyze / chat 都必须走它，否则多标签页下
+    会出现「记录的标的与图上的 K 线不是同一个」的静默错配。
+    """
+    from web.api.session_ctx import resolve_view, session_id_of
+
+    return resolve_view(ctx, session_id_of(request))
+
+
 @router.get("/bars")
 async def get_bars(request: Request, count: int = 100):
     """Fetch latest N bars and return as JSON for chart rendering."""
@@ -258,7 +270,15 @@ async def get_bars(request: Request, count: int = 100):
     # cache miss. The frontend polls this every second, so calling it inline
     # would block the event loop and freeze every SSE stream. The background SSE
     # loop already offloads the same call (see routes_bars_stream._push_bar_update).
-    bars_raw = await asyncio.to_thread(ctx.data_source.latest_snapshot, count)
+    # 按**本会话游标**取数，而不是全局订阅：多标签页各看各的标的时，
+    # 读全局订阅会让 A tab 拿到 B tab 的 K 线（评审 H1）。
+    view_symbol, view_timeframe, view_exchange = _resolve_view(request, ctx)
+    bars_raw = await asyncio.to_thread(
+        ctx.data_source.latest_snapshot, count,
+        exchange=view_exchange or None,
+        symbol=view_symbol or None,
+        timeframe=view_timeframe or None,
+    )
     bars: list[dict] = []
     for b in bars_raw:
         bars.append({
@@ -306,7 +326,13 @@ async def get_next_close(
     # symbol / exchange are accepted for symmetry with /api/subscribe but
     # are not strictly required — we read the forming bar from the
     # current data source regardless.
-    bars_raw = await asyncio.to_thread(ctx.data_source.latest_snapshot, 2)
+    view_symbol, view_timeframe, view_exchange = _resolve_view(request, ctx)
+    bars_raw = await asyncio.to_thread(
+        ctx.data_source.latest_snapshot, 2,
+        exchange=view_exchange or None,
+        symbol=view_symbol or None,
+        timeframe=view_timeframe or None,
+    )
     if not bars_raw:
         return {
             "symbol": symbol or getattr(ctx.settings.general, "last_symbol", ""),

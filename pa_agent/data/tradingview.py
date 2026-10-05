@@ -568,6 +568,12 @@ def _fetch_auth_token_via_session(session_id: str) -> str | None:
         return None
 
 
+# 多槽快照缓存上限：防止「切过很多标的」把内存吃满。
+_SNAP_CACHE_MAX_ENTRIES = 64
+# 过期判定兜底 TTL：只要超过这个时间，条目必被清理。
+_SNAP_CACHE_MAX_TTL_S = 3600.0
+
+
 class TradingViewSource(DataSource):
     """Live K-line data from TradingView via tvdatafeed."""
 
@@ -586,9 +592,9 @@ class TradingViewSource(DataSource):
         self._snapshot_lock = threading.Lock()
         # TTL cache for latest_snapshot(): avoids opening a fresh WebSocket
         # on every call. Mirrors EastMoneySource's _snap_cache_* pattern.
-        self._snap_cache_bars: list | None = None
-        self._snap_cache_n: int = 0
-        self._snap_cache_ts: float = 0.0
+        # 多槽快照缓存：key=(exchange, symbol, timeframe, n)，value=(ts, bars)。
+        # 原为单槽（只按 n 判 TTL），切品种后会返回上一个标的的 K 线。
+        self._snap_cache_by_key: dict[tuple, tuple[float, list]] = {}
         # Callback for status updates during auto-probe: fn(symbol, exchange, label)
         self.on_probe_status = None
 
@@ -707,9 +713,7 @@ class TradingViewSource(DataSource):
         if symbol.strip() != self._symbol or timeframe != self._timeframe:
             # Invalidate snapshot cache so the next latest_snapshot() doesn't
             # return bars for the previous symbol/timeframe.
-            self._snap_cache_bars = None
-            self._snap_cache_n = 0
-            self._snap_cache_ts = 0.0
+            self._snap_cache_by_key.clear()
         self._timeframe = timeframe
         self._symbol = symbol.strip()
         # Abort any in-flight get_hist() blocked on a stalled connection so the
@@ -727,9 +731,7 @@ class TradingViewSource(DataSource):
     def unsubscribe(self) -> None:
         self._symbol = ""
         self._timeframe = ""
-        self._snap_cache_bars = None
-        self._snap_cache_n = 0
-        self._snap_cache_ts = 0.0
+        self._snap_cache_by_key.clear()
         logger.info("TradingViewSource unsubscribed")
 
     # ── Data fetch ────────────────────────────────────────────────────────────
@@ -836,53 +838,86 @@ class TradingViewSource(DataSource):
     def clear_snapshot_cache(self) -> None:
         """Clear the TTL snapshot cache to force a fresh fetch on next call."""
         with self._snapshot_lock:
-            self._snap_cache_bars = None
-            self._snap_cache_n = 0
-            self._snap_cache_ts = 0.0
+            self._snap_cache_by_key.clear()
 
-    def latest_snapshot(self, n: int) -> list[KlineBar]:
+    def latest_snapshot(
+        self,
+        n: int,
+        *,
+        exchange: str | None = None,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+    ) -> list[KlineBar]:
         """Return *n* bars newest-first; bars[0] is the forming (unclosed) bar.
+
+        **游标从「订阅绑定」变成「入参」**：多标签页各自看不同标的时，不能靠
+        ``subscribe()`` 改共享状态来切 —— 那会让 A tab 的请求读到 B tab 的数据。
+        省略入参时沿用当前订阅（向后兼容 GUI 与单标签页用法）。
+
+        缓存按 ``(exchange, symbol, timeframe, n)`` 分键：原实现是**单槽**的，
+        判 TTL 时不看品种，换品种后仍会命中上一个标的的缓存（切品种后 0~N 秒
+        返回旧 K 线，评审 H8）。多槽后不同标的互不干扰。
 
         Thread-safety: serialized via ``_snapshot_lock`` because
         ``TvDatafeed.get_hist()`` is NOT thread-safe — it writes to
         ``self.ws`` on each call, and concurrent access clobbers the
         WebSocket, causing C++ segfaults.
-
-        A TTL cache (``_snap_cache_*``) short-circuits repeated calls within
-        ``tv_cache_ttl_seconds(self._timeframe)`` so we don't open a fresh
-        WebSocket on every poll. Cache read AND write happen inside the lock
-        to prevent races with concurrent callers and with ``subscribe()``.
         """
+        ex = self._exchange if exchange is None else exchange
+        sym = self._symbol if symbol is None else symbol
+        tf = self._timeframe if timeframe is None else timeframe
+
         with self._snapshot_lock:
-            ttl = tv_cache_ttl_seconds(self._timeframe)
-            if (
-                self._snap_cache_bars is not None
-                and self._snap_cache_n == n
-                and (time.time() - self._snap_cache_ts) < ttl
-            ):
-                return list(self._snap_cache_bars)
-            bars = self._latest_snapshot_inner(n)
-            self._snap_cache_bars = list(bars)
-            self._snap_cache_n = n
-            self._snap_cache_ts = time.time()
+            key = (ex or "", sym or "", tf or "", n)
+            ttl = tv_cache_ttl_seconds(tf)
+            hit = self._snap_cache_by_key.get(key)
+            if hit is not None and (time.time() - hit[0]) < ttl:
+                return list(hit[1])
+            bars = self._latest_snapshot_inner(n, exchange=ex, symbol=sym, timeframe=tf)
+            self._snap_cache_by_key[key] = (time.time(), list(bars))
+            self._evict_snapshot_cache()
             return bars
 
-    def _latest_snapshot_inner(self, n: int) -> list[KlineBar]:
+    def _evict_snapshot_cache(self) -> None:
+        """清理过期条目并限制总容量。调用方须持有 ``_snapshot_lock``。
+
+        单槽实现不存在「越切越大」的问题，改多槽后必须自己设上限，否则
+        「切过多少个标的」会让缓存无限增长。
+        """
+        now = time.time()
+        for k, (ts, _bars) in list(self._snap_cache_by_key.items()):
+            if (now - ts) > _SNAP_CACHE_MAX_TTL_S:
+                self._snap_cache_by_key.pop(k, None)
+        while len(self._snap_cache_by_key) > _SNAP_CACHE_MAX_ENTRIES:
+            self._snap_cache_by_key.pop(next(iter(self._snap_cache_by_key)))
+
+    def _latest_snapshot_inner(
+        self,
+        n: int,
+        *,
+        exchange: str | None = None,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+    ) -> list[KlineBar]:
         """Actual snapshot logic — caller holds ``_snapshot_lock``."""
         if self._tv is None:
             raise DataSourceTransientError("TradingView 未连接，请先选择数据来源 TradingView")
-        if not self._symbol or not self._timeframe:
-            raise DataSourceTransientError("TradingView 未订阅品种/周期")
 
-        user_symbol = self._symbol
-        req_exchange = self._exchange
+        # 入参优先，未传才回落当前订阅 —— 多标签页各自传自己的游标。
+        # 顺序很重要：先算出 sym/tf 再做非空校验，否则会引用未赋值的局部变量
+        # （批量替换 self._timeframe→tf 时踩过一次，表现为 UnboundLocalError）。
+        user_symbol = (self._symbol if symbol is None else symbol) or ""
+        tf = (self._timeframe if timeframe is None else timeframe) or ""
+        req_exchange = self._exchange if exchange is None else exchange
+        if not user_symbol or not tf:
+            raise DataSourceTransientError("TradingView 未订阅品种/周期")
         exchange = req_exchange or ""
         fetch_symbol = user_symbol
         auto_probe = is_tv_exchange_auto(req_exchange)
         probe_plan = tv_auto_probe_plan(user_symbol) if auto_probe else []
         try:
             from tvDatafeed import Interval  # type: ignore[import]
-            interval = getattr(Interval, _TF_MAP[self._timeframe])
+            interval = getattr(Interval, _TF_MAP[tf])
             if auto_probe and probe_plan:
                 df, exchange = self._fetch_tv_auto_probe(
                     symbol=user_symbol,
@@ -935,7 +970,7 @@ class TradingViewSource(DataSource):
                 from pa_agent.data.bar_close_wait import seconds_until_bar_closes
 
                 secs_left = seconds_until_bar_closes(
-                    ts_ms, self._timeframe, now_ms=None
+                    ts_ms, tf, now_ms=None
                 )
                 still_forming = secs_left is not None and secs_left > 0
                 if still_forming:

@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import logging
 
-from pa_agent.storage.db import get_hub, now
+from pa_agent.storage.db import DEFAULT_USER_ID, get_hub, now
 
 logger = logging.getLogger("pa_agent.storage.users")
 
-#: 单机部署下的唯一用户。凭证、prompt、偏好都挂在这个 user_id 上。
-ADMIN_USER_ID = "admin"
+#: 单机部署下的唯一用户。**别名到 db.DEFAULT_USER_ID**，避免两处各定义一份
+#: 而产生「记录指向 users 表里不存在的用户」这种静默错配（评审 H5）。
+ADMIN_USER_ID = DEFAULT_USER_ID
 ADMIN_DISPLAY_NAME = "管理员"
 
 

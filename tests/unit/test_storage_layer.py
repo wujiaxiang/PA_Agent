@@ -430,3 +430,81 @@ def test_read_failure_is_distinguishable_from_empty(db_path_isolated: Path):
     hub._read_error = "no such table: nope"
     assert hub.query("SELECT * FROM nope") == []
     assert hub.read_failed is True, "读失败必须能被上层识别"
+
+
+# ── 多会话推理：快照游标入参化 + 多槽缓存 ──────────────────────────────────────
+# 回归背景：原先 latest_snapshot 只按 n 判 TTL（单槽），换品种后仍会命中上一个
+# 标的的缓存；且游标绑定在 data_source.subscribe() 上，多标签页互相串味。
+
+
+class _FakeBars(list):
+    pass
+
+
+def _mk_src(tmp_path):
+    from pa_agent.data.tradingview import TradingViewSource
+
+    s = TradingViewSource.__new__(TradingViewSource)
+    import threading
+
+    s._path_lock = threading.Lock()
+    s._snapshot_lock = threading.RLock()
+    s._snap_cache_by_key = {}
+    s._exchange = "GATEIO"
+    s._symbol = "BTCUSDT"
+    s._timeframe = "1h"
+    s._tv = object()
+    calls: list[tuple] = []
+
+    def inner(n, *, exchange=None, symbol=None, timeframe=None):
+        calls.append((exchange, symbol, timeframe))
+        return _FakeBars([{"close": float(len(calls))}])
+
+    s._latest_snapshot_inner = inner
+    return s, calls
+
+
+def test_snapshot_accepts_cursor_args(tmp_path):
+    """游标变成入参：入参优先于当前订阅（省略时才回落）。"""
+    s, calls = _mk_src(tmp_path)
+    s.latest_snapshot(10, symbol="NVDA", timeframe="1d", exchange="NASDAQ")
+    assert calls[-1] == ("NASDAQ", "NVDA", "1d")
+
+
+def test_snapshot_falls_back_to_subscription(tmp_path):
+    """不传参时沿用当前订阅 —— GUI 与单标签页用法保持不变。"""
+    s, calls = _mk_src(tmp_path)
+    s.latest_snapshot(10)
+    assert calls[-1] == ("GATEIO", "BTCUSDT", "1h")
+
+
+def test_snapshot_cache_is_keyed_by_instrument(tmp_path):
+    """核心回归：切品种后不得返回上一个标的的 K 线。"""
+    s, _ = _mk_src(tmp_path)
+    a = s.latest_snapshot(10, symbol="BTCUSDT")
+    b = s.latest_snapshot(10, symbol="NVDA")
+    assert a[0]["close"] != b[0]["close"], "两个标的命中了同一份缓存"
+
+
+def test_snapshot_cache_reused_for_same_instrument(tmp_path):
+    s, calls = _mk_src(tmp_path)
+    s.latest_snapshot(10, symbol="NVDA")
+    s.latest_snapshot(10, symbol="NVDA")
+    assert len(calls) == 1, "同标的同根数应命中缓存，不重复取数"
+
+
+def test_snapshot_cache_distinguishes_count(tmp_path):
+    s, calls = _mk_src(tmp_path)
+    s.latest_snapshot(10, symbol="NVDA")
+    s.latest_snapshot(50, symbol="NVDA")
+    assert len(calls) == 2, "根数不同不应共用缓存"
+
+
+def test_snapshot_cache_is_bounded(tmp_path):
+    """多槽后必须自限容量，否则「切过多少标的」会让缓存无限增长。"""
+    from pa_agent.data.tradingview import _SNAP_CACHE_MAX_ENTRIES
+
+    s, _ = _mk_src(tmp_path)
+    for i in range(_SNAP_CACHE_MAX_ENTRIES + 20):
+        s.latest_snapshot(10, symbol=f"SYM{i}")
+    assert len(s._snap_cache_by_key) <= _SNAP_CACHE_MAX_ENTRIES
