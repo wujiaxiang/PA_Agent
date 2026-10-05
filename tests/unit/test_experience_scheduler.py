@@ -292,3 +292,68 @@ def test_timer_loop_stays_idle_in_manual_mode(lib, monkeypatch):
 
     assert len(lib.list_pending()) == 1, "manual 模式下定时器结算了记录"
     assert rounds["n"] >= 4, "循环没真正跑起来（测试本身失效）"
+
+
+class _DedicatedSourceProbe:
+    """验证「验证」按钮走的专用数据源路径。
+
+    **回归守卫**：``_DedicatedSource.fetch`` 曾写成
+    ``subscribe(symbol=..., exchange=..., timeframe=...)``，而基类签名是
+    ``subscribe(self, symbol, timeframe)`` —— 对**所有**数据源都抛 TypeError。
+    这条路径从未被测到：单测用的是假源，而假源只走 ``_shared_fetch`` 的三轴
+    匹配分支，压根不碰专用源。真机上第一次点「验证」就暴露了。
+    """
+
+
+def test_dedicated_source_uses_the_real_subscribe_signature():
+    from web.api import experience_verifier as ev
+
+    calls: dict = {}
+
+    class _Src:
+        def connect(self):
+            calls["connect"] = True
+
+        def set_exchange(self, ex):
+            calls["exchange"] = ex
+
+        def subscribe(self, symbol, timeframe):      # 基类签名，没有 exchange
+            calls["subscribe"] = (symbol, timeframe)
+
+        def latest_snapshot(self, n):
+            calls["n"] = n
+            return [{"ts_open": 1, "high": 2, "low": 1, "close": 1.5}]
+
+        def disconnect(self):
+            calls["disconnect"] = True
+
+    src = ev._DedicatedSource(lambda: _Src(), "BTCUSDT", "1h", "GATEIO",
+                              __import__("logging").getLogger())
+    rows = src.fetch()
+
+    assert rows, "必须取到 K 线；取不到会让每条待验证记录永远停在 pending"
+    assert calls["subscribe"] == ("BTCUSDT", "1h"), "订阅必须是位置参数"
+    assert calls["exchange"] == "GATEIO", "交易所走 set_exchange，不是 subscribe 形参"
+    assert calls["disconnect"] is True, "用完即弃必须断连"
+
+
+def test_dedicated_source_tolerates_sources_without_set_exchange():
+    """部分数据源没有 set_exchange —— 不得因此整条路径挂掉。"""
+    from web.api import experience_verifier as ev
+
+    class _Src:
+        def connect(self):
+            pass
+
+        def subscribe(self, symbol, timeframe):
+            self.got = (symbol, timeframe)
+
+        def latest_snapshot(self, n):
+            return [{"ts_open": 1, "high": 2, "low": 1, "close": 1.5}]
+
+        def disconnect(self):
+            pass
+
+    src = ev._DedicatedSource(lambda: _Src(), "BTCUSDT", "1h", "GATEIO",
+                              __import__("logging").getLogger())
+    assert src.fetch(), "没有 set_exchange 也要能取数"

@@ -48,6 +48,31 @@
 
 ## 2026-10-05
 
+### 13. Docker 真机验证：查出结算链路两个从未工作的 bug
+
+第一次在**真实容器 + 真实行情**上跑整条链路，之前所有单测都绿着，却查��：
+
+- 🔴 **「验证」按钮的专用数据源路径对所有数据源都抛 TypeError**：
+  `_DedicatedSource` 写成 `subscribe(symbol=..., exchange=..., timeframe=...)`，
+  而基类签名是 `subscribe(self, symbol, timeframe)`。TypeError 被 except 吞掉 →
+  返回空列表 → `skipped_no_data` → 每条待验证记录**永远停在 pending**。
+  从没被发现是因为单测用的假源只走 `_shared_fetch` 的三轴匹配分支，
+  **压根不碰专用源** —— 测试覆盖的是没人走的那条路
+- 🟠 **后台结算的 scope 读的是冻结字段**：`experience_scheduler` 从
+  `settings.general.last_symbol/last_timeframe` 取范围，但那已是「每次请求从会话
+  游标派生、只回给前端」的只读字段，`/api/subscribe` 早就不更新它了。
+  实测切到 NVDA/5m 后点验证，`checked=0` —— 快照里还是上次订阅的 BTCUSDT
+- 🟡 **交易所/品种组合无效的记录会永久滞留** `pending`：真机上发现一条
+  `GATEIO/NVDA` 的真实待验证记录（美股挂在加密交易所下），TradingView 永远
+  无数据，既结算不了也没有清理机制。**未修** —— 需要在写入侧校验组合合法性
+- 🟡 **K 线快照是最新在前**：`_bars_after` 的锚点必须是**最老**那根，
+  取 `bars[0]` 等于锚在最新 bar 上，其后一根都没有
+
+**闭环验证结果（真实 BTCUSDT 1h 行情，201 根）**：pending → loss（200 根后触及
+止损）→ 程序化复盘自动生成（MFE 0.00% / MAE 1.27% / 第 1 根触及）→ 注入
+Stage 2 提示词（`<experience_review>` 块出现）→ 案例块 JSON 合法。
+验证数据已清理。
+
 ### 12. 第二次评审：换掉净化器方案（枚举取代自由文本）
 
 - **上一轮的两处不实声明**（复查员实测发现，已在此更正）：

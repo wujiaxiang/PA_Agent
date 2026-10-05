@@ -144,8 +144,16 @@ class _DedicatedSource:
         try:
             src = self._factory()
             src.connect()
-            src.subscribe(symbol=self._symbol, exchange=self._exchange or "",
-                          timeframe=self._timeframe)
+            # 交易所走 ``set_exchange``、订阅只收 (symbol, timeframe) ——
+            # 基类签名就是 ``subscribe(self, symbol, timeframe)``，没有 exchange
+            # 形参。此前这里写成 ``subscribe(symbol=..., exchange=..., timeframe=...)``，
+            # 对**所有**数据源都抛 TypeError，于是整条「验证」按钮路径（专用数据源）
+            # 永远取不到 K 线。之所以从没被发现：单测用的是假源，而假源只走
+            # ``_shared_fetch`` 的三轴匹配分支，压根不碰这段。
+            setter = getattr(src, "set_exchange", None)
+            if callable(setter):
+                setter(self._exchange or "")
+            src.subscribe(self._symbol, self._timeframe)
             return _bar_rows(src.latest_snapshot(_FETCH_BARS))
         except Exception as exc:  # noqa: BLE001
             self._log.warning(

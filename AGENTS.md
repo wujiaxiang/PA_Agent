@@ -359,6 +359,17 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
   两次调用给出不同答案 = 复盘挂到 admin 名下、carol 看不到自己的
 - **词表只有一份**（`review_program.VERDICTS`）。`review_spec` 的兜底值必须
   取自它 —— 兜底路径正是词表校验最薄的地方，曾硬编码出一个词表外的值
+- **`subscribe()` 只有 `(symbol, timeframe)` 两个位置参数**：交易所走
+  `set_exchange()`。`_DedicatedSource` 曾写成 `subscribe(symbol=..., exchange=...,
+  timeframe=...)` → 对**所有**数据源抛 TypeError → 「验证」按钮整条路径永远取不到
+  K 线 → 每条待验证记录静默停在 pending。之所以从没被发现：单测用的是假源，
+  而假源只走 `_shared_fetch` 的三轴匹配分支，**压根不碰专用源**。
+  **任何只测共享源路径的用例都验不到它**
+- **结算 scope 不能读 `settings.general.last_*`**：那已经是「每次请求从会话游标
+  派生、只回给前端」的只读字段（见 `routes_settings._CURSOR_FIELDS` 注释），
+  而 `/api/subscribe` 早已改写会话游标、不再更新它。调度器从 settings 快照读到的
+  是**冻结的旧值**，于是后台结算永远只匹配那一个品种。实测：我切到 NVDA/5m 后
+  点「验证」，`checked=0` —— 因为快照里的 `last_symbol` 还是先前那次订阅的 BTCUSDT
 - **重建表必须先 `PRAGMA foreign_keys=OFF`**：`connect()` 开着 FK，而重建要
   `DROP TABLE`，SQLite 视为删全部行 → `ON DELETE CASCADE` **静默清空子表**，
   `migrate()` 还返回 True（实测重建 `experience_entries` 会删光
