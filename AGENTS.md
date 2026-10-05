@@ -102,7 +102,7 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 ### 前端事件绑定
 
 - **`bindEvents()` 必须在所有 `await` 数据加载之前调用**：数据加载失败（如 `loadBars()` throw 异常）不应影响 UI 可交互性。违反此约束会导致所有按钮失去响应。
-- **SSE 流 `startSSEBarsStream` 必须在 `loadBars.then()` 中启动**
+- **`startSSEBarsStream` 必须在 `loadBars.then()` 中启动**（现已改为轮询流，函数名保留）
 
 ### 切换操作（交易所/品种/周期）
 
@@ -133,27 +133,41 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **从 Demo 返回实时必须无条件重载 K 线**：Demo 覆盖主图数据却不改订阅，品种/周期可能与演示内容对不上，只清叠加层不够
 - **「分析」按钮自动选路**：有可复用上下文走增量、否则走完整，按钮文案与 tooltip 必须说明它会走哪条路。「强制完整」开关供用户覆盖
 - **按钮按域分组**：工具栏=数据流开关（仅「实时」）；侧边栏=分析控制（分析/等待收盘/持续分析/增量）
-- **持续分析联动规则**：开启时强制勾选并禁用「实时」+「等待收盘」（依赖 SSE bar_close 事件）；关闭时恢复可编辑
-- **哨兵去重**：`keepAnalysisLastClosedTs` 变量，bar_close 事件仅在 `ts_open` 变化时触发分析
+- **持续分析联动规则**：开启时强制勾选并禁用「实时」+「等待收盘」（依赖 bar 收盘判定）；关闭时恢复可编辑
+- **哨兵去重**：`keepAnalysisLastClosedTs` 变量，仅在 `ts_open` 变化时触发分析（触发源已由 bar_close 事件改为本地定时器，见「K 线实时刷新」节）
 - **持续分析触发时禁止再次等待收盘**：`startAnalysis` / `startIncrementalAnalysis` 必须接受 `triggerSource`（`'user'` / `'continuous'`），由 `web/static/js/continuous_gate.js::shouldWaitForClose` 判定。`'continuous'` 表示本次调用本身就是被 `bar_close` 触发的，此时 bar 刚刚收盘，**再等一根必然出错**——与「持续分析强制勾选等待收盘」的联动规则叠加后会形成自等待，被下一次 `bar_close` 内的 `stopWaitCloseCountdown()` 取消成 `resolve(false)`，表现为持续分析整周期延迟或时灵时不灵。新增触发路径时必须透传 `'continuous'`
 - **`closedBarTs()` 必须按 `closed` 标志查找**：硬编码 offset=2 假定末位恒为 forming bar；休市模式下全部 bar 已收盘，此时「刚收盘」就是最后一根，offset 会返回两根之前的 ts → bar_close 哨兵错位（重新开盘后漏触发或重复触发持续分析）
 - **`lastBars` 是 newest-first**：`/api/bars` 返回 bars[0]=forming bar（数据快照契约）。按 ts_open 定位元素，**不要**用 `lastBars[length-1]` 当最新根 —— 那是**最老**的一根
 - **品种选择器：聚焦 = 浏览，输入 = 搜索**：聚焦时展示「常用 + 分类」清单；拿输入框里已有的当前品种去搜只返回寥寥几条，看起来像功能坏了
 - **纯逻辑抽到 `continuous_gate.js`**：「刚收盘 bar 的 ts_open」与「是否需要等待收盘」是无 DOM 依赖的纯逻辑，禁止再内联回 `app.js`。三处哨兵计算曾重复三份且必须永远一致，抽成唯一实现由 Node 单测 `continuous_gate.test.js` 守护
 - **取消「等待收盘」勾选必须调用 `stopWaitCloseCountdown()`**：只停显示定时器不够。`refreshAnalyzeButtonWaitingState()` 会把按钮置回 `idle`，而 `updateSSEStatusWithExpiry` 中 `if (btn.dataset.state !== 'waiting') return` 会提前返回，导致 pending resolver 无人 resolve，`startAnalysis` 永久 await
-- **图表暂停**：分析期间暂停 `bar_update` 的 K线渲染（仍更新 next_close_ts 和状态栏），完成后调用 `loadBars()` 刷新
+- **图表暂停**：分析期间暂停 K 线渲染（仍更新 `lastBars`、next_close_ts 和状态栏），完成后调用 `loadBars()` 刷新
 - **倒计时统一 HMS 格式**：所有倒计时使用 `formatCountdownHMS()` 函数显示 `HH:MM:SS`
-- **倒计时共享 tick**：SSE 活跃时「等待收盘」按钮必须复用 `sseStatusExpiryTimer`（由 `updateSSEStatusWithExpiry` 统一更新），不创建独立 setInterval。通过 `waitCloseCountdownResolver` 全局变量在 remaining <= 0 时触发分析。禁止维护两个独立定时器——会导致两个 UI 不同步、算法不一致、sanity check 逻辑分叉
+- **倒计时共享 tick**：「等待收盘」按钮必须复用 `sseStatusExpiryTimer`（由 `updateSSEStatusWithExpiry` 统一更新），不创建独立 setInterval。通过 `waitCloseCountdownResolver` 全局变量在 remaining <= 0 时触发分析。禁止维护两个独立定时器——会导致两个 UI 不同步、算法不一致、sanity check 逻辑分叉
 
-### SSE / 实时刷新
+### K 线实时刷新（2026-10-05 起为前端轮询，非 SSE）
 
-- **SSE 连接 `onopen` 事件中不设置 `sseLastBarUpdateTs`**，仅启动定时器
-- **时间剩余计算需通过 `timeframeToSeconds()` 函数与后端对齐**，并进行上限检查（`remaining > tfSecs` 则丢弃值）
-- **`updateSSEStatusWithExpiry` 的 `tfSecs` 需优先从 `#ds-timeframe` 读取用户选择值**，fallback 到 `currentSettings`
-- **后端 `done` 事件推送前必须检查 `exception` 字段**，有异常时不推进到完成状态
-- **休市时（`forming_bar.closed == True`）后端仅推 ping 不推 bar_close 事件**
-- **`_compute_next_close_ts()` 必须使用 `elapsed % duration` 取模算法**，不可用简单的 `ts_open + duration`（会产生时区偏移）
-- **`seconds_until_bar_closes` 需加入绝对时间判断**：`now_ms >= ts_open_ms + duration_ms` 时返回 0
+- **服务端 SSE 已下线**：`GET /api/bars/stream` 及后台广播循环全部移除，
+  `routes_bars_stream.py` 只剩 `_compute_next_close_ts`（`routes_data.py` 的
+  跨模块硬契约，**不得删**）。前端改调 `startLiveRefresh(5000)` 轮询
+  `/api/bars`，**按各自会话游标**取数
+- **为什么不用服务端 SSE 分组**：浏览器原生 `EventSource` **无法设置请求头**，
+  服务端拿不到会话身份，任何按会话分组的方案都无法实施；且坏品种的 auto-probe
+  会持 `_snapshot_lock` 数十秒，全站 `/api/bars` 排队。轮询路径本就存在，且
+  隐藏标签页自动停，一个坏 tab 不会传染别人
+- **轮询化后必须成立的约束**（缺一个就静默坏掉）：
+  - 游标 DOM（`#ds-symbol`/`#ds-exchange`/`#ds-timeframe`）必须在**启动轮询之前**
+    写好 —— 轮询会同步发请求，顺序反了会按旧游标取数
+  - `fetchAndUpdateNextCloseTs` 不得有「SSE 活跃就不拉」的短路，否则
+    `next_close_ts` 永远拿不到，倒计时与「等待收盘」全废
+  - `refreshBarsOnly` 必须尊重 `chartUpdatePaused`：仍更新 `lastBars`，
+    只跳过 `applyBarsToChart`，否则分析期间图表每 5s 跳一次
+  - 休市判定不能靠「一个周期无 bar_update」（SSE 断流判据）——轮询下
+    `liveRefreshLastTs` 每 5s 都更新，该判据恒不成立，须用 `market_closed` 标志
+- **持续分析触发**：由本地 3000ms 定时器调 `PAContinuousGate.closedBarTs()`
+  判定，**不再依赖 bar_close 事件**；`triggerSource` 仍必须透传 `'continuous'`
+- **`_compute_next_close_ts()` 必须使用 `elapsed % duration` 取模算法**，
+  不可用简单的 `ts_open + duration`（会产生时区偏移）
 
 ### 数据快照契约
 
@@ -282,10 +296,12 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 
 ## 核心技术概念
 
-### SSE (Server-Sent Events)
-- **端点**：`/api/bars/stream`
-- **事件**：`bar_update`、`bar_close`、`ping`
-- **关键字段**：`next_close_ts`（下一 bar 收盘时间戳）
+### K 线实时刷新
+- **形态**：前端按会话游标轮询 `GET /api/bars`（间隔 5000ms）+ 拉 `next-close`
+- **已下线**：SSE 端点 `/api/bars/stream` 与后台广播循环（2026-10-05，
+  原因见硬约束节）。`bar_update` / `bar_close` / `ping` 三个事件不再存在
+- **会话隔离**：取数入参化（`latest_snapshot(n, exchange=, symbol=, timeframe=)`），
+  缓存按 `(exchange,symbol,timeframe,n)` 分键
 
 ### FlowBar 进度条（6-step）
 - **步骤**：1=等待数据 → 2=阶段一推理 → 3=阶段一验证 → 4=阶段二推理 → 5=阶段二验证 → 6=完成
@@ -293,7 +309,7 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 
 ### 增量分析
 - **目的**：减少 token 消耗（约 14.5K tokens），保持 AI 上下文连贯性
-- **触发**：手动点击「增量」按钮或「持续分析」在 bar_close 事件触发
+- **触发**：手动点击「增量」按钮，或持续分析定时器判定新收盘后触发
 - **机制**：重用之前的 Stage1 上下文（system+user+assistant），仅发送新的 bars
 
 ### 配置真源在 DB（2026-10-05 重大改造）
@@ -319,13 +335,6 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **优先级**：shell 环境变量 > .env > settings.json
 - **说明**：`.env` 为可选，文件不存在时 `env_loader` 不执行操作
 
-### 降级轮询模式
-- **触发**：SSE 连接失败时自动切换
-- **间隔**：3 秒轮询 + 5 秒拉取 `next-close`
-- **功能**：保证基本的实时数据更新和倒计时显示
-
----
-
 ## 已知问题
 
 - **模型 API 连接失败**：本地模型 API 服务器 `192.168.2.177:8082` 未运行，导致分析失败（已通过 `.env` 配置切换到可用 endpoint 解决，但配置项仍可能被误填回内网地址）。注意 2026-10 实测还存在「模型免费期结束」类 404（`base_url` 可达但模型不可用），`/api/health` 会显示 `degraded`/`model_api: error`
@@ -336,7 +345,7 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
   + `GET /api/experience` + 侧边栏「经验库」tab + `experience_max_entries` 默认 3
 - **移动端未适配**：当前 UI 为桌面端设计，移动端显示效果差
 - **国际化缺失**：所有文案硬编码中文，无多语言支持
-- **`/api/bars` 忽略查询参数**：该端点只接受 `count`，实际数据取自当前订阅状态（`settings.general.last_symbol/last_timeframe`）；而 `/api/bars/next-close` 却接受并回显 `symbol/timeframe/exchange`。两个端点对同一请求会返回不同品种，属于**已知接口不一致**，前端必须先 `POST /api/subscribe` 再 `GET /api/bars`。待统一
+- **`/api/bars` 不接受品种参数**：该端点只接受 `count`，数据取自**本会话游标**（2026-10-05 起，不再读全局 `settings.general.last_*`）；而 `/api/bars/next-close` 仍接受并回显 `symbol/timeframe/exchange`。两个端点对同一请求可能返回不同品种，属于**已知接口不一致**，前端必须先 `POST /api/subscribe` 再 `GET /api/bars`。待统一
 - **`_build_incremental_stage1_user_prompt` 为死代码**：`pa_agent/ai/prompt_assembler.py` 中该方法全仓无调用者（增量路径走 `build_incremental_stage1` 的续写变体）
 - **429 耗尽后被归类为网络错误**：`two_stage._stream_chat_resilient` 中 `_is_network_error` 匹配 `openai.APIStatusError`（`RateLimitError` 的父类），持续限流时会静默轮换 provider fallback 而不是直接报错
 
@@ -346,7 +355,7 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 
 1. **经验库系统完善** ⭐ 高优：添加经验数据文件，实现经验库检索和应用功能
 2. **移动端适配**：响应式布局，关键操作在移动端可用
-3. **性能优化**：页面加载速度、渲染性能、SSE 长连接内存泄漏排查
+3. **性能优化**：页面加载速度、渲染性能、会话注册表内存占用排查
 4. **国际化支持**：添加多语言支持（中/英）
 5. **统一 `/api/bars` 与 `/api/bars/next-close` 的参数契约**：要么都接受 `symbol/timeframe/exchange`，要么都只读订阅状态，避免前端拿错品种
 6. **AI provider 预设与字段校验**：桌面 GUI 有 cursor/qclaw/workbuddy/trae_cn 等预设和「model / BaseURL 填反了」的守卫（`gui/settings_dialog.py:335-446`），Web 端目前是裸文本框，Docker 用户需手填

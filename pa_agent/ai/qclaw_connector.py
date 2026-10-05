@@ -277,6 +277,18 @@ def apply_qclaw_provider_to_settings(
     ok, health_msg = qclaw_health_check_base(provider.base_url, provider.api_key)
     if not ok:
         return f"QClaw 连通性检查失败：\n\n{health_msg}"
+
+    # 全部校验通过后才落库。凭证属 L1 单机账号，写**用户层**而非系统兜底层
+    # （见 docs/SESSION_STORAGE_DESIGN.md §5.2）。原先这里只改内存：写文件的
+    # 死路径被删掉后没补 DB 写入，于是启动同步路径的设置重启即丢，而 two_stage
+    # 的 fallback 路径因另有一处显式调用而正常 —— 两条路径行为不一致。
+    try:
+        from pa_agent.config.settings import persist_provider
+
+        if not persist_provider(provider):
+            logger.warning("QClaw provider applied but user-layer persist failed")
+    except Exception as exc:  # noqa: BLE001 — 落库失败不该阻断启动
+        logger.warning("QClaw provider persist failed: %s", exc)
     return None
 
 

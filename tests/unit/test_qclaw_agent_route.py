@@ -172,8 +172,6 @@ def test_apply_qclaw_provider_on_load_keeps_sub_agent_alias() -> None:
 
 def test_sync_workbuddy_on_load_keeps_submodel() -> None:
     """sync_workbuddy_provider_on_load must not strip openclaw_wb/<api-model>."""
-    from pathlib import Path
-
     from pa_agent.ai.workbuddy_connector import sync_workbuddy_provider_on_load
     from pa_agent.config.settings import Settings
 
@@ -186,7 +184,9 @@ def test_sync_workbuddy_on_load_keeps_submodel() -> None:
         "pa_agent.ai.workbuddy_connector.apply_workbuddy_provider_to_settings"
     ) as apply, patch("pa_agent.config.settings.save_settings") as save:
         apply.return_value = None
-        sync_workbuddy_provider_on_load(settings, save_path=Path("settings.json"))
+        # save_path 已删除：同步后的落库由 apply_* 内的 persist_provider 负责，
+        # 启动时不再整份写 settings.json（系统兜底存在时那份文件没人读）。
+        sync_workbuddy_provider_on_load(settings)
         apply.assert_called_once_with(settings)
         save.assert_not_called()
 
