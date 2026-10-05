@@ -34,4 +34,22 @@ if git diff --cached -U0 | grep '^+' | grep -v '^+++' | grep -E \
 	exit 1
 fi
 
+# ── 多会话写入范围检查（见 SESSION_CHANGES.md / AGENTS.md「多会话协作规范」）──
+# 暂存文件落在他人声明的「进行中」范围内 → 阻断。
+# 确认无冲突要绕过：SKIP_WRITE_SCOPE_CHECK=1 git commit ...
+if [ "${SKIP_WRITE_SCOPE_CHECK:-}" = "1" ]; then
+	echo "pre-commit: skipped write-scope check (SKIP_WRITE_SCOPE_CHECK=1)"
+else
+	repo_root=$(git rev-parse --show-toplevel)
+	py=""
+	for cand in python3 python; do
+		if command -v "$cand" >/dev/null 2>&1; then py="$cand"; break; fi
+	done
+	if [ -n "$py" ]; then
+		"$py" "$repo_root/tools/check_write_scope.py" --hook || exit 1
+	else
+		echo "pre-commit: warn — python not found, skipped write-scope check"
+	fi
+fi
+
 exit 0

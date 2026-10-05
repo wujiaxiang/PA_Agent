@@ -22,3 +22,40 @@ jobs:
 
       - name: Verify install
         run: python -c "import pa_agent; print('OK')"
+
+  write-scope:
+    name: 多会话写入范围检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 1) 改了代码却没更新 SESSION_CHANGES.md → 失败（强制登记纪律）
+      # 2) 改动命中他人「进行中」范围 → 仅告警：正在干活的那个会话自己
+      #    落地成果时必然命中自己的范围，硬阻断只会逼人绕过检查
+      - name: Resolve base ref
+        id: base
+        run: |
+          # push 事件里 github.event.before 可能是全零 SHA（首次推送/force push），
+          # 直接拿去 git diff 会报错。用 fetch-depth:0 拿到的浅层历史兜底：
+          # 取 HEAD~1，取不到就跳过检查（不能因为拿不到基线就让 CI 变红）。
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE="$(git rev-parse HEAD~1 2>/dev/null || echo '')"
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      - name: Check write scopes
+        run: |
+          if [ -z "${{ steps.base.outputs.base }}" ]; then
+            echo "::notice::无法确定基线 ref，跳过写入范围检查"
+            exit 0
+          fi
+          python tools/check_write_scope.py --ci \
+            --base "${{ steps.base.outputs.base }}" \
+            --head "${{ github.sha }}"

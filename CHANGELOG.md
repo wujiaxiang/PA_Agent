@@ -4,6 +4,33 @@
 
 ---
 
+## 2026-10-05
+
+### 5. 多会话隔离 + SQLite 存储层 + 跨品种历史浏览
+
+- **问题**：
+  1. 服务端是全局单例（`app.state.ctx` 一次 bootstrap），`POST /api/subscribe` 直接改写全局 `data_source` 与 `settings.json` —— **A 标签页切品种会直接把 B 标签页的图切走**
+  2. SSE 是模块级 `_subscribers` 广播给所有连接，**所有标签页只能看到同一条数据流**，无法隔离
+  3. `routes_analyze` 的增量锚点读 `ctx.settings.general.last_symbol`（全局），**A 看 NVDA 而全局为 BTCUSDT 时，增量分析会捞到 BTCUSDT 的上一轮上下文**喂给模型（跨标的串味）
+  4. `GET /api/records` 的三个过滤参数必填且前端硬编码传当前 tab 的游标 —— **历史面板只能看到当前订阅品种**，多标签页互相看不到对方分析出的结果
+  5. `ctx._last_record` 是全局单值，A 的分析结果会成为 B 的追问锚点
+  6. 无持久化索引层：增量分析靠 `rglob` + 全量 JSON parse + 目录 mtime 启发式缓存
+- **根因**：`data_source` 同时扮演**连接**（TradingView WebSocket，应全局共享）与**游标**（`self._symbol/_timeframe`，应按会话隔离）两个角色；游标寄生在连接上，使「多标签页各自服务自己的 K 线图」不可能实现
+- **改动**：
+  - 新增 `pa_agent/storage/` 包：`db.py`（WAL + `threading.local` 连接 + 故障降级）、`schema.py`（7 张表 DDL）、`ephemeral.py`（会话注册表：TTL + LRU + `EphemeralBackend` 可替换协议）、`repositories.py`、`sessions.py`、`importer.py`
+  - 数据分三级：**L1 全局**（凭证/全局开关，无 user_id）、**L2 用户**（记录/经验/交易/偏好/追问，带 user_id，多会话共享）、**L3 会话**（游标/视图模式/运行时开关，缓存级快照 + TTL）
+  - 会话身份走 **`X-Session-Id` 请求头 + 前端 `sessionStorage` UUID**：Cookie 同源共享会让所有标签页拿到同一 id，「一 tab 一会话」直接失效
+  - `routes_analyze` 增量锚点改用会话游标；`routes_data.subscribe` 同步写本 tab 游标
+  - `GET /api/records` 过滤条件改为可选（留空=跨全部品种，走 SQLite 索引），摘要新增 `symbol`/`timeframe`/`exchange`
+  - 前端历史面板新增「全部品种」开关；`api.js` 统一注入会话头
+  - lifespan 启动时幂等导入既有记录；`/api/health` 新增 `storage` 字段
+  - 选型说明：**PG→SQLite**（LXC 宿主 + AppArmor 构建受限 + 内存/Swap 已紧张）、**Redis 不引入**（用内存注册表 + SQLite 快照自实现等效语义）
+- **文件**：`pa_agent/storage/*`、`web/api/{session_ctx,routes_analyze,routes_data,routes_records}.py`、`web/server.py`、`web/static/{js/api.js,js/app.js,index.html,css/style.css}`、`docs/SESSION_STORAGE_DESIGN.md`
+- **验证**：新增 `tests/unit/test_storage_layer.py`(41) + `test_session_ctx.py`(19)。既有 27 条记录全量导入（22 ok / 5 partial），重复导入幂等，8 组 `(exchange,symbol,timeframe)` 组合与文件路径**逐例等价、0 处不一致**。全量 `tests/unit`+`tests/property` 对基线：1145→1187 tests，failures 38→38、errors 30→30，**新增失败 0**。实机起服验证 `/api/health` 暴露存储状态、跨品种浏览同时返回 BTCUSDT 与 NVDA
+- **接口变更**：新增请求头 `X-Session-Id`（可选，缺失时回落旧行为）；`GET /api/records` 三个参数由必填改可选 + 响应新增 `symbol`/`timeframe`/`exchange`；`GET /api/health` 新增 `storage`
+
+---
+
 ## 2026-10-03
 
 ### 4. 事件循环阻塞下线 + 记录/交易落盘原子化
