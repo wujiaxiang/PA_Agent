@@ -14,7 +14,7 @@ reasoning/content into the same bubble component the 追问 tab already uses.
 """
 from __future__ import annotations
 
-from pa_agent.records.review_insights import INSIGHT_CODES as _INSIGHT_CODES, render_insights
+from pa_agent.records.review_insights import INSIGHT_CODES as _INSIGHT_CODES, is_degenerate, render_insights
 from pa_agent.records.review_spec import parse_review, spec_hint
 
 import asyncio
@@ -197,6 +197,38 @@ def _extract_codes(raw: str) -> list[str]:
     return found
 
 
+def _code_counts() -> dict[str, int]:
+    """历史上各枚举码被选中的次数（跨用户聚合）。
+
+    聚合而非按用户分开：偏袒是**模型行为**的特征，与哪个用户在看无关；
+    按用户拆开会让样本量永远达不到退化判据的门槛。
+    """
+    import json
+
+    from pa_agent.storage.db import get_hub
+
+    counts: dict[str, int] = {}
+    try:
+        # 统计的是 **payload 里的原始选码**，不是 ``reusable_criteria`` ——
+        # 后者存的是渲染后的中文句子，枚举码已被替换掉，从那里统计恒为 0。
+        rows = get_hub().query(
+            "SELECT payload_json FROM experience_reviews WHERE source = 'llm'")
+    except Exception:  # noqa: BLE001
+        logger.warning("cannot read insight history", exc_info=True)
+        return counts
+    for r in rows or ():
+        try:
+            # sqlite3.Row 按**列名**取；r[0] 取的是第一列的值（JSON 字符串），
+            # 再对它取下标会抛 TypeError 并被 except 吞掉 —— 统计恒为 0
+            payload = json.loads(r["payload_json"])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+        for code in (payload.get("codes") or []) if isinstance(payload, dict) else ():
+            key = str(code)
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def _facts_for(entry: dict[str, Any]) -> dict[str, Any]:
     """本笔交易的确定性数值（供枚举模板填槽）。取不到就用程序层那份。"""
     from pa_agent.storage.experience_repo import program_review
@@ -232,6 +264,13 @@ def _persist_review(
     raw = str(getattr(reply, "content", None) or "")
     codes = _extract_codes(raw)
     entry = entry or {}
+    if codes:
+        bad, why = is_degenerate(_code_counts())
+        if bad:
+            # 模型永远选同一个码 → 判据块看似有内容，实则每条一样，
+            # 对决策零增量，却仍占提示词预算并暗示「这是重要经验」。静音它。
+            logger.warning("LLM insight selection is degenerate; dropping codes (%s)", why)
+            codes = []
     facts = _facts_for(entry)
     criteria = render_insights(codes, entry, facts)
     content = raw
@@ -255,7 +294,9 @@ def _persist_review(
 
         ok = ExperienceWriter(logger=logger).attach_review(
             record_id,
-            {"content": content, "spec": spec,
+            # ``codes`` 存**原始选码**：渲染后的 reusable_criteria 里枚举码已被
+            # 换成中文句子，偏袒检测只能从这里统计（存别处就会恒为 0）
+            {"content": content, "spec": spec, "codes": codes,
              "reasoning": str(getattr(reply, "reasoning_content", "") or "")},
             model=str(getattr(ctx.settings.provider, "model", "") or ""),
             verdict=spec["verdict"],

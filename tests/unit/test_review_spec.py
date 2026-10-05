@@ -293,3 +293,104 @@ def test_packing_drops_whole_fields_not_characters():
     parsed = json.loads(blob)
     assert "symbol" in parsed, "靠前的短字段应当保留"
     assert "summary" not in parsed, "放不下的长字段应被整字段丢弃"
+
+
+# ── 偏袒检测：模型永远选同一个码 ────────────────────────────────────────────
+
+def test_degenerate_needs_minimum_sample():
+    """样本不足一律不判退化 —— 否则前几笔会因「碰巧重复」被静音，
+    之后再也攒不出样本，判据功能永久关闭。"""
+    from pa_agent.records.review_insights import MIN_SAMPLE, is_degenerate
+
+    assert not is_degenerate({"STOP_TOO_TIGHT": MIN_SAMPLE - 1})[0]
+
+
+def test_degenerate_detects_single_code_domination():
+    from pa_agent.records.review_insights import is_degenerate
+
+    bad, why = is_degenerate({"STOP_TOO_TIGHT": 9, "TP_TOO_WIDE": 1})
+    assert bad and "STOP_TOO_TIGHT" in why
+    assert not is_degenerate({"A": 3, "B": 2, "C": 1})[0]
+
+
+@pytest.fixture()
+def _iso_db(tmp_path):
+    from pa_agent.storage.db import reset_hub_for_tests
+
+    hub = reset_hub_for_tests(tmp_path / "counts.db")
+    yield hub
+    hub.close_all()
+
+
+def test_code_counts_reads_raw_codes_not_rendered_text(_iso_db):
+    """**回归守卫**：统计必须读 payload 里的**原始选码**。
+
+    ``reusable_criteria`` 存的是渲染后的中文句子，枚举码已被替换掉 —— 从那里
+    统计恒为 0，退化检测会永远不触发，于是这道兜底形同虚设。
+    """
+    import json
+
+    from pa_agent.storage.experience_repo import attach_review, upsert_entry
+    from web.api.routes_experience_review import _code_counts
+
+    for i in range(3):
+        upsert_entry({"i": i}, entry_id=f"e{i}", cycle_position="trending_tr",
+                     status="win", symbol="X", timeframe="1h")
+        attach_review(
+            {"content": "正文", "codes": ["STOP_TOO_TIGHT"]},
+            entry_id=f"e{i}",
+            # 渲染后的句子：里面**没有**枚举码
+            reusable_criteria="- 止损设在 90（-10%），位于结构位内侧",
+            user_id="admin", source="llm",
+        )
+    assert _code_counts() == {"STOP_TOO_TIGHT": 3}
+
+
+def test_degenerate_codes_are_dropped_end_to_end(tmp_path):
+    """模型对每笔都挑同一个码 → 判据被静音，只剩程序层事实。"""
+    import os
+
+    from pa_agent.records.experience_writer import ExperienceWriter
+    from pa_agent.storage.db import reset_hub_for_tests
+    from web.api import routes_experience_review as rv
+    from web.api.experience_verifier import settle_record
+
+    hub = reset_hub_for_tests(tmp_path / "iso.db")
+    try:
+        w = ExperienceWriter()
+        from pa_agent.storage.experience_repo import get_entry, latest_llm_review
+
+        def one(sym):
+            plan = dict(cycle_position="trending_tr", direction="做多",
+                        detected_patterns=["x"], confidence=70, summary=sym,
+                        symbol=sym, timeframe="1h", exchange="GATEIO",
+                        entry_price=100.0, take_profit_price=120.0,
+                        stop_loss_price=90.0, is_long=True, entry_ts_open_ms=0)
+            eid = w.save_pending(**plan)
+            settle_record(w, eid, dict(plan),
+                          [{"ts_open": 1, "high": 112, "low": 101},
+                           {"ts_open": 2, "high": 89, "low": 89}],
+                          verify_bars=5)
+            entry = get_entry(eid) or {}
+
+            class C:
+                class P:
+                    model = "m"
+                settings = type("S", (), {"provider": P()})()
+
+            class R:
+                content = ("## 结论\n判断成立但运气不佳\n\n## 归因\n- 对的部分: a\n"
+                           "- 错的部分: b\n\n## 当时能否预见\n- c\n\n"
+                           "## 改进建议\n- d\n\n"
+                           "## 下次同类 setup 的判据\nSTOP_TOO_TIGHT")
+                reasoning_content = "r"
+
+            rv._persist_review(eid, "admin", R(), C(), entry)
+            return latest_llm_review(eid, user_id="admin")
+
+        assert one("S1")["reusable_criteria"], "样本不足时不应静音"
+        for i in range(2, 7):
+            one(f"S{i}")
+        assert one("S7")["reusable_criteria"] == "", "退化后必须静音判据"
+    finally:
+        hub.close_all()

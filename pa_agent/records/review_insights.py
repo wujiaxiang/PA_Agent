@@ -115,3 +115,33 @@ def render_insights(codes: Any, content: dict[str, Any], facts: dict[str, Any]) 
             line = line[: MAX_SENTENCE_CHARS - 1] + "…"
         lines.append(f"- {line}")
     return "\n".join(lines)
+
+# ── 偏袒检测：防止模型永远选同一个码 ──────────────────────────────────────────
+
+#: 判定「退化了」所需的最小样本数。太小的样本不具统计意义。
+MIN_SAMPLE = 5
+#: 单一码的占比超过这个值即视为退化 —— 模型若对每笔交易都挑同一条，
+#: 它提供的信息量等于零，却仍在占据提示词预算并暗示「这是重要经验」。
+DEGENERATE_SHARE = 0.8
+
+
+def is_degenerate(counts: dict[str, int]) -> tuple[bool, str]:
+    """LLM 的选码分布是否已经退化成「永远选同一个」。
+
+    这是枚举方案**剩下的那点残余风险**的兜底：模型无法注入任意文本，但仍能
+    通过「每次都选 STOP_TOO_TIGHT」施加方向性偏置 —— 那种情况下判据块看似
+    有内容，实则每条都一样，对决策没有增量信息。
+
+    判据刻意保守：样本不足（< :data:`MIN_SAMPLE`）一律不判退化 —— 否则前几笔
+    复盘就会因为「碰巧重复」被静音，之后再也攒不出样本。
+
+    返回 ``(是否退化, 说明)``，说明用于日志，便于排查时知道是哪个码在刷。
+    """
+    total = sum(int(n) for n in counts.values())
+    if total < MIN_SAMPLE:
+        return False, f"样本不足（{total} < {MIN_SAMPLE}）"
+    top_code, top_n = max(counts.items(), key=lambda kv: kv[1])
+    share = top_n / total
+    if share >= DEGENERATE_SHARE:
+        return True, f"{top_code} 占全部选码的 {share:.0%}（{top_n}/{total}）"
+    return False, f"分布正常，最高占比 {share:.0%}"
