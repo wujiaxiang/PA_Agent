@@ -158,6 +158,10 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **渲染函数必须能接受空记录**：`renderDecision` / `renderFuturePanel` / `renderDecisionTree` 直接访问 `record.stage2_decision`，传 null 会抛 TypeError；`renderStreamFromRecord(null)` / `renderTokenUsage(null)` 静默 return，同样不清内容。新增/修改任何「渲染某条记录」的函数都要显式处理 `!record`
 - **可选链只对「已声明为 undefined」生效**：写成 `updateFlowBarIdle?.()` 而该函数根本不存在时，仍会抛 ReferenceError。函数是否存在要用 `typeof x === 'function'` 判断，不要靠加 `?.` 蒙混
 - **端到端测试必须断言「内容」而非「状态位」**：面板可见 / dataset 值 / classList / 消息条数只能证明**机制触发**，不能证明**结果正确**。断言要看面板当前显示的内容是否属于当前模式，并把多个操作串成一条**状态迁移链**逐段验证（`replay → 返回实时` 必须是一次连续走查，不能拆成两个独立步骤）
+- **测试必须接进 CI 才算数**：只写在仓库里、本地手动跑一遍，等于没写 —— 下次改动照样没人被拦。`tests/e2e` 由独立的 `e2e` job 承载（起真实服务 + Playwright）
+- **E2E 播种必须由服务端做**：CI 是空库，核心用例会静默 `skip`（全绿但什么都没测）。但**绝不能让测试进程自己写文件/写库** —— 宿主机与容器是两套文件系统视图（`/root/.../records/pending` vs `/app/records/pending`，同一 inode、不同挂载点），`_db_candidates` 的 `f.resolve().relative_to(RECORDS_DIR)` 必然失败，表现为「文件在、库里有、API 就是查不到」。正确做法是请求仅在 `PA_AGENT_E2E=1` 时注册的服务端播种端点，由它用自己的 `RECORDS_DIR` 与 `upsert_record`
+- **播种后要用服务端同一套 schema 自检**：不通过就 500。列表接口会**静默过滤**校验不过的记录，CI 上表现为「播种成功但测试没测到」，极难定位
+- **部署前必须全量语法自检**：`web/` 与 `pa_agent/` 两个目录要么都覆盖、要么都不覆盖。本轮两次把另一会话的半成品代码打进镜像（`IndentationError` 的编辑中间态、容器缺 `chat_repo`）
 - **新写的测试要做「能否抓到 bug」的反向验证**：把修复回退，确认测试变红。没做过这一步的测试，无法区分「真的没问题」与「根本没测到」
 - **「分析」按钮自动选路**：有可复用上下文走增量、否则走完整，按钮文案与 tooltip 必须说明它会走哪条路。「强制完整」开关供用户覆盖
 - **按钮按域分组**：工具栏=数据流开关（仅「实时」）；侧边栏=分析控制（分析/等待收盘/持续分析/增量）
@@ -248,6 +252,45 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **经验库范围恒等于当前 K 线**：`GET /api/experience` 的 `symbol` / `timeframe` **始终**取自 `#ds-symbol` / `#ds-timeframe`，前端不提供手动选择控件（只有「市场周期」可筛）。经验库的意义是「我正在看的这个标的、这个周期上历史上怎么走」，让用户另选等于把它变成另一个功能。`applySubscribe()` 末尾必须调 `loadExperienceLibrary()`，否则切品种后面板停在旧结果上
 - **经验库浏览必须先过滤**：`GET /api/experience` 支持 `symbol` / `timeframe`，按**条目内容**过滤而非文件名（同一代码会出现在不同市场周期下）。前端默认勾选「跟随当前订阅」；用户手动选下拉会自动取消跟随，避免两控件互相覆盖。`cycles` 汇总计数必须跟着过滤，否则前端显示的数字对不上
 - **读取端默认必须 > 0**：`experience_max_entries` 默认 0 会让整条检索链路空跑；新增/修改 PromptSettings 时注意该默认值
+
+### 经验库读端（2026-10-05 起切库，`SESSION_STORAGE_DESIGN` §7 C 阶段）
+
+- **切读形态**：三条读路径（提示词注入 / `GET /api/experience` / 复盘取档）一律
+  **先查 SQLite，查不到或读不出来再扫文件**。读端**仍然严格只读**，绝不「顺手补写」：
+  那会把读变成写、顶住 `routes_analyze` 的 `max_workers=2` 分析池
+  （`db._BUSY_TIMEOUT_MS = 5000`，一次撞锁可占住一个分析槽 5 秒），且破坏
+  「写入方唯一入口」。回填交给 `importer`（幂等，本就存在）
+- **`hub.query()` 返回 `[]` 有两种含义**：「表里确实没有」与「读不出来」同形。
+  调用方**不得**用「查完再去读 hub 标志位」的方式判断 —— 那是读后时序，同线程内
+  后一次成功读会把前一次的失败标记清掉。`experience_repo` 的查询函数返回
+  `QueryResult(list)`，`.failed` / `.error` **随结果一起**交出，照它判断
+- **`hub.read_failed` 是线程局部的**（`_read_error` 存在 `threading.local` 里）。
+  它曾是普通实例属性且被 `query()` 成功时清空，于是 A 线程的失败标记会被 B 线程
+  任意一次成功读抹掉 —— 而本系统恰恰是高并发读（分析线程池 + 结算调度器 +
+  每次分析新建的 followup 线程），那放行的正是最需要降级的那一刻。
+  **不要把它当进程级共享标志用**
+- **DB 逻辑必须放进 `ExperienceReader.read_top5()` 内部**，不要改
+  `read_for_stage2`：`read_top5` 是唯一漏斗，在它里面改能一次覆盖所有调用方，
+  且 14 处 `mock.read_top5` 测试点继续有效。绕过它会让那些测试**静默失效**
+  —— 它们仍会绿，因为 Mock 不设返回值时返回的是 MagicMock
+- **`user_id` 必须一路落到记录 JSON**：`save_pending()` 把它写进 content，
+  `finalize()` 默认沿用记录自带的值。阶段二结算跑在后台调度器线程上、结算的是
+  几小时前的 pending，那时没有请求上下文 —— **记录本身是唯一的归属依据**。
+  缺了它，多用户下后台只能回落默认用户，等于把 A 的单结算进 B 的账
+- **`entry_id` 是 `<user_id>_<文件名 stem>`**：主键全局唯一，而
+  `ON CONFLICT DO UPDATE SET` 的列清单里**没有** `user_id`。曾用裸 stem 导致两个
+  用户写出同 stem 文件时后者静默覆盖前者。新增写入路径必须带上 user_id
+- **`direction` 比较前必须归一**：三个来源各说各话 —— 阶段一诊断输出
+  `bullish/bearish/neutral`，阶段二 `order_direction` 输出 `做多/做空`（校验限定），
+  种子数据是 `up/down`。直接比字符串则**永远不等**，检索的 +2 分恒为 0，
+  退化成「只看形态交集」且毫无报错。归一在**读侧**做（`experience_reader._normalize_direction`），
+  存量按中文落盘的老条目同样受益
+- **`experience_max_chars_per_entry` 上限 `le=4000` 装不下真实 payload**
+  （含 `analysis_context` + `bars_snapshot` 实测 7032 字符，且 `analysis_context`
+  从第 471 字符才开始）。**调大该参数不是捷径**，渲染层必须做字段感知选取
+- **测试隔离**：切库后「只写 tmp_path」的用例会从 **session 级共享 DB** 读到别的
+  文件镜像进来的行 —— 断言照样绿，验的已经不是它声称的东西。相关测试文件已加
+  autouse 的 `reset_hub_for_tests` 夹具；新增经验库测试必须自带隔离
 
 ### 侧边栏 tab 分组与子 tab
 

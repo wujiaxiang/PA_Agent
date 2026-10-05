@@ -6,6 +6,63 @@
 
 ## 2026-10-05
 
+### 7. 经验库读端切库（P-1 → P2）：修并发降级失效 + 三条读路径接 DB
+
+- **问题**：`650fc8f` 落地了身份/鉴权层，但经验库**读端一行未动** —— 提示词注入、
+  浏览 API、复盘取档三条路径全在文件系统扫目录。`experience_repo.list_entries`/
+  `get_entry`/`count_by_status` 除测试外**零生产调用者**，`current_user_id` 也零调用者，
+  `experience_entries` 表自建起就是死索引，`user_id` 列从未生效。
+- **根因**：写端早就双写了，读端没跟上；而直接开写会踩三个更隐蔽的坑（见下）
+- **改动**：
+  - **P-1 故障隔离（切读的前置条件，三处都是会静默坏掉的缺陷）**：
+    - `db.py` 的 `_read_error` 从**普通实例属性**移入 `threading.local`。它曾被
+      `query()` 成功时清空，于是 A 线程的读失败标记会被 B 线程任意一次成功读抹掉，
+      A 随后读到 `read_failed == False`，把「读不出来」的 `[]` 当成「库里确实没有」。
+      本系统是高并发读（分析线程池 + 结算调度器 + 每次分析新建的 followup 线程），
+      这不是罕见路径而是**常态路径**，且它放行的正是最需要降级的那一刻
+    - `experience_repo` 新增 `QueryResult(list)`，把「本次查询是否失败」**随结果一起**
+      交出去，调用方不再「查完再去读共享标志位」
+    - `two_stage` 新增 `_load_experience()`：经验检索的任何异常都吞掉并降级成空列表。
+      原先 reader 调用裸奔，而当时所有 `save_partial` 都在 `Stage1Done` 之前、
+      下一次落盘远在其后 —— reader 一抛，**这次分析连同已经付费成功的 Stage 1 一起消失**
+    - `save_partial("stage1_completed")` 前移到 `Stage1Done` 之后
+  - **P-2 repo 接口**：`list_entries` 增 `statuses` 多值过滤（单值调两次会得到最多 2N 条
+    候选，与「两目录合并取最新 N 条」语义不符且不报错）；`entry_id` 改为
+    `<user_id>_<stem>` —— 它曾是全局主键且不在 `ON CONFLICT DO UPDATE SET` 里，
+    两个用户写出同 stem 文件时后者会**静默覆盖**前者的 `content_json`
+  - **P0 身份统一**：`bind_session` 改走 `current_user_id(request)`（原默认
+    `"default"` 是 `users` 表里根本不存在的第三种身份）；`RecordMeta` 增 `user_id`；
+    写入链全链透传 `user_id`，且 **`save_pending` 把它写进记录 JSON** —— 阶段二结算跑在
+    后台调度器线程上，唯一能知道这条属于谁的地方就是记录本身
+  - **P1 读端切读**：`ExperienceReader.read_top5()` 内部改为「先查 SQLite，
+    查不到/读不出来再扫文件」（`SESSION_STORAGE_DESIGN` §7 的 C 阶段）。DB 逻辑刻意
+    放进 `read_top5` 而不是 `read_for_stage2` —— 前者是唯一漏斗，14 处
+    `mock.read_top5` 测试点因此保持有效。**读端仍然严格只读**，不做「顺手补写」：
+    那会把读变成写、顶住 `max_workers=2` 的分析池（`busy_timeout=5000`），
+    且破坏 AGENTS「写入方唯一入口」。顺带修 `direction` 枚举错配（落盘是
+    `做多`、比对的是 `bullish`，**+2 分恒为 0**，检索退化成只看形态交集且毫无报错）
+  - **P2 浏览端切读**：`GET /api/experience` 改为先查 DB，抽出 `_row_dict`/
+    `_counts_by_cycle`/`_browse_payload` 供两条路径共用（口径必须一致），
+    市场周期过滤下沉到共用段
+- **测试**：新增 26 条用例（DB 命中不碰文件系统 / DB 空回落 / DB 读不出来回落 /
+  多用户隔离 / 点号目录拒绝 / DB 与文件路径给出同一组条目 / direction 归一 /
+  浏览端四条路径）。**全部做过反向验证** —— 把守卫拆掉确认测试变红。其中
+  `test_read_failure_flag_is_thread_local` 第一版是**假绿**的：它等的是一个自己刚
+  `set()` 的 `Event`，立刻返回，在有 bug 的代码上通过；改用两个 Event 后才真正抓到
+- **顺带修**：`save()` 是唯一不镜像 SQLite 的写路径（将来复活会写出永远进不了库的条目）
+- **文件**：`pa_agent/storage/db.py`、`pa_agent/storage/experience_repo.py`、
+  `pa_agent/records/experience_reader.py`、`pa_agent/records/experience_writer.py`、
+  `pa_agent/records/schema.py`、`pa_agent/orchestrator/two_stage.py`、
+  `web/api/session_ctx.py`、`web/api/routes_analyze.py`、`web/api/order_followup.py`、
+  `web/api/routes_data.py`、`docs/EXPERIENCE_READ_CUTOVER.md`
+- **接口变更**：`GET /api/experience` 新增 `request` 入参；`list_entries` 增
+  `statuses`；`hub.read_failed` 改为线程局部语义（调用方写法不变，并发下不再互相清标志）；
+  `/api/records` 中 legacy 记录的 `meta.user_id` 为 `""`（多一个 key）
+- **回归**：以 HEAD 的干净 worktree 为基线做全量 unit 对比 —— **新增失败 0、新增 error 0**，
+  顺带修好 1 条既有失败
+- **方案评审**：见 [docs/EXPERIENCE_READ_CUTOVER.md](docs/EXPERIENCE_READ_CUTOVER.md)，
+  v1 经两轮独立评审推翻（5 个 BLOCKER），修订记录保留在文档 §7
+
 ### 6. 多会话推理收尾：SSE 下线 / 追问隔离 / 交易域补齐 / 配置层收敛
 
 - **问题**：多标签页虽已能各取各的 K 线，但实时推送、追问、配置仍有全局串味
@@ -89,6 +146,22 @@
 - **修复**：全部阻塞调用改 `await asyncio.to_thread(...)`（`routes_analyze._run_analysis` 本就跑在 `run_in_executor`，无需改）；订阅队列 `maxsize=256` 且满时丢弃**最旧**增量事件（`bar_update` 是覆盖式快照，丢旧的安全；丢 `bar_close` 会卡住倒计时）；记录文件名加毫秒 + uuid6；`_write_json` 改同目录临时文件 + `os.replace` 原子落盘；CSV 改 per-file 锁 + 单次追加 + 仅新建时写表头
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
+
+### 28. 端到端测试接入 CI + E2E 专用播种端点
+
+上一条把 `tests/e2e/test_modes_e2e.py` 建好后，只在本地跑 —— `ci.yml` 中 0 处引用。**测试写了但不接流水线等于没写**：下次谁改了模式切换，CI 不会报警。这与「此前没做端到端」是同一类问题，只是换了个位置。
+
+- **播种必须由服务端做（连续踩四个坑）**
+  CI 是空库，核心用例会 `pytest.skip` —— CI 全绿但什么都没测。但最初把播种写成「测试进程写文件 + `upsert_record()` 写 DB」，本地能跑通，容器里连续失败：
+  1. `experience_loaded` 写成 `False`，schema 要求 `list` → 被列表接口静默过滤
+  2. 只写文件不写 DB → API 查不到（`_list_records` 明确「**数据库是唯一真源**」，磁盘文件只是补种来源）
+  3. 补上 `upsert_record()` 仍查不到 → `f.resolve().relative_to(RECORDS_DIR)` 失败。**根因：宿主机与容器是两套文件系统视图**（`/root/.../records/pending` vs `/app/records/pending`，同一 inode、不同挂载点）。任何「测试进程自己写库」的方案在容器下都不成立
+  4. `_safe_path_segment()` 返回 `str` 不是 `Path`，`a / b` 报 `TypeError`
+- **改为 `POST /api/records/__e2e_seed__`**：仅在 `PA_AGENT_E2E=1` 时**注册路由**（生产环境该路由 404）。播种走服务端自己的 `RECORDS_DIR`、自己的 `upsert_record`，并用服务端同一套 `AnalysisRecord` schema 先自检 —— 不过就 500，免得「播种成功但被列表接口静默过滤」，在 CI 上表现为「什么都没测到」
+- **CI 新增独立 `e2e` job**：起服务（带 `PA_AGENT_E2E=1`）→ 等健康检查 → 跑 `pytest tests/e2e` → 失败时打印 `server.log`。与 `test` job 并行、失败必须红
+- **验证**：播种端点返回 `seeded:true`，`GET /api/records` 随即查到（`order_type=限价单`）；**清空全部 e2e 记录后重跑 5 passed / 63s，核心用例未 skip**
+- **部署踩坑**：本轮两次把另一会话的半成品代码打进镜像 —— 一次 `routes_data.py` 的 `IndentationError`（编辑中间态被 tar 快照捕获），一次容器 `pa_agent/` 未同步导致 `chat_repo` 缺失。教训：部署前必须对 `web/` 与 `pa_agent/` 全量语法自检，且两目录要么都覆盖要么都不覆盖
+- **文件**：`tests/e2e/test_modes_e2e.py`、`web/api/routes_records.py`（播种端点）、`.github/workflows/ci.yml`、`SESSION_CHANGES.md`
 
 ### 27. 修复：模式切回实时后侧边栏面板残留上一条记录的内容 + 补内容级 E2E
 
