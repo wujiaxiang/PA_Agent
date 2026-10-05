@@ -47,6 +47,38 @@
 - **token 存 `localStorage` 不用 `sessionStorage`**：后者刷新即丢，等于每次
   刷新都要重登，与「刷新不丢数据」直接冲突
 
+#### 前端登录界面细节
+新增 10 个 DOM id：`#login-screen` / `#login-form` / `#login-username` /
+`#login-password` / `#login-submit` / `#login-error` / `#login-status` /
+`#login-led` / `#auth-user` / `#btn-logout`。`<body data-auth>` 三态
+（pending/login/app），CSS 用**属性选择器** `body[data-auth="login"]` 关主界面
+（`visibility:hidden`，不用 `display` 以免放行后布局跳变）。
+
+- **闸门在 `DOMContentLoaded` 的第一句**：未登录直接 return，主界面一行不执行。
+  第二道闸在 `api.js` 五个入口发请求前就地拒绝（零网络往返），管「进页面之后」
+  的登出/过期/多标签页场景
+- **本地不判令牌过期**：后端契约禁止。它降级成「判不出就判活」的快路径 ——
+  把「本地判不出」当「已死」会让服务端仍认的令牌把用户锁死在登录页外，
+  而用户看不出为什么；反过来只多一次 401
+- **登出用 `location.reload()` 而非手工清理**：主界面内存里残留着上一个用户的
+  lastBars/lastRecord/面板 innerHTML/叠加层/追问线程/当前订阅，手工清理正是本
+  仓库反复踩的坑（`clearOverlays` 漏派生图例、置 `lastRecord=null` 面板内容还在）。
+  代价是一次静态资源重载，换用户时本来就该重来
+- 401 时**刻意不 reload**：boot 期间并发的一批请求会一起 401，reload 会变成
+  「重载→首屏又 401→再重载」的循环。403 ≠ 401（403 是已登录但无权，
+  清令牌会把用户踢去重试他没做错的事）
+
+#### ⚠️ 一次共享暂存区事故（第二次撞上）
+提交 `2e9418e` 时把 `api.js`/`index.html`/`style.css` 带了进去，但子代理当时
+正在收尾、`app.js` 停在旧版 —— **HEAD 内部自相矛盾**：`app.js` 调
+`PAuth.isTokenUsable`（api.js 已不导出）→ 登录提交 TypeError；
+`decideBootGate(...) !== 'boot'` 恒真 → 永远停在登录页。**checkout HEAD 就登录不了。**
+
+已补提交修复，并新增 `tests/js/test_login_gate.test.js` 里的**跨文件契约守卫**：
+app.js 调的每个 `PAuth.*` 必须在 api.js 里有定义。语法检查抓不到这类
+「调用了不存在的导出」，必须有这条断言。**教训：不要在子代理还在改它自己
+文件时提交那些文件。**
+
 #### 接口变更 ⚠️
 - **所有 `/api/*` 现在都需要 `Authorization: Bearer <token>`**，未带一律 401
 - 新增 `POST /api/auth/login` / `logout` / `password`、`GET /api/auth/me`

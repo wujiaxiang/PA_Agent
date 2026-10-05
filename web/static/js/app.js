@@ -329,7 +329,20 @@ function setLoginBusy(busy, text) {
   if (el.status && text) el.status.textContent = text;
 }
 
-/** 登录成功后回填顶栏的用户名。display 优先用 /auth/me 里的 username，
+/** 从 login / me 的响应里取展示名。
+ *
+ * 兼容三种形状，因为后端给的是嵌套 user，且 /auth/me 与 login 的字段略有出入：
+ *   {display_name, user_id}  ← /api/auth/me 顶层
+ *   {user: {display_name, user_id}}  ← POST /api/auth/login
+ *   {username, user_id}             ← 容错
+ * 取不到一律返回空串，**不猜、不留 undefined**。 */
+function _displayNameOf(payload) {
+  if (!payload || typeof payload !== 'object') return '';
+  const u = (payload.user && typeof payload.user === 'object') ? payload.user : payload;
+  return u.display_name || u.username || u.user_id || '';
+}
+
+/** 登录成功后回填顶栏的用户名。display 优先用 /auth/me 里的 display_name，
  *  拿不到就退回令牌载荷里的 sub —— 不猜、不留空。 */
 function setAuthBadge(display) {
   const badge = $('#auth-user');
@@ -352,9 +365,13 @@ async function handleLoginSubmit(ev) {
   setLoginBusy(true, '校验中…');
   try {
     const headers = await sessionHeadersAsync({ 'Content-Type': 'application/json' });
+    // ⚠️ 字段名 **user_id** 不是 username —— 与后端 routes_auth.py::LoginRequest
+    // 逐字对齐（也与 users.user_id、authenticate() 同名）。写成 username 会被
+    // pydantic 判成 422「请求畸形」，而 422 与 401 的区别在登录语境下毫无意义，
+    // 用户只会看到一句看不懂的报错。
     const r = await fetch('/api/auth/login', {
       method: 'POST', headers, cache: 'no-cache',
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ user_id: username, password }),
     });
     if (r.status === 404) {
       setLoginError('登录接口未就绪（404）：后端 /api/auth/login 尚未落地');
@@ -371,18 +388,20 @@ async function handleLoginSubmit(ev) {
     }
     let data = null;
     try { data = await r.json(); } catch (_) { /* 落到下面的缺字段提示 */ }
-    // 令牌字段名兼容 token / access_token —— 后端尚未落地，先宽进严出。
+    // 后端 routes_auth.py 返回的就是 `token`；`access_token` 只是容错别名。
     const token = (data && (data.token || data.access_token)) || '';
     if (!token) {
       setLoginError('响应里没有 token 字段（需为 {"token": "v1...."}）');
       return;
     }
-    if (!PAuth.isTokenUsable(token)) {
-      setLoginError('令牌格式无法识别（期望 v1.<payload>.<sig>，且载荷含 sub 与 exp）');
+    // 只挡「空串」。「格式对不对」交给服务端：前端把一个自己看不懂、
+    // 但服务端认的令牌拒掉，等于凭空造出一个用户解不开的死局。
+    if (!PAuth.hasToken(token)) {
+      setLoginError('响应里没有 token 字段（需为 {"token": "v1...."}）');
       return;
     }
     PAuth.setAuthToken(token);
-    setAuthBadge(data.username || data.user_id || PAuth.currentUserId());
+    setAuthBadge(_displayNameOf(data) || PAuth.currentUserId());
     showToast('登录成功，正在进入控制台…', 'success', { force: true });
     // 登录成功后**整页重载**，而不是就地启动主界面（取舍见交付说明）。
     // 重载保证主界面只可能由「一次通过了闸门的 boot」产生 —— 这条不变量
@@ -439,14 +458,17 @@ async function initLoginGate() {
   PAuth.setUnauthorizedHandler(onSessionLost);
 
   try {
-    // 2) 同步判定 —— 不 await，所以匿名用户**看不到任何一帧空主界面**
-    if (PAuth.decideBootGate(PAuth.readAuthToken()) !== 'boot') {
+    // 2) 同步判定 —— 不 await，所以匿名用户**看不到任何一帧空主界面**。
+    //    没有令牌就到此为止：**一个请求都不发**（含 /api/auth/me —— 没有令牌时
+    //    问它只会换一个 401 回来，纯粹浪费一次往返）。
+    if (PAuth.decideBootGate(PAuth.readAuthToken()) === 'login') {
       showLoginScreen('missing');
       const u = _loginEls().user;
       if (u) setTimeout(() => u.focus(), 0);
       return false;
     }
-    // 3) 令牌本地看是有效的，再向服务端问一次身份。
+    // 3) 有令牌 → 向服务端问一次身份，**由它说了算**（前端不自己判过期，
+    //    见 web/api/routes_auth.py 前端契约第 1 条）。
     //    **只有 401 才拦**：404 / 500 / 网络抖动一律放行。理由是这一步是
     //    「锦上添花的身份回显」，真正的鉴权由业务端点自己把关（它们 401 会
     //    走 onSessionLost）；而如果因为这个可选端点一抖就把人锁在登录页，
@@ -461,7 +483,7 @@ async function initLoginGate() {
     if (r.ok) {
       let me = null;
       try { me = await r.json(); } catch (_) { /* 非 JSON 就只用令牌里的 sub */ }
-      setAuthBadge((me && (me.username || me.user_id)) || PAuth.currentUserId());
+      setAuthBadge(_displayNameOf(me) || PAuth.currentUserId());
     }
     document.body.dataset.auth = 'app';
     return true;

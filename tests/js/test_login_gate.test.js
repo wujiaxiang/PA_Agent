@@ -92,34 +92,42 @@ for (const bad of [
 // 载荷是合法 JSON 但不是对象（数组/标量）也判无效
 assert.strictEqual(A.decodeTokenPayload(`v1.${Buffer.from('[1,2]').toString('base64url')}.x`), null);
 
-/* ── isTokenUsable（fail closed）────────────────────────────────────────── */
-assert.strictEqual(A.isTokenUsable(validToken, NOW), true);
-assert.strictEqual(A.isTokenUsable(expiredToken, NOW), false, 'exp 已过必须判不可用');
-assert.strictEqual(A.isTokenUsable('', NOW), false, '空令牌不可用');
-assert.strictEqual(A.isTokenUsable(null, NOW), false);
-assert.strictEqual(A.isTokenUsable(undefined, NOW), false);
-assert.strictEqual(A.isTokenUsable('garbage', NOW), false);
+/* ── hasToken：能不能发业务请求的唯一判据 ───────────────────────────────── */
+assert.strictEqual(A.hasToken(validToken), true);
+assert.strictEqual(A.hasToken('  '), false, '空白串不是令牌');
+assert.strictEqual(A.hasToken(''), false);
+assert.strictEqual(A.hasToken(null), false);
+assert.strictEqual(A.hasToken(undefined), false);
+assert.strictEqual(A.hasToken(123), false);
 
-// 缺 sub / 缺 exp / exp 非数字 —— 一律不可用。
-// 「缺 exp 仍放行」看似宽容，实际后果是拿一个本地无法判断的令牌去打接口，
-// 靠一串 401 才发现会话早就死了：那正是闸门要消灭的现象。
-assert.strictEqual(A.isTokenUsable(makeToken({ exp: NOW + 3600 }), NOW), false, '缺 sub 必须不可用');
-assert.strictEqual(A.isTokenUsable(makeToken({ sub: 'admin' }), NOW), false, '缺 exp 必须不可用');
-assert.strictEqual(A.isTokenUsable(makeToken({ sub: '', exp: NOW + 3600 }), NOW), false, '空 sub 必须不可用');
-assert.strictEqual(A.isTokenUsable(makeToken({ sub: 'admin', exp: 'soon' }), NOW), false);
-assert.strictEqual(A.isTokenUsable(makeToken({ sub: 'admin', exp: Infinity }), NOW), false);
+/* ── isTokenLocallyExpired：**只**用于「别白跑一趟」的快路径 ───────────── */
+assert.strictEqual(A.isTokenLocallyExpired(validToken, NOW), false);
+assert.strictEqual(A.isTokenLocallyExpired(expiredToken, NOW), true, '已过期必须本地判死');
 
 // leeway：与后端 verify_token(leeway_s=30) 对齐，客户端时钟略慢不该提前判死
 assert.strictEqual(
-  A.isTokenUsable(makeToken({ sub: 'admin', exp: NOW - 10 }), NOW), true,
-  'exp 刚过、仍在 leeway 内必须放行（对齐后端 leeway_s=30）'
+  A.isTokenLocallyExpired(makeToken({ sub: 'admin', exp: NOW - 10 }), NOW), false,
+  'exp 刚过、仍在 leeway 内不算本地过期（对齐后端 leeway_s=30）'
 );
 assert.strictEqual(
-  A.isTokenUsable(makeToken({ sub: 'admin', exp: NOW - A.LEEWAY_S - 1 }), NOW), false,
-  '超出 leeway 必须判不可用'
+  A.isTokenLocallyExpired(makeToken({ sub: 'admin', exp: NOW - A.LEEWAY_S - 1 }), NOW), true,
+  '超出 leeway 必须判死'
 );
-// leeway 常量必须就是 30：与后端写死值对不上会让两端对「过期」的认知分叉
+// leeway 常量必须就是 30：与后端写死值对不上会让两端对「过期」的分叉
 assert.strictEqual(A.LEEWAY_S, 30);
+
+/* ⚠️ 判不出 ≠ 已死。方向反了会造成**最坏的一种故障**：一个服务端仍然认可的
+ * 令牌被前端锁死，用户被挡在登录页外却说不出为什么。下面每一条都必须 false。 */
+for (const undecidable of [
+  '', null, undefined, 'garbage',
+  makeToken({ sub: 'admin' }),              // 没有 exp
+  makeToken({ sub: 'admin', exp: 'soon' }), // exp 不是数字
+  makeToken({ sub: 'admin', exp: null }),
+  'v2.aaa.bbb',
+]) {
+  assert.strictEqual(A.isTokenLocallyExpired(undecidable, NOW), false,
+    `判不出过期必须 false（不得据此把用户锁在登录页外）：${JSON.stringify(undecidable)}`);
+}
 
 /* ── authHeaderValue ────────────────────────────────────────────────────── */
 assert.strictEqual(A.authHeaderValue(validToken), `Bearer ${validToken}`);
@@ -157,7 +165,7 @@ const BUSINESS = [
   '/api/settings', '/api/bars?count=100', '/api/bars/next-close',
   '/api/exchanges', '/api/symbols', '/api/timeframes', '/api/order-types',
   '/api/records', '/api/experience', '/api/health',
-  '/api/subscribe', '/api/demo/start',
+  '/api/subscribe', '/api/demo/sample',
   '/api/analyze/stream', '/api/analyze/incremental/stream', '/api/chat/stream',
 ];
 const AUTH = ['/api/auth/login', '/api/auth/logout', '/api/auth/me'];
@@ -165,14 +173,20 @@ const AUTH = ['/api/auth/login', '/api/auth/logout', '/api/auth/me'];
 for (const ep of BUSINESS) {
   assert.strictEqual(A.authDecisionFor(ep, '', NOW), 'deny',
     `契约A：无令牌时 ${ep} 必须被拒（未登录绝不发业务请求）`);
+  assert.strictEqual(A.authDecisionFor(ep, null, NOW), 'deny');
   assert.strictEqual(A.authDecisionFor(ep, expiredToken, NOW), 'deny',
-    `契约A：过期令牌时 ${ep} 必须被拒`);
+    `契约A：本地已判死的令牌不发 ${ep}（省掉一次注定 401 的往返）`);
   assert.strictEqual(A.authDecisionFor(ep, validToken, NOW), 'send',
     `契约A：有效令牌时 ${ep} 必须放行`);
+  // 「本地判不出」也必须放行 —— 否则前端会锁死服务端仍认的令牌
+  assert.strictEqual(A.authDecisionFor(ep, 'garbage', NOW), 'send',
+    `契约A：本地判不出过期时不得拦 ${ep}（判据归服务端）`);
 }
 for (const ep of AUTH) {
   assert.strictEqual(A.authDecisionFor(ep, '', NOW), 'send',
     `${ep} 在没有令牌时也必须能发出去，否则永远登不上`);
+  assert.strictEqual(A.authDecisionFor(ep, expiredToken, NOW), 'send',
+    `${ep} 即便令牌已过期也要能发（登出/换登录都要靠它）`);
   assert.strictEqual(A.authDecisionFor(ep, validToken, NOW), 'send');
 }
 
@@ -192,14 +206,39 @@ for (const ep of AUTH) {
 }
 
 /* ── 契约 D：boot 闸门 ─────────────────────────────────────────────────── */
-assert.strictEqual(A.decideBootGate(validToken, NOW), 'boot');
-assert.strictEqual(A.decideBootGate(expiredToken, NOW), 'login');
-assert.strictEqual(A.decideBootGate('', NOW), 'login');
-assert.strictEqual(A.decideBootGate(null, NOW), 'login');
-assert.strictEqual(A.decideBootGate(undefined, NOW), 'login');
-assert.strictEqual(A.decideBootGate('v1.zzz.yyy', NOW), 'login');
-// 令牌形状被改坏（被别的版本写入、被手改）必须停在登录页，而不是
-// 「先试试看」——那是拿一个必然 401 的令牌去污染服务端日志。
-assert.strictEqual(A.decideBootGate(makeToken({ sub: 'admin' }), NOW), 'login');
+// 有令牌 → 'probe'（去问 /api/auth/me，**由服务端判过期**）
+// 无令牌 → 'login'（一个请求都不发）
+for (const t of [validToken, expiredToken, 'garbage', 'v1.zzz.yyy']) {
+  assert.strictEqual(A.decideBootGate(t), 'probe',
+    '有令牌就必须去问服务端，前端无权自行判死');
+}
+// 空串 / 纯空白 / null / undefined ⇒ 没有令牌可问，直接停在登录页
+for (const t of ['', ' ', '   ', null, undefined, 0, false, {}]) {
+  assert.strictEqual(A.decideBootGate(t), 'login',
+    `没有令牌必须停在登录页（一个请求都不发）：${JSON.stringify(t)}`);
+}
 
 console.log('login_gate: all assertions passed');
+
+/* ── 契约守卫：app.js 调的 PAuth.* 必须在 api.js 里有定义 ──────────────────
+ *
+ * 2026-10-05 实测事故：一次提交把 api.js 的新版与 app.js 的旧版一起带走，
+ * HEAD 内部自相矛盾 —— app.js 调 PAuth.isTokenUsable（api.js 已不导出），
+ * 登录提交直接 TypeError；decideBootGate(...) !== 'boot' 恒真则永远停在登录页。
+ * 两份文件都能通过 node --check，而浏览器里才发现整个登录是死的。
+ *
+ * 语法检查抓不到跨文件的「调用了不存在的导出」，所以这条断言必须存在。
+ */
+const _fs2 = require('fs');
+const _path2 = require('path');
+const _root2 = _path2.join(__dirname, '..', '..');
+const _app2 = _fs2.readFileSync(_path2.join(_root2, 'web/static/js/app.js'), 'utf8');
+const _api2 = _fs2.readFileSync(_path2.join(_root2, 'web/static/js/api.js'), 'utf8');
+
+const _called = [...new Set([..._app2.matchAll(/PAuth\.([A-Za-z_]\w*)/g)].map((m) => m[1]))];
+const _missing = _called.filter((n) => !new RegExp(`\\b${n}\\b`).test(_api2));
+if (_missing.length) {
+  console.error(`FAIL app.js 调用了 api.js 未导出的 PAuth 成员: ${_missing.join(', ')}`);
+  process.exit(1);
+}
+console.log(`contract: app.js 的 ${_called.length} 个 PAuth 调用全部有定义`);
