@@ -69,6 +69,7 @@ from web.api.auth_ctx import (
     bearer_token,
     current_auth,
     login_token_ttl_s,
+    revoke_user_tokens,
     revoke_token,
 )
 
@@ -253,10 +254,10 @@ async def change_password(payload: ChangePasswordRequest, request: Request):
     **要求当前口令**：令牌被窃取本身就等于全面沦陷，所以这一条不是安全边界，
     而是「确认此刻坐在机器前的是本人」的防误操作闸门。
 
-    **明确不做的事**：不吊销该用户其它已签发的令牌。吊销表按令牌记、不按用户记，
-    要吊销「某用户的全部令牌」得再维护一张 user→tokens 表 —— 本轮不引入。
-    换句话说：**改密后请把 :data:`web.api.auth_ctx.DEFAULT_LOGIN_TOKEN_TTL_S`
-    调小或等待其到期**，否则旧令牌在剩余 TTL 内仍有效。这一点必须写进 README。
+    **改密会作废该用户此前所有令牌**（含本进程吊销名单里根本没记的那些 ——
+    靠的是按用户的签发水位线，见
+    :func:`web.api.auth_ctx.revoke_user_tokens`）。改密后**本请求用的这枚令牌
+    也一并失效**，前端须重新登录；这与「改密成功却仍留在旧会话里」相比更安全。
     """
     auth = _auth_or_challenge(request)
     if isinstance(auth, JSONResponse):
@@ -277,5 +278,12 @@ async def change_password(payload: ChangePasswordRequest, request: Request):
             content={"error": "password_not_persisted",
                      "detail": "口令未能写入，请检查存储层状态"},
         )
-    logger.info("password changed for user_id=%s", auth.user_id)
+    # 改密是**账号级**动作：该用户此前所有设备上换到的令牌都应立刻失效。
+    # 否则「改了密码」在最需要它生效的场景（令牌已被别人拿走）里恰恰不生效
+    # —— 那把锁只挡住了还没偷到令牌的人。
+    cutoff = revoke_user_tokens(auth.user_id)
+    logger.info(
+        "password changed for user_id=%s; tokens issued before %.3f revoked",
+        auth.user_id, cutoff,
+    )
     return {"ok": True}

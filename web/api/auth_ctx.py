@@ -124,6 +124,16 @@ class AuthContext:
 # 键用 token 的 sha256 摘要而非原文：令牌常被记进日志，名单里存原文等于再造一份
 # 可用副本。
 _revoked: dict[str, float] = {}
+#: 按**用户**记的吊销水位线：签发时刻早于 ``cutoff`` 的该用户令牌一律作废。
+#:
+#: 为什么不能只靠 ``_revoked``：那本按令牌哈希记，而改密是**账号级**动作 ——
+#: 用户改了口令，此前所有浏览器/所有设备上换到的令牌都应立刻失效，否则
+#: 「改了密码」在最需要它生效的场景（别人拿着旧令牌）里恰恰不生效。
+#:
+#: 存水位线而不是令牌集合，是因为要作废的是**过去签发的全部**令牌（含进程重启
+#: 前签的、清单里根本没记的那些）；集合会让「重启后新登入的令牌」也一起被误杀。
+#: user_id -> (签发水位线, 本条记录自身的失效时刻)
+_revoked_users: dict[str, tuple[float, float]] = {}
 _revoked_lock = threading.Lock()
 
 
@@ -146,6 +156,50 @@ def revoke_token(token: str, *, expires_at: float | None = None) -> None:
     with _revoked_lock:
         _prune_revoked(now)
         _revoked[_token_digest(token)] = exp
+
+
+def revoke_user_tokens(user_id: str, *, at: float | None = None) -> float:
+    """作废该用户**此刻之前**签发的全部令牌，返回记录的水位线。
+
+    用于改密。``at`` 是签发水位线：令牌载荷里的 ``iat`` 早于它即判失效。
+    比它新的（理论上不存在，改密瞬间不会有并发登录成功）仍然有效。
+    """
+    if not user_id or not isinstance(user_id, str):
+        return 0.0
+    now = time.time()
+    cutoff = float(at) if at else now
+    # 本条记录自身的失效时刻 = 水位线 + 令牌最长剩余寿命。过了它就可以整条丢掉：
+    # 那时任何还没过期的令牌都不可能早于水位线（否则它早该过期了）。
+    expires = cutoff + float(login_token_ttl_s())
+    with _revoked_lock:
+        _prune_revoked(now)
+        prev = _revoked_users.get(user_id)
+        # 只前进不后退：并发改密时水位线不能被后一次调用的更早时间戳拉回去
+        keep = prev[0] if prev is not None else 0.0
+        _revoked_users[user_id] = (max(keep, cutoff), expires)
+        return max(keep, cutoff)
+
+
+def is_user_tokens_revoked(
+    user_id: str, *, issued_at: float, at: float | None = None
+) -> bool:
+    """该用户这枚令牌是否因改密而作废（``issued_at`` 早于水位线）。"""
+    if not user_id or not issued_at:
+        return False
+    now = float(at) if at else time.time()
+    with _revoked_lock:
+        entry = _revoked_users.get(user_id)
+        if entry is None:
+            return False
+        cutoff, expires = entry
+        if expires <= now:    # 这条吊销记录本身过期（很久没改密）
+            _revoked_users.pop(user_id, None)
+            return False
+        # 令牌载荷的 iat 是 round(now, 3)（毫秒精度），而 cutoff 是原始
+        # time.time()。同一毫秒内先后签发时，比较会因这半个毫秒差而把
+        # 「改密之后签的那枚」误杀 —— 测试里两条语句连着跑就会复现。
+        # 容忍 1ms：把暴露窗口从 0.5ms 提到 1ms，换来判定不抖动。
+        return float(issued_at) < cutoff - 0.001
 
 
 def is_token_revoked(token: str) -> bool:
@@ -173,12 +227,15 @@ def _prune_revoked(now: float) -> None:
     """丢掉已过期的吊销记录。调用方持锁。"""
     for key in [k for k, exp in _revoked.items() if exp <= now]:
         _revoked.pop(key, None)
+    for uid in [u for u, (_c, exp) in _revoked_users.items() if exp <= now]:
+        _revoked_users.pop(uid, None)
 
 
 def reset_revocation_state_for_tests() -> None:
     """清空吊销名单。测试专用（否则跨用例泄漏）。"""
     with _revoked_lock:
         _revoked.clear()
+        _revoked_users.clear()
 
 
 def login_token_ttl_s() -> int:
@@ -233,11 +290,21 @@ def current_auth(request) -> AuthContext:
     if token:
         claims = verify_token(token)
         if claims is not None and not is_token_revoked(token):
-            return AuthContext(
-                user_id=claims.user_id, claims=claims,
-                source="token", authenticated=True,
+            # 改密是账号级动作：该用户此前所有令牌一并作废。放在逐令牌吊销
+            # 之后判 —— 两者的判据都是「这枚令牌还能不能用」，短路顺序无所谓，
+            # 但先跑便宜的哈希查表。
+            if not is_user_tokens_revoked(
+                claims.user_id, issued_at=claims.issued_at
+            ):
+                return AuthContext(
+                    user_id=claims.user_id, claims=claims,
+                    source="token", authenticated=True,
+                )
+            logger.info(
+                "Bearer token superseded by password change for %s; rejected",
+                claims.user_id,
             )
-        if claims is not None:
+        elif claims is not None:
             logger.info("Bearer token revoked by logout; rejected")
         else:
             logger.debug("Bearer token invalid or expired; falling back")

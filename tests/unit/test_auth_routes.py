@@ -78,6 +78,17 @@ def users_db(tmp_path: Path):
     ensure_admin_user()
     set_password("admin", ADMIN_PW)
     yield hub
+    # **必须把 admin 的口令复位**。本文件里「改密成功」的用例会就地改掉
+    # users 行，而 hub 指向同一个库 —— 夹具只复位吊销表、不复位口令的话，
+    # 后面的用例拿 ADMIN_PW 登录就会「莫名失败」，且失败与被测逻辑毫无关系。
+    # 本轮加改密用例时踩到过一次：test_login_is_public_on_the_real_app
+    # 单独跑全绿、整文件跑红。
+    try:
+        from pa_agent.storage.users import set_password as _sp
+
+        _sp("admin", ADMIN_PW)
+    except Exception:  # noqa: BLE001 —— 收尾不该让整份文件失败
+        pass
     reset_hub_for_tests(Path(os.environ["PA_AGENT_DB_PATH"]))
 
 
@@ -664,3 +675,122 @@ def _login_on_real_app():
 
     return TestClient(server.app).post(
         "/api/auth/login", json={"user_id": "admin", "password": ADMIN_PW})
+
+# ── 改密作废该用户全部令牌 ────────────────────────────────────────────────
+
+
+def _fresh_user(name: str, pw: str = "Seed-Pw-12345") -> str:
+    """建一个专用用户。
+
+    **不要拿 admin 做改密用例**：改密是就地改 users 行，而 client fixture
+    在整份文件里共享同一个库 —— 前一个用例把 admin 口令改了，后一个用例
+    拿 ADMIN_PW 去登录就会「莫名其妙失败」，且失败原因与被测逻辑无关。
+    这是本项目反复栽的「测试之间互相污染」那一类。
+    """
+    from pa_agent.storage.users import create_user
+
+    create_user(name, display_name=name, password=pw)
+    return pw
+
+
+# 改密的受验端点用 /api/auth/me —— 它必然挂在 client 上，而 /api/settings
+# 未必（client 是最小 app）。曾用后者，四条用例全拿到 404。
+
+
+def test_password_change_revokes_every_token_of_that_user(client):
+    """改密是账号级动作：该用户所有设备上换到的令牌都要立刻失效。
+
+    修之前只有逐令牌吊销表，于是「改了密码」在最需要它生效的场景
+    （令牌已被别人拿走）里恰恰不生效 —— 那把锁只挡住了还没偷到令牌的人。
+    """
+    from pa_agent.storage.auth import issue_token
+
+    pw = _fresh_user("revoker1")
+    tokens = [issue_token("revoker1", ttl_s=3600) for _ in range(3)]
+    for t in tokens:
+        assert client.get(
+            "/api/auth/me", headers={"Authorization": f"Bearer {t}"}
+        ).status_code == 200, "前置条件：三枚令牌都应可用"
+
+    r = client.post(
+        "/api/auth/password",
+        headers={"Authorization": f"Bearer {tokens[1]}"},
+        json={"current_password": pw, "new_password": "Brand-New-Pw-42"},
+    )
+    assert r.status_code == 200
+    for t in tokens:
+        assert client.get(
+            "/api/auth/me", headers={"Authorization": f"Bearer {t}"}
+        ).status_code == 401, "改密后仍有旧令牌可用"
+
+
+def test_token_issued_after_password_change_stays_valid(client):
+    """水位线之后签发的令牌不该被自己那次改密杀掉。"""
+    from pa_agent.storage.auth import issue_token
+
+    pw = _fresh_user("revoker2")
+    before = issue_token("revoker2", ttl_s=3600)
+    assert client.post(
+        "/api/auth/password",
+        headers={"Authorization": f"Bearer {before}"},
+        json={"current_password": pw, "new_password": "Another-Pw-77"},
+    ).status_code == 200
+    after = issue_token("revoker2", ttl_s=3600)
+    assert client.get(
+        "/api/auth/me", headers={"Authorization": f"Bearer {after}"}
+    ).status_code == 200, "改密之后签的令牌被误杀"
+
+
+def test_password_change_does_not_revoke_other_users(client):
+    """改密只影响本人。别人的令牌与它无关。"""
+    from pa_agent.storage.auth import issue_token
+
+    pw = _fresh_user("revoker3")
+    bystander = issue_token("bystander-x", ttl_s=3600)
+    actor = issue_token("revoker3", ttl_s=3600)
+    assert client.post(
+        "/api/auth/password",
+        headers={"Authorization": f"Bearer {actor}"},
+        json={"current_password": pw, "new_password": "Isolated-Pw-9"},
+    ).status_code == 200
+    assert client.get(
+        "/api/auth/me", headers={"Authorization": f"Bearer {bystander}"}
+    ).status_code == 200, "改密误伤了别的用户"
+
+
+def test_failed_password_change_keeps_tokens_alive(client):
+    """当前口令给错时**不得**作废任何令牌 —— 否则成了 DoS。"""
+    from pa_agent.storage.auth import issue_token
+
+    pw = _fresh_user("revoker4")
+    t = issue_token("revoker4", ttl_s=3600)
+    r = client.post(
+        "/api/auth/password",
+        headers={"Authorization": f"Bearer {t}"},
+        json={"current_password": "WRONG", "new_password": "Whatever-123"},
+    )
+    assert r.status_code == 401
+    assert client.get(
+        "/api/auth/me", headers={"Authorization": f"Bearer {t}"}
+    ).status_code == 200, "改密失败却把用户踢出了会话"
+
+
+def test_logout_stays_token_scoped_not_user_scoped(client):
+    """登出只作废**本枚**令牌，同账号的另一个浏览器必须照常可用。
+
+    这与改密的语义正好相反：登出是设备级动作，改密是账号级动作。
+    吊销表键本来就是令牌哈希（`_token_digest`），这里锁死它不被改成按用户。
+
+    令牌走 ``_login()`` 拿而不是 ``issue_token()`` 直接签：后者绕过了
+    签发路径，可能与校验路径取到不同的密钥，那测的是「两枚不同密钥的
+    令牌」而不是「同一账号的两个会话」。
+    """
+    a = _login(client).json()["token"]
+    b = _login(client).json()["token"]
+    assert a != b, "两次登录应拿到不同令牌"
+
+    assert client.post("/api/auth/logout", headers=_auth(a)).status_code == 200
+    assert client.get("/api/auth/me", headers=_auth(a)).status_code == 401
+    assert client.get("/api/auth/me", headers=_auth(b)).status_code == 200, (
+        "登出一个浏览器却把同账号的另一个也踢了"
+    )
