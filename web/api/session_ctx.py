@@ -20,27 +20,54 @@ logger = logging.getLogger("pa_agent.web.session")
 #: 请求头名。前端 sessionStorage 里的 UUID。
 SESSION_HEADER = "X-Session-Id"
 
+#: query 参数名。原生 EventSource 带不了 header，只能走 query。
+SESSION_QUERY_PARAM = "sid"
+
 #: 单个 session_id 的长度上限。防御性：session_id 会进日志与 SQL，超长无意义。
 _MAX_ID_LEN = 64
 
 
-def session_id_of(request: Any) -> str:
-    """Extract and sanitise the session id from the request.
+def sanitize_session_id(raw: str) -> str:
+    """校验并归一 session_id。header 与 query 两个入口共用。
 
-    校验规则：非空、长度上限、只允许 ``[A-Za-z0-9_-]``。session_id 会拼进
-    SQL（虽然走参数化）并出现在日志里，收紧字符集可避免日志注入。
+    规则：非空、长度上限、只允许 ``[A-Za-z0-9_-]``。session_id 会拼进 SQL
+    （虽走参数化）并出现在日志里，收紧字符集可避免日志注入。
     """
-    raw = ""
-    try:
-        raw = request.headers.get(SESSION_HEADER, "") or ""
-    except Exception:  # noqa: BLE001 - 任何异常都视作「无会话」
-        return ""
-    raw = raw.strip()
+    raw = (raw or "").strip()
     if not raw or len(raw) > _MAX_ID_LEN:
         return ""
     if not all(c.isalnum() or c in "-_" for c in raw):
         return ""
     return raw
+
+
+def session_id_of(request: Any) -> str:
+    """从请求取 session_id：**header 优先，其次 query ``sid``**。
+
+    为什么需要 query 这一路：浏览器原生 ``EventSource`` **无法设置请求头**
+    （这是硬限制，不是配置问题）。SSE 端点若靠 ``X-Session-Id`` 区分会话，
+    服务端永远拿不到值，会静默退回全局游标 —— 这正是 SSE 多会话隔离方案
+    A 不可实施的原因。追问 SSE 也受同一限制。
+
+    两路都过同一个 :func:`sanitize_session_id`，避免 query 成为绕过字符集
+    校验的后门。
+    """
+    for getter in ("headers", "query_params"):
+        try:
+            src = getattr(request, getter, None)
+            if src is None:
+                continue
+            raw = (
+                src.get(SESSION_HEADER, "")
+                if getter == "headers"
+                else src.get(SESSION_QUERY_PARAM, "")
+            ) or ""
+            got = sanitize_session_id(raw)
+            if got:
+                return got
+        except Exception:  # noqa: BLE001 - 任何异常都视作「无会话」
+            continue
+    return ""
 
 
 def resolve_view(ctx: Any, session_id: str) -> tuple[str, str, str]:

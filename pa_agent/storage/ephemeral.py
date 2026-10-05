@@ -60,6 +60,11 @@ class Cursor:
     def __eq__(self, other: object) -> bool:
         return isinstance(other, Cursor) and self.as_tuple() == other.as_tuple()
 
+    # 定义了 __eq__ 就必须显式给 __hash__，否则 __slots__ 类不可哈希 ——
+    # 任何拿 Cursor 当 dict 键做分组的实现都会 TypeError（评审实测确认）。
+    def __hash__(self) -> int:
+        return hash(self.as_tuple())
+
     def __repr__(self) -> str:  # pragma: no cover - 诊断用
         return f"Cursor({self.symbol!r}, {self.timeframe!r}, {self.exchange!r})"
 
@@ -217,9 +222,26 @@ class InMemoryBackend:
         for k in expired:
             self._sessions.pop(k, None)
             logger.debug("session expired: %s", k)
-        # 硬上限：宁可踢最久未用的，也不能让内存无限涨
+        # 硬上限：宁可踢最久未用的，也不能让内存无限涨。
+        # 但**跳过仍有 SSE 队列的会话** —— 被弹的会话其 event_generator 会永久
+        # await queue.get()，连接泄漏且 finally 里的清理永不执行。
         while len(self._sessions) > self._max:
-            _, victim = self._sessions.popitem(last=False)
+            # OrderedDict 按「最近使用」排序，从头找第一个没有挂连接的会话。
+            victim_id = next(
+                (k for k, v in self._sessions.items() if v.sse_queue is None), None
+            )
+            if victim_id is None:
+                logger.warning(
+                    "session registry over capacity (%d) but every session holds an "
+                    "SSE queue; keeping them rather than leaking connections",
+                    len(self._sessions),
+                )
+                break        # 全都挂着连接，宁可暂时超限也不踢
+            victim = self._sessions.pop(victim_id)
+            logger.warning(
+                "session registry at capacity (%d), evicted LRU session %s",
+                self._max, victim.session_id,
+            )
             logger.warning(
                 "session registry at capacity (%d), evicted LRU session %s",
                 self._max, victim.session_id,
@@ -274,8 +296,18 @@ class SessionRegistry:
         return self._backend.get(session_id)
 
     def drop(self, session_id: str) -> None:
-        """SSE 连接断开时立刻释放，不等 TTL。"""
+        """整个会话丢弃（含 chat / cursor / last_record）。仅关 tab 时用。"""
         self._backend.drop(session_id)
+
+    def drop_queue(self, session_id: str) -> None:
+        """**只**清空该会话的 SSE 出站队列，其余状态原样保留。
+
+        断连时必须用这个而不是 :meth:`drop` —— 浏览器会自动重连 EventSource，
+        用 drop 会把追问历史和游标一起清掉（P2 隔离被静默摧毁的根因）。
+        """
+        state = self._backend.get(session_id)
+        if state is not None:
+            state.sse_queue = None
 
     def sweep(self) -> int:
         return self._backend.sweep()

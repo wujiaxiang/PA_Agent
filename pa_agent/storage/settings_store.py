@@ -190,6 +190,18 @@ def apply_user_change(new_settings: dict[str, Any], user_id: str) -> bool:
     存差异而非全量的理由见模块 docstring：全量复制会让系统兜底后续的更新
     再也传不到该用户。
     """
+    # **读失败必须拒绝写入**（现存 bug，评审 B4-32）：`load_baseline() or {}`
+    # 在读失败时会拿到 {}，于是 compute_diff({}, 全量配置) 会把整份 8 个 section
+    # 全部写进 user_prefs。此后系统兜底的任何更新都再也传不到该用户，且用户会
+    # 看到「配置被莫名重置」。必须与 resolve() 同样先看 hub.read_failed。
+    hub = get_hub()
+    if hub.read_failed:
+        logger.error(
+            "拒绝写入用户覆盖：DB 读取失败（%s）。本次改动只落文件，重启后可能丢失。",
+            hub.read_error,
+        )
+        return False
+
     baseline = load_baseline() or {}
     return save_overrides(compute_diff(baseline, new_settings), user_id)
 
