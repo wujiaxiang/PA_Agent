@@ -141,8 +141,11 @@ DDL_EXPERIENCE_REVIEWS = (
     """,
     # 一条经验只要「最新一版复盘」是热路径；同一条的历史版本很少被读。
     """
+    -- 列序对齐 ``program_review`` / ``latest_llm_review`` 的 ORDER BY，
+    -- 否则每查一次复盘都要临时 B-tree 排序。复盘条数通常 1–3 条，代价可忽略，
+    -- 但同一笔交易反复复盘几十次时这就是第一个该优化的地方。
     CREATE INDEX IF NOT EXISTS ix_review_entry
-        ON experience_reviews (user_id, entry_id, created_at DESC)
+        ON experience_reviews (user_id, entry_id, source, verdict, created_at DESC)
     """,
 )
 
@@ -279,6 +282,11 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     # 出现在老库上。没有这条迁移时，INSERT 报 "no column named source"，而
     # ``db.execute`` 把它当「transient error (not latching)」吞掉 —— 结算照常
     # 成功、复盘却一条都没写进去，日志里只有一行 warning。
+    # ⚠️ 必须排在上面那些 ``drop_default_user_id`` 之后。重建走
+    # ``create_table_ddl()``（已含 source），拷数据时按**旧表**的列清单来 ——
+    # 旧表若已被 ADD COLUMN 补过，两种顺序都不会出错；但把 ALTER 提前会让
+    # ``drop_default_user_id`` 的重建拷到已存在的 source 列，行为依赖执行序。
+    # 保持现状，别调整顺序。
     ("experience_reviews",
      "ALTER TABLE experience_reviews ADD COLUMN source TEXT NOT NULL DEFAULT 'llm'"),
 )

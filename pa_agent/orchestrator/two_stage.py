@@ -806,6 +806,9 @@ class TwoStageOrchestrator:
             previous_record=previous_record,
             enable_next_bar_prediction=_enable_next_bar,
             provider_settings=getattr(self._settings, "provider", None),
+            # 复盘按 user_id 取用；漏传则恒回落默认用户，非 admin 的复盘
+            # 永远不进提示词 —— 且不报错
+            user_id=str(user_id or ""),
             structure_flip_cooldown_bars=_flip_cooldown,
         )
 

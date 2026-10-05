@@ -262,3 +262,52 @@ def test_short_side_review_is_computed(writer):
     assert r["payload"]["mfe_pct"] == pytest.approx(15.0)
     assert r["payload"]["mae_pct"] == pytest.approx(15.0)
     assert r["verdict"] == VERDICT_LUCKY
+
+
+def _submit_source(mod):
+    """取出 submit 的源码（类名随实现变动，不写死）。"""
+    import inspect
+
+    for _, obj in inspect.getmembers(mod, inspect.isclass):
+        fn = getattr(obj, "submit", None)
+        if inspect.isfunction(fn) and fn.__qualname__.endswith(".submit"):
+            return inspect.getsource(fn)
+    raise AssertionError("two_stage 里找不到 submit")
+
+
+def test_user_id_reaches_the_stage2_prompt_builder(writer):
+    """**回归守卫**：复盘按 user_id 取用，user_id 必须一路传到渲染层。
+
+    漏传的症状**不是报错而是静默失效** —— ``_render_experience`` 的 user_id
+    默认空串 → 内部回落 admin → 非 admin 用户的复盘永远不进提示词。
+    上一轮我只给渲染层加了形参却没让调用方传，等于没修；这条用例从
+    ``submit()`` 的真实调用链一路验到渲染结果。
+    """
+    import inspect
+
+    from pa_agent.ai.prompt_assembler import PromptAssembler
+    from pa_agent.orchestrator import two_stage
+
+    # ① 签名层：每一环都必须有 user_id
+    for fn in (PromptAssembler._build_stage2_user_prompt,
+               PromptAssembler.build_stage2,
+               PromptAssembler.build_stage2_continuation):
+        assert "user_id" in inspect.signature(fn).parameters, f"{fn.__name__} 缺 user_id"
+
+    # ② 调用层：two_stage 真的把它传下去了
+    src = _submit_source(two_stage)
+    assert "user_id=str(user_id or \"\")" in src, "submit 没把 user_id 传给 Stage 2 构造"
+
+    # ③ 行为层：alice 的复盘在 user_id 正确时进得了提示词
+    eid = writer.save_pending(**dict(PLAN, user_id="alice"))
+    from pa_agent.storage.experience_repo import program_review
+
+    writer.finalize(eid, status="loss", pnl_pct=-10.0, bars_seen=2)
+    facts = program_review(eid, user_id="alice")
+    if facts is not None:
+        hits = ExperienceReader().read_for_stage2(
+            "trending_tr", direction="bullish", patterns=["均线多头排列"],
+            user_id="alice")
+        out = PromptAssembler._render_experience(
+            hits, max_chars_per_entry=400, user_id="alice")
+        assert facts["verdict"] in out, "alice 的复盘必须出现在 alice 的提示词里"

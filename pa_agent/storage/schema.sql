@@ -83,8 +83,11 @@ CREATE TABLE IF NOT EXISTS experience_reviews (
         FOREIGN KEY (entry_id) REFERENCES experience_entries(entry_id)
             ON DELETE CASCADE
     );
-CREATE INDEX IF NOT EXISTS ix_review_entry
-        ON experience_reviews (user_id, entry_id, created_at DESC);
+-- 列序对齐 ``program_review`` / ``latest_llm_review`` 的 ORDER BY，
+    -- 否则每查一次复盘都要临时 B-tree 排序。复盘条数通常 1–3 条，代价可忽略，
+    -- 但同一笔交易反复复盘几十次时这就是第一个该优化的地方。
+    CREATE INDEX IF NOT EXISTS ix_review_entry
+        ON experience_reviews (user_id, entry_id, source, verdict, created_at DESC);
 CREATE TABLE IF NOT EXISTS trade_records (
         trade_id     TEXT PRIMARY KEY,
         user_id      TEXT NOT NULL,

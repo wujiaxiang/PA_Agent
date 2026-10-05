@@ -23,6 +23,7 @@ from pa_agent.ai.market_features import (
 )
 from pa_agent.data.base import KlineFrame
 from pa_agent.data.datetime_ts import format_epoch_for_display
+from pa_agent.records.review_spec import sanitize_for_prompt
 from pa_agent.records.schema import AnalysisRecord
 
 logger = logging.getLogger(__name__)
@@ -1497,6 +1498,7 @@ class PromptAssembler:
         experience_entries: list[Any],
         *,
         decision_stance: str = "conservative",
+        user_id: str = "",
     ) -> list[dict]:
         """Build a standalone Stage 2 request (kept for tests/tools)."""
         system_content = self._build_stage2_system_prompt()
@@ -1507,6 +1509,7 @@ class PromptAssembler:
             experience_entries=experience_entries,
             decision_stance=decision_stance,
             enable_next_bar_prediction=False,
+            user_id=user_id,
         )
         return [
             {"role": "system", "content": system_content},
@@ -1577,6 +1580,7 @@ class PromptAssembler:
         provider_settings: Any | None = None,
         use_prefix_chain: bool | None = None,
         structure_flip_cooldown_bars: int = 3,
+        user_id: str = "",
     ) -> list[dict]:
         """Build Stage 2 messages, optionally chaining after Stage 1 for KV cache.
 
@@ -1632,8 +1636,14 @@ class PromptAssembler:
         enable_next_bar_prediction: bool = False,
         omit_kline_block: bool = False,
         structure_flip_cooldown_bars: int = 3,
+        user_id: str = "",
     ) -> str:
-        """Build the Stage 2 task turn for standalone or prefix-chain mode."""
+        """Build the Stage 2 task turn for standalone or prefix-chain mode.
+
+        ``user_id`` 必须一路传到 ``_render_experience`` —— 渲染期要按它取复盘。
+        漏掉的后果不是报错而是**静默失效**：复盘取用恒回落默认用户，
+        非 admin 用户的复盘永远不进提示词。
+        """
         from pa_agent.ai.decision_continuity import (
             build_continuity_context,
             render_continuity_prompt_block,
@@ -1679,6 +1689,7 @@ class PromptAssembler:
                 self._render_experience(
                     experience_entries,
                     max_chars_per_entry=max_chars,
+                    user_id=user_id,
                 )
             )
         stage2_parts.append(_STAGE2_OUTPUT_CONTRACT)
@@ -1975,11 +1986,22 @@ class PromptAssembler:
         ]
         for i, entry in enumerate(entries, 1):
             content = cls._entry_content(entry)
-            head = {
-                k: content.get(k)
-                for k in cls._EXPERIENCE_HEAD_FIELDS
-                if content.get(k) not in (None, "", [], {})
-            }
+            # ``summary`` 与 ``detected_patterns`` 是**上一次分析的模型输出**
+            # （summary 取自 stage2 的 reasoning）。它们会进到**下一次** Stage 2
+            # 的提示词里 —— 这是二阶注入：模型 A 的输出成为模型 B 的输入。
+            # 外层文本即便来自我们自己的渲染代码，也无法替模型内容消毒。
+            head = {}
+            for k in cls._EXPERIENCE_HEAD_FIELDS:
+                v = content.get(k)
+                if v in (None, "", [], {}):
+                    continue
+                if k in cls._MODEL_AUTHORED_HEAD_FIELDS:
+                    v = sanitize_for_prompt(
+                        json.dumps(v, ensure_ascii=False)
+                        if not isinstance(v, str) else v,
+                        max_chars=cls._MODEL_FIELD_MAX_CHARS,
+                    )
+                head[k] = v
             blob = json.dumps(head, ensure_ascii=False, indent=2)
             # 复盘结论单独追加：它不在 content 里，而是挂在 experience_reviews。
             # 不单独抽出来就永远挤不进提示词 —— 复盘写得再好也只是躺在库里。
@@ -1991,6 +2013,12 @@ class PromptAssembler:
                 blob = blob[: max_chars_per_entry - 3] + "..."
             lines.append(f"\n### 案例 {i}\n```json\n{blob}\n```{extra}")
         return "\n".join(lines)
+
+    #: 这几个 head 字段是**上一次模型的输出**，不是我们自己写的。
+    _MODEL_AUTHORED_HEAD_FIELDS: tuple[str, ...] = ("summary", "detected_patterns")
+
+    #: 模型产出字段的字符上限（比复盘判据更短：这些字段本就该是短摘要）
+    _MODEL_FIELD_MAX_CHARS = 120
 
     #: 注入提示词的复盘文本**硬上限**。LLM 复盘是自由文本，没有上限就能把
     #: Stage 2 提示词撑爆 —— 这段曾整个在 ``max_chars_per_entry`` 预算之外直插。

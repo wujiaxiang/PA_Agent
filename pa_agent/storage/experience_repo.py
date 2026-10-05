@@ -386,10 +386,3 @@ def latest_review(
     return program_review(entry_id, user_id=user_id) or latest_llm_review(
         entry_id, user_id=user_id
     )
-
-
-def delete_reviews(entry_id: str, *, user_id: str = DEFAULT_USER_ID) -> bool:
-    return get_hub().execute(
-        "DELETE FROM experience_reviews WHERE entry_id = ? AND user_id = ?",
-        (entry_id, user_id),
-    )
