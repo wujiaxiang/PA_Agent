@@ -378,6 +378,24 @@ def _install_callbacks(event_queue: asyncio.Queue, loop):
     }
 
 
+def _request_user_id(request: Request) -> str:
+    """本次请求的 user_id，取不到就回落默认用户。
+
+    身份判定本身在 ``web.api.auth_ctx``，那里「任何情况下都不抛」。
+    这里再包一层是因为本函数在**派发线程之前**被调用 —— 拿不到身份绝不能
+    让整次分析起不来，回落成默认用户即可（单机部署下它本就等于正确答案）。
+    """
+    try:
+        from web.api.auth_ctx import current_user_id
+
+        return current_user_id(request)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("user identity unavailable, using default: %s", exc)
+        from pa_agent.storage.db import DEFAULT_USER_ID
+
+        return DEFAULT_USER_ID
+
+
 def _run_analysis(
     ctx,
     bar_count: int,
@@ -386,6 +404,7 @@ def _run_analysis(
     incremental: bool = False,
     continuous: bool = False,
     session_id: str = "",
+    user_id: str = "",
 ):
     """Run the two-stage pipeline (synchronous) and push events to *event_queue*.
 
@@ -399,6 +418,10 @@ def _run_analysis(
     不读全局 settings —— 否则 A tab 看 NVDA 而全局为 BTCUSDT 时，A 的增量
     分析会捞到 BTCUSDT 的上一轮上下文喂给模型（跨标的串味）。
     空 session_id 时回落到全局 settings，行为与改造前一致。
+
+    *user_id* 同样必须由调用方（持有 request 的异步入口）在**派发前**取好传进来：
+    本函数跑在线程池里，没有 request 可问。而经验记录要靠它确定归属 ——
+    经验库的写入方在后台线程，事后无从追问「这条是谁的」。
     """
     # *loop* is the main-thread event loop, passed from analyze_stream
 
@@ -407,7 +430,17 @@ def _run_analysis(
 
         view_symbol, view_timeframe, view_exchange = resolve_view(ctx, session_id)
 
-        bars_raw = ctx.data_source.latest_snapshot(bar_count)
+        # **必须按本会话游标取数**。不传则回落到进程级共享订阅（最后一次
+        # POST /api/subscribe 的结果），于是 A tab 的分析会拿到 B tab 的 K 线，
+        # 再被下面 build_display_frame 贴上 A 的标的标签 —— AI 分析错标的、
+        # 记录还带着「对」的标签，零异常零日志。
+        # 与 /api/bars（web/api/routes_data.py）保持逐字一致，别再各漏各的。
+        bars_raw = ctx.data_source.latest_snapshot(
+            bar_count,
+            exchange=view_exchange or None,
+            symbol=view_symbol or None,
+            timeframe=view_timeframe or None,
+        )
         now_ms = int(time.time() * 1000)
         frame = build_display_frame(
             bars_raw, bar_count,
@@ -480,6 +513,7 @@ def _run_analysis(
             incremental_new_bar_count=incremental_new_bar_count,
             incremental=incremental,
             continuous=continuous,
+            user_id=user_id,
             **callbacks,
         )
         record_payload = _serialize_record(record)
@@ -507,14 +541,15 @@ def _run_analysis(
                 record=record,
                 frame=frame,
                 settings=ctx.settings,
-                symbol=ctx.settings.general.last_symbol,
-                timeframe=ctx.settings.general.last_timeframe,
+                # 同上：必须用**本次分析的**品种，而不是全局订阅。
+                # 分析对了而落盘/推送用错标的，用户看到的通知与记录会对不上。
+                symbol=view_symbol,
+                timeframe=view_timeframe,
                 data_source=ctx.data_source,
+                user_id=user_id,
             ):
                 logger.info(
-                    "order signal dispatched for %s/%s",
-                    ctx.settings.general.last_symbol,
-                    ctx.settings.general.last_timeframe,
+                    "order signal dispatched for %s/%s", view_symbol, view_timeframe,
                 )
             # 刚写下的 pending 最可能马上够 N 根 K 线，顺带结算一轮。
             # 后台线程，不阻塞本次分析响应；与定时器共用单飞守卫不会重叠。
@@ -566,13 +601,14 @@ async def analyze_stream(
     from web.api.session_ctx import session_id_of
 
     session_id = session_id_of(request)
+    user_id = _request_user_id(request)
     event_queue: asyncio.Queue = asyncio.Queue()
 
     # Kick off analysis in thread pool
     loop = asyncio.get_running_loop()
     loop.run_in_executor(
         _executor, _run_analysis, ctx, bar_count, event_queue, loop, False,
-        continuous, session_id,
+        continuous, session_id, user_id,
     )
 
     async def event_generator():
@@ -642,6 +678,7 @@ async def analyze_incremental_stream(
         True,  # incremental=True
         continuous,
         session_id,
+        _request_user_id(request),
     )
 
     async def event_generator():

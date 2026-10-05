@@ -141,10 +141,13 @@ def _sweep_chat_sessions() -> int:
     这一处的权威清理方是 ``routes_chat._chat_cleanup_loop``（事件循环侧、60s
     一轮，会在弹出后 ``release()`` 被占用的锁把等待者唤醒）。本函数只在
     **那条 task 没在跑**时补位 —— 正常情况下恒返回 0，不与它抢同一批条目。
-    之所以需要这层兜底：该清理 task 挂在 ``@router.on_event("startup")`` 上，
-    而 FastAPI **已不再执行 router 级 startup 事件**（0.142 实测
-    ``APIRouter.include_router`` 不转发 ``on_startup``），故它实际上从未启动，
-    ``_chat_sessions`` 一直只增不减。
+    **⚠️ 更正一条此前的错误结论**：本函数最初的注释称「FastAPI 已不再执行
+    router 级 startup 事件，故该清理 task 从未启动」。**该结论是错的**，
+    已实测证伪：``APIRouter.include_router`` 确实转发 ``on_startup``，
+    router 级 startup 在 TestClient 下真的执行。行为由
+    ``tests/unit/test_router_startup_forwards.py`` 锁定 —— 将来 FastAPI 真改了
+    行为，那条测试会红，届时可以名正言顺地改代码，而不是凭一次误判加兜底。
+    本清扫因此是**双保险**（权威 task 失活 / 逻辑有漏）而非「唯一防线」。
 
     两条与权威清理方的差异，都是有意为之：
 
