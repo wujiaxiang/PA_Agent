@@ -94,7 +94,9 @@ MAC*.txt
 
 # ── tools 目录下的本地诊断输出（保留 .py 脚本本身）──────────────────────────
 tools/_pending_order_report.txt
-tools/stage2_raw_sample.txt
+# 注意：tools/stage2_raw_sample.txt **不能**继续被忽略 ——
+# tests/unit/test_json_validator.py 把它当夹具读（破损 JSON 修复用例）。
+# 2026-10-05 实测：它被 ignore 后新克隆/CI 上文件不存在，测试必失败。
 tools/_tools_catalog.json
 tools/_diag_*.txt
 # 根目录探针产物：tools/probe_thinking_routes.py 的运行输出（一次性诊断，不入库）

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from pa_agent.ai.cursor_sdk_client import (
     _consume_cursor_stream_event,
     _ensure_cursor_sdk_patches,
@@ -18,6 +20,9 @@ def test_safe_bridge_auth_token_never_starts_with_dash() -> None:
 
 
 def test_patch_cursor_sdk_bridge_auth_tokens() -> None:
+    # cursor-sdk 是可选依赖（pyproject 的 [cursor] extra），多数环境没装。
+    # 这两个用例要 import 真实模块才能验证 patch 效果，缺依赖应 skip 而非失败。
+    pytest.importorskip("cursor_sdk", reason="需要可选依赖 cursor-sdk")
     _patch_cursor_sdk_bridge_auth_tokens()
     import cursor_sdk._tool_callback as tool_cb  # type: ignore
 
@@ -39,6 +44,9 @@ def test_sanitize_cursor_bridge_argv_fixes_dash_prefixed_token() -> None:
 
 
 def test_bridge_launches_after_cursor_sdk_patches() -> None:
+    # cursor-sdk 是可选依赖（pyproject 的 [cursor] extra），多数环境没装。
+    # 这两个用例要 import 真实模块才能验证 patch 效果，缺依赖应 skip 而非失败。
+    pytest.importorskip("cursor_sdk", reason="需要可选依赖 cursor-sdk")
     _ensure_cursor_sdk_patches()
     from cursor_sdk import CursorClient  # type: ignore
 

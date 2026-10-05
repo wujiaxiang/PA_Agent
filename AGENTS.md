@@ -159,6 +159,16 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **可选链只对「已声明为 undefined」生效**：写成 `updateFlowBarIdle?.()` 而该函数根本不存在时，仍会抛 ReferenceError。函数是否存在要用 `typeof x === 'function'` 判断，不要靠加 `?.` 蒙混
 - **端到端测试必须断言「内容」而非「状态位」**：面板可见 / dataset 值 / classList / 消息条数只能证明**机制触发**，不能证明**结果正确**。断言要看面板当前显示的内容是否属于当前模式，并把多个操作串成一条**状态迁移链**逐段验证（`replay → 返回实时` 必须是一次连续走查，不能拆成两个独立步骤）
 - **CI 的绿灯必须对应真的跑了测试**：`test` job 曾只做 `pip install` + `import pa_agent` 就算过，且 `pip install -e ".[dev]"` 里的 **`[dev]` extra 从未定义** —— pip 只 warning 后继续，pytest 根本没装上。**加 CI 前先确认被装的 extra 真的存在**，否则是「假绿灯」，比没有 CI 更危险
+- **失败基线必须从「已提交的干净状态」生成，绝不能用脏工作区**：2026-10-05 实测
+  ——在多会话并行、别人正重构未提交时生成基线，把 **40 项「别人半成品造成的失败」**
+  当成存量记了进去。纯净 `HEAD` 实测只有 32 项，脏工作区却是 102 项。结果是
+  **CI 对这 40 项真实回归保持绿灯，基线替未完成的代码背了书**。
+  正确做法：`git archive HEAD | tar -x -C /tmp/head` 导出纯净树再跑 pytest。
+  判据：若工作区有他人未提交改动，基线一律不可信
+- **只解析 pytest 的 `short test summary info` 段**：全文扫描会命中
+  **Captured log 段**里的应用日志行（`ERROR web.api.routes_data:...`），
+  把它当成名为 `web.api.routes_data:...` 的测试报成「新增回归」。应用日志里
+  出现 ERROR 是正常运行的一部分，与测试成败无关
 - **存量测试失败会让 CI 永久红，必须用基线**：`tools/ci_diff_baseline.py` 比对
   `tests/ci/baseline_failures.txt`，**存量失败降级为警告、新增失败才红**。不设基线
   → CI 永远红 → 没人再看 CI；不报 → 就是假绿灯。基线是快照，**不替代修测试**；

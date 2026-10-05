@@ -209,6 +209,78 @@
 
 ## ✅ 已提交
 
+### 2026-10-05 · 修 CI 基线误报 + 基线来源错误（当前）
+
+**状态**：已提交 `（本提交）`
+
+#### 需求
+用户要求修 72 项单测失败。排查后发现主体不是普通 bug，而是**别人未提交的重构**，
+遂改为修自己上一轮引入的两个问题。
+
+#### 问题 1：`ci_diff_baseline.py` 会把应用日志误当成测试失败
+2026-10-05 实测：原正则 `^(FAILED|ERROR)\s+(\S+)` 全文扫描，会命中
+**Captured log 段**里的应用日志行：
+
+    ERROR    web.api.routes_data:routes_data.py:451 experience browse: store unreadable
+
+被当成名为 `web.api.routes_data:routes_data.py:451` 的测试 → 报成「新增回归」。
+应用日志里出现 ERROR 是**正常运行的一部分**，与测试成败无关。
+
+修复：**只解析 `short test summary info` 段**，并要求条目形如 `路径.py::用例`
+（双重约束）。反向验证：注入伪造日志行后解析结果不变（0 新增）。
+
+#### 问题 2（更严重）：基线是从**脏工作区**生成的
+原基线记录 102 项。用 `git archive HEAD` 导出纯净树复测 —— **HEAD 上只有 32 项失败**。
+多出的 **40 项全部来自别人未提交的经验库重构**，被我当成「已知失败」记了进去。
+
+后果：**CI 对这 40 项真实回归保持绿灯**，基线反而替未完成的代码背了书。
+这与 AGENTS.md 警告的「假绿灯」是同一类错误，只是方向相反 —— 我上一轮
+修的正是它，却用同样的方式重新造了一遍。
+
+修复：基线按**纯净 HEAD 重新生成**（32 项），并在文件头写明生成方式必须是
+`git archive HEAD` 导出干净树，禁止用脏工作区。
+
+双向验证：
+| 场景 | 期望 | 实测 |
+|---|---|---|
+| 纯净 HEAD | exit 0 | ✅ exit 0 |
+| 脏工作区（含别人 40 项） | exit 1 并点名 | ✅ exit 1，精确报出 40 项 |
+
+#### 未能处理的部分（已查明，非本会话范围）
+72 项中的 **40 项属于别人未提交的经验库重构**，本会话**未修改**其代码：
+- `pa_agent/storage/experience_repo.py` 把 `upsert_entry(file_path=)` 改成必填
+  `entry_id=`，**该重构完全在未提交工作区**（`git log -S` 无对应 commit）
+- `pa_agent/storage/importer.py:148` 仍传 `file_path=` —— **真实生产 bug**，
+  经 `web/server.py:119 → import_all()` 每次启动触发，被宽 `except` 吞成一行
+  WARNING，导致 `import_trade_records()` 永不执行
+- `ExperienceWriter.save()` 返回类型 `Path → str`、`_read_top5_from_files` 已删、
+  `EXPERIENCE_DIR` 已删、`schema.sql` 未重新生成
+- 另一会话诊断期间仍在实时改动这些文件（mtime 14:46–14:49，失败数 69→53），
+  `test_storage_dualwrite.py` 近 15 分钟内有写入
+
+#### 改动文件（写入范围）
+
+| 文件 | 改动 |
+|---|---|
+| `tools/ci_diff_baseline.py` | 只解析 summary 段 + 校验条目形态 |
+| `tests/ci/baseline_failures.txt` | 按纯净 HEAD 重建（102 → 32 项） |
+| `tests/unit/test_mt5_clock_skew.py` | MT5 缺依赖时逐用例 skip |
+| `tests/unit/test_cursor_sdk_client.py` | cursor_sdk 缺依赖时 skip |
+| `tools/stage2_raw_sample.txt` + `.gitignore` | 恢复被 ignore 掉的测试夹具 |
+| `SESSION_CHANGES.md` / `CHANGELOG.md` / `AGENTS.md` | 记录 |
+
+#### 接口变更
+无。`upsert_entry` 的 `file_path → entry_id` 变更属**别人未提交的重构**，
+本会话未采纳、未代为提交。
+
+#### 冲突风险 ⚠️
+- **`tests/unit/test_storage_dualwrite.py` 正被另一会话写入**，本会话一度改过
+  9 处 `file_path → entry_id`，已确认不再触碰，避免互相覆盖
+- `tools/stage2_raw_sample.txt` 原被 `.gitignore` 排除，导致
+  `test_json_validator.py` 在 CI 上必然失败；已解除忽略并加注释放说明它是夹具
+- 剩余 32 项基线中 `test_mt5_clock_skew` 的 2 项在 CI（Linux）上会 skip，
+  基线留着无害（skip 不计入 FAILED）
+
 ### 2026-10-05 · CI 只跑单元测试（当前）
 
 **状态**：进行中

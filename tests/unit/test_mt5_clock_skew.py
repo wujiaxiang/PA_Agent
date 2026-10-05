@@ -5,7 +5,19 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+
+def _require_mt5() -> None:
+    """MetaTrader5 是 win32 专属包（pyproject 里 `sys_platform == 'win32'`）。
+
+    Linux 上必然没有，而 CI 现在跑的就是 ubuntu。`patch("MetaTrader5.xxx")`
+    要求真实模块可导入，所以缺依赖时必须 skip —— 否则整个模块收集期就崩，
+    连**不依赖 MT5** 的那条倒计时用例也一起丢掉。
+    """
+    pytest.importorskip("MetaTrader5", reason="MetaTrader5 仅 Windows 可用")
+
 from pa_agent.data.bar_close_wait import seconds_until_bar_closes
+
+
 def test_countdown_inflates_when_local_lags_server_by_3h() -> None:
     """Reproduce Hantec-style skew: bar ts from MT5, now from Windows 3h behind."""
     offset_ms = 3 * 3600 * 1000
@@ -23,6 +35,7 @@ def test_countdown_inflates_when_local_lags_server_by_3h() -> None:
 
 
 def test_mt5_server_time_ms_prefers_time_msc() -> None:
+    _require_mt5()
     from pa_agent.data.mt5 import MT5Source
 
     src = MT5Source()
@@ -38,6 +51,7 @@ def test_mt5_server_time_ms_prefers_time_msc() -> None:
 
 
 def test_mt5_server_time_ms_falls_back_to_time_seconds() -> None:
+    _require_mt5()
     from pa_agent.data.mt5 import MT5Source
 
     src = MT5Source()
@@ -53,6 +67,7 @@ def test_mt5_server_time_ms_falls_back_to_time_seconds() -> None:
 
 
 def test_mt5_server_time_ms_returns_none_when_disconnected() -> None:
+    _require_mt5()
     from pa_agent.data.mt5 import MT5Source
 
     src = MT5Source()

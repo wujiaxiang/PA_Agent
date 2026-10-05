@@ -33,6 +33,21 @@ python tools/ci_diff_baseline.py \
 - 更糟：基线里没删掉的项，一旦同名用例再次失败会被当存量放过
 
 所以本脚本会把「基线里已不存在于本次结果」的项单独报出来，提醒清理。
+
+## 只解析 short test summary 段（不要全文扫）
+
+2026-10-05 实测踩坑：原先对整个日志跑 `^(FAILED|ERROR)\\s+(\\S+)`，结果
+**Captured log 段里的应用日志行也会命中**，例如
+
+```
+ERROR    web.api.routes_data:routes_data.py:451 experience browse: store unreadable
+```
+
+被当成名为 `web.api.routes_data:routes_data.py:451` 的测试 → 报成「新增回归」。
+应用日志里出现 ERROR 是**正常运行的一部分**，与测试是否失败无关。
+
+因此改为**只解析 `short test summary info` 段**，并且要求条目形如
+`<路径>::<用例>`（或纯路径）—— 两者都能排除日志行。
 """
 from __future__ import annotations
 
@@ -41,19 +56,37 @@ import re
 import sys
 from pathlib import Path
 
-# pytest 输出里 "FAILED path::test - reason" / "ERROR path::test"
+# pytest 的 "FAILED path::test - reason" / "ERROR path::test"
 _RESULT_RE = re.compile(r"^(FAILED|ERROR)\s+(\S+)")
+# 汇总段起止标记。-q 下可能是 "=== short test summary info ==="（含前后 ===）
+_SUMMARY_START = re.compile(r"^=+.*short test summary info.*=+$")
+# 真实用例条目一定带路径分隔符或 ::；应用日志行（Captured log 段）不会
+_NODE_SHAPE = re.compile(r"^[\w./\\-]+\.py::|^[\w./\\-]+\.py$|^[\w./\\-]+\.py\s")
 
 
 def parse_results(log_path: Path) -> set[str]:
-    """从 pytest 输出里抽出失败项的 `文件::用例` 全名。"""
+    """从 pytest 输出里抽出失败项的 `文件::用例` 全名。
+
+    **只解析 `short test summary info` 段**。整份日志里还有 Captured log 段，
+    应用的 ERROR 日志行会被旧正则误当成失败项（见模块 docstring）。
+    """
     if not log_path.is_file():
         print(f"[baseline] 找不到 pytest 输出：{log_path}", file=sys.stderr)
         return set()
     found: set[str] = set()
+    in_summary = False
     for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        m = _RESULT_RE.match(line)
-        if m:
+        if _SUMMARY_START.match(line.strip()):
+            in_summary = True
+            continue
+        # 汇总段结束：遇到新的 === 标题（且不是 summary 本身）
+        if in_summary and re.match(r"^=+ .* =+$", line.strip()):
+            in_summary = False
+            continue
+        if not in_summary:
+            continue
+        m = _RESULT_RE.match(line.strip())
+        if m and _NODE_SHAPE.match(m.group(2)):
             found.add(m.group(2))
     return found
 

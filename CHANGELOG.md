@@ -147,6 +147,48 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 30. 修 CI 基线的两个自伤缺陷（误报 + 基线取自脏工作区）
+
+上一条把 E2E 与单测接进 CI 后排查 72 项失败，发现主体来自**别人未提交的重构**，
+转而修自己上一轮引入的两个问题。
+
+- **`ci_diff_baseline.py` 把应用日志误当测试失败**
+  - 原正则 `^(FAILED|ERROR)\s+(\S+)` 全文扫描，会命中 **Captured log 段**：
+    `ERROR    web.api.routes_data:routes_data.py:451 experience browse: store unreadable`
+    被当成名为 `web.api.routes_data:routes_data.py:451` 的测试 → 报成「新增回归」
+  - 应用日志里出现 ERROR 是正常运行的一部分，与测试成败无关
+  - **修复**：只解析 `short test summary info` 段 + 校验条目形如 `路径.py::用例`（双重约束）
+  - 反向验证：注入伪造日志行后解析结果不变
+- **基线取自脏工作区（更严重）**
+  - 原基线 102 项；用 `git archive HEAD` 导出纯净树复测，**HEAD 上只有 32 项失败**
+  - 多出的 **40 项全部来自别人未提交的经验库重构**，被当成「已知失败」记入
+  - 后果：**CI 对这 40 项真实回归保持绿灯**，基线替未完成的代码背了书
+  - **修复**：基线按纯净 HEAD 重建（102 → 32），文件头写明生成方式必须用
+    `git archive HEAD` 导出干净树，禁止用脏工作区
+  - 双向验证：HEAD 上 exit 0；脏工作区上 exit 1 并精确点名那 40 项
+  - 讽刺之处：上一条修的正是「假绿灯」，却用同样的方式重新造了一遍
+- **顺带修好的低风险项**
+  - `test_mt5_clock_skew.py`：MT5 是 win32 专属包，CI 跑 ubuntu 必缺 → 逐用例
+    `importorskip`（模块级会连带丢掉那条**不依赖 MT5** 的倒计时用例）
+  - `test_cursor_sdk_client.py`：`cursor-sdk` 是可选 extra，缺则 skip
+  - `tools/stage2_raw_sample.txt`：被 `.gitignore` 排除，而
+    `test_json_validator.py` 把它当夹具读 → **CI 上必然失败**。已恢复该文件
+    （从 `fb50037` 取回）、解除忽略、加注释放说明它是夹具而非诊断输出
+
+- **查明但未处理（属他人未提交重构，非本会话范围）**
+  - `experience_repo.upsert_entry` 的 `file_path → entry_id` 改造**完全在未提交
+    工作区**（`git log -S` 无对应 commit）
+  - `pa_agent/storage/importer.py:148` 仍传 `file_path=` —— **真实生产 bug**：
+    经 `web/server.py:119 → import_all()` 每次启动触发，被宽 `except` 吞成一行
+    WARNING，`import_trade_records()` 永不执行
+  - `ExperienceWriter.save()` 返回 `Path → str`、`_read_top5_from_files` 已删、
+    `EXPERIENCE_DIR` 已删、`schema.sql` 未重新生成
+  - 另一会话诊断期间仍在实时改动这些文件，故未代为修改
+
+- **文件**：`tools/ci_diff_baseline.py`、`tests/ci/baseline_failures.txt`、
+  `tests/unit/test_mt5_clock_skew.py`、`tests/unit/test_cursor_sdk_client.py`、
+  `tools/stage2_raw_sample.txt`（恢复）、`.gitignore`
+
 ### 29. CI 的 test job 从「假绿灯」改为真跑单元测试
 
 用户要求 CI 只跑单元测试。动手前先查现状，发现一个必须先说的问题。
