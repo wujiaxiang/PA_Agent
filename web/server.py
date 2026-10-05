@@ -84,6 +84,17 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Failed to start experience scheduler: %s", exc)
 
+    # Periodic GC: in-memory session registry + chat sessions + expired DB rows.
+    # 前三者（注册表 sweep / sessions.purge_expired / 孤儿 chat_turns 清理）此前
+    # **有实现、无任何生产调用者** —— 见 web/api/storage_gc.py 模块 docstring。
+    # 放在 lifespan 启动而非分析主路径：清理撞 SQLite 写锁会让用户的分析多等 5s。
+    try:
+        from web.api import storage_gc
+
+        storage_gc.start(ctx)
+    except Exception as exc:
+        logger.warning("Failed to start storage GC: %s", exc)
+
     # K 线实时推送已改为**前端按自己游标轮询** /api/bars（见 docs/REMAINING_PLAN.md
     # 的评审裁决）：原 SSE 后台广播从全局订阅取数并推给所有连接，多标签页下
     # 所有人收到同一条数据流；而原生 EventSource 又带不了 X-Session-Id，服务端
@@ -121,6 +132,12 @@ async def lifespan(app: FastAPI):
         from web.api import experience_scheduler
 
         experience_scheduler.stop()
+    except Exception:
+        pass
+    try:
+        from web.api import storage_gc
+
+        storage_gc.stop()
     except Exception:
         pass
     try:
@@ -314,7 +331,9 @@ async def health():
     heartbeat has run yet, returns ``"starting"`` so callers can retry.
 
     Also surfaces storage-layer state: 存储层是索引层，故障时数据仍可从文件
-    读取，但让运维能一眼看出「DB 已降级」而不是静默变慢。
+    读取，但让运维能一眼看出「DB 已降级」而不是静默变慢。``storage.gc`` 暴露
+    周期性清理（``web.api.storage_gc``）的运行状态与最近一轮各清了多少 ——
+    清理静默失效与没有清理在外部表现上完全一样。
     """
     report = getattr(app.state, "last_health_report", None)
     storage: dict[str, Any] = {}
@@ -331,6 +350,14 @@ async def health():
         }
     except Exception as exc:  # noqa: BLE001
         storage = {"error": str(exc)}
+    # GC：清理静默失效与「没有 GC」表现完全一样（数据照涨），故必须可观测 ——
+    # running / interval_s / next_run_at / last（各清了多少 + errors + skipped）。
+    try:
+        from web.api import storage_gc
+
+        storage["gc"] = storage_gc.status()
+    except Exception as exc:  # noqa: BLE001
+        storage["gc"] = {"error": str(exc)}
     if report is None:
         return {"status": "starting", "storage": storage}
     return {"status": report["status"], "storage": storage}

@@ -13,6 +13,17 @@
 
 **为什么不把会话塞进 Redis**：见 ``docs/SESSION_STORAGE_DESIGN.md`` §1。
 本表提供持久快照，热层提供 Redis 语义，外部依赖为零。
+
+**TTL 的续期口径（2026-10-05 核实，只登记）**：``expires_at`` 由
+:func:`ensure_session` / :func:`touch_session` / :func:`set_cursor` /
+:func:`set_view_state` 续期，而生产路径里**只有** ``POST /api/subscribe``
+（``routes_data`` → :func:`set_cursor`）真的在调。``session_ctx.bind_session()``
+（每个请求都续期的正路）**没有任何生产调用者**。后果：一个订阅后一直挂着不
+再切品种的 tab，其快照行会在 30 分钟后被 ``get_session()`` 视作不存在
+（回落全局 settings），随后被 :func:`purge_expired` 真正删掉。这**不影响正在
+使用的会话**（读侧早已把它当不存在），只影响「进程重启后还能不能恢复游标」，
+且与内存热层的 30 分钟 TTL 行为一致。修法是在请求路径上补一次续期调用
+（不在本轮写集内）。
 """
 from __future__ import annotations
 
@@ -173,7 +184,13 @@ def drop_session(session_id: str) -> bool:
 def purge_expired() -> int:
     """删除已过期快照（**只删 ``sessions`` 表**），返回删除行数。
 
-    由 housekeeping 周期调用。
+    由 :mod:`web.api.storage_gc` 的守护线程周期调用（每 10 分钟一轮；
+    ``/api/health`` 的 ``storage.gc.last.sessions_purged`` 可见其计数）。
+
+    **删除是安全的**：``get_session()`` 早已把 ``expires_at <= now`` 的行当
+    「不存在」（惰性过期，与 Redis 一致），故本函数只回收**任何读者都已经
+    看不见**的行 —— 它不会让一个还在用的会话凭空消失。真正的 TTL 是 30 分钟
+    （:data:`DEFAULT_TTL_S`），不是清理间隔。
 
     **它不删 ``chat_turns``。** 这一点被反复搞错：``chat_turns`` 里存着追问
     历史（``pa_agent.storage.chat_repo`` 写入），而 ``session_id`` 一列正是
@@ -194,17 +211,20 @@ def purge_for_user_sessions() -> int:
     """删除孤儿追问记录（``chat_turns``）：其 session_id 已不在 sessions 表中。
 
     chat_turns 是 L2 持久数据，但按 session 隔离线程。会话过期后这些行
-    不该无限堆积 —— 按 TTL 保留一段时间后再清。
+    不该无限堆积 —— 按 TTL 保留一段时间后再清（当前实现：7 天，见下方 SQL）。
 
     **必须在 :func:`purge_expired` 之后调用**：本函数的判定是
     ``session_id NOT IN (SELECT session_id FROM sessions)``，而
     ``purge_expired`` 才是把过期行从 ``sessions`` 里拿掉的那一步。反过来
-    （先清本函数）时行还在 ``sessions`` 里，永远判不出孤儿。
+    （先清本函数）时行还在 ``sessions`` 里，永远判不出孤儿 —— 表现为
+    「每轮都清 0 条」而非报错，极易被误读成「这轮没东西可清」。
+    :mod:`web.api.storage_gc` 的 ``run_once()`` 把这两步放在同一分支内按序
+    执行，并由单测 ``tests/unit/test_storage_gc.py`` 守护这个顺序。
 
-    **已知缺陷（2026-10-05 核实，本次只登记不修）**：本函数与
-    :func:`purge_expired` 目前**都没有生产调用者**（仅被单测覆盖），
-    整条清理链尚未接入任何调度器。因此 ``chat_turns`` 在调度器补上之前
-    只增不减。补调度点需要改 ``web/server.py``（lifespan），不在本轮写集内。
+    **返回值是 0/1 而非行数**：``hub.execute()`` 只回答「这次 DELETE 有没有
+    成功执行」。拿它当「清了多少条」看会得到恒为 0 或 1 的假象，故 GC 的
+    可观测字段叫 ``chat_turns_purged``（本次是否执行成功）而非
+    ``chat_turns_deleted``。
     """
     hub = get_hub()
     res = hub.execute(
