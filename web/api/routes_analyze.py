@@ -385,6 +385,7 @@ def _run_analysis(
     loop,
     incremental: bool = False,
     continuous: bool = False,
+    session_id: str = "",
 ):
     """Run the two-stage pipeline (synchronous) and push events to *event_queue*.
 
@@ -393,16 +394,25 @@ def _run_analysis(
     ``previous_record`` to the orchestrator. The orchestrator then routes
     Stage 1 through ``build_incremental_stage1`` so the AI sees the prior
     conclusion as context and only reasons about newly-closed bars.
+
+    *session_id* 解析本次请求属于哪个标签页：游标与增量锚点都按会话取，
+    不读全局 settings —— 否则 A tab 看 NVDA 而全局为 BTCUSDT 时，A 的增量
+    分析会捞到 BTCUSDT 的上一轮上下文喂给模型（跨标的串味）。
+    空 session_id 时回落到全局 settings，行为与改造前一致。
     """
     # *loop* is the main-thread event loop, passed from analyze_stream
 
     try:
+        from web.api.session_ctx import resolve_view
+
+        view_symbol, view_timeframe, view_exchange = resolve_view(ctx, session_id)
+
         bars_raw = ctx.data_source.latest_snapshot(bar_count)
         now_ms = int(time.time() * 1000)
         frame = build_display_frame(
             bars_raw, bar_count,
-            ctx.settings.general.last_symbol,
-            ctx.settings.general.last_timeframe,
+            view_symbol,
+            view_timeframe,
             now_ms=now_ms,
         )
 
@@ -414,11 +424,11 @@ def _run_analysis(
         incremental_new_bar_count: int | None = None
         if incremental:
             try:
-                symbol = ctx.settings.general.last_symbol
-                timeframe = ctx.settings.general.last_timeframe
-                exchange = getattr(
-                    ctx.settings.general, "last_tradingview_exchange", ""
-                ) or ""
+                # 游标与 frame 用的是同一组 view_* —— 锚点与数据必须同标的，
+                # 否则增量上下文会串到别的品种上。
+                symbol = view_symbol
+                timeframe = view_timeframe
+                exchange = view_exchange
                 previous_record = find_latest_successful_record(
                     symbol=symbol, timeframe=timeframe, exchange=exchange
                 )
@@ -541,12 +551,16 @@ async def analyze_stream(
 ):
     """SSE endpoint — triggers two-stage analysis and streams every event."""
     ctx = request.app.state.ctx
+    from web.api.session_ctx import session_id_of
+
+    session_id = session_id_of(request)
     event_queue: asyncio.Queue = asyncio.Queue()
 
     # Kick off analysis in thread pool
     loop = asyncio.get_running_loop()
     loop.run_in_executor(
-        _executor, _run_analysis, ctx, bar_count, event_queue, loop, False, continuous
+        _executor, _run_analysis, ctx, bar_count, event_queue, loop, False,
+        continuous, session_id,
     )
 
     async def event_generator():
@@ -582,18 +596,14 @@ async def analyze_incremental_stream(
     analysis transparently.
     """
     ctx = request.app.state.ctx
+    from web.api.session_ctx import resolve_view, session_id_of
+
+    session_id = session_id_of(request)
     # Fast-fail when no prior record exists: 404 with a clear message so the
     # frontend can fall back to a full analysis call without paying the
     # thread-pool dispatch cost. (Frontend already disables the button via
     # /api/records?limit=1 precheck, so this is a defensive double-check.)
-    try:
-        symbol = ctx.settings.general.last_symbol
-        timeframe = ctx.settings.general.last_timeframe
-        exchange = getattr(ctx.settings.general, "last_tradingview_exchange", "") or ""
-    except AttributeError:
-        symbol = ""
-        timeframe = ""
-        exchange = ""
+    symbol, timeframe, exchange = resolve_view(ctx, session_id)
     previous_record = None
     if symbol and timeframe:
         try:
@@ -619,6 +629,7 @@ async def analyze_incremental_stream(
         loop,
         True,  # incremental=True
         continuous,
+        session_id,
     )
 
     async def event_generator():

@@ -387,7 +387,44 @@ class ExperienceWriter:
             "experience written: status=%s cycle=%s %s %s -> %s",
             status, cycle_position, symbol, timeframe, dst.name,
         )
+        self._mirror_to_sqlite(content, cycle_position, status, symbol, timeframe, dst)
         return dst
+
+    def _mirror_to_sqlite(
+        self,
+        content: dict[str, Any],
+        cycle_position: str,
+        status: str,
+        symbol: str,
+        timeframe: str,
+        path: Path,
+    ) -> None:
+        """把刚落盘的案例同步一份到 SQLite（索引层）。
+
+        写在 ``_write`` **之后**而非之前：文件是权威副本，索引层失败绝不能让
+        案例丢失。任何异常只记 warning，不冒泡 —— ``_write`` 的调用方是分析主流程
+        与后台结算调度器，异常会中断写入链。
+
+        状态流转（pending → success/failure）会自然变成同一 ``entry_id`` 的
+        UPDATE：``_write`` 在流转时沿用原文件名，故不会产生重复行。
+        """
+        try:
+            from pa_agent.storage.experience_repo import upsert_entry
+
+            upsert_entry(
+                content,
+                cycle_position=cycle_position,
+                status=status,
+                symbol=symbol,
+                timeframe=timeframe,
+                file_path=path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning(
+                "experience SQLite mirror failed for %s (file already saved): %s",
+                path.name,
+                exc,
+            )
 
 
 def evaluate_outcome(

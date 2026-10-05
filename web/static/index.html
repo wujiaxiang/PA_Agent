@@ -9,7 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="/css/style.css?v=38">
+<link rel="stylesheet" href="/css/style.css?v=39">
 </head>
 <body>
 
@@ -92,6 +92,10 @@
       <div id="history-popover" class="history-popover hidden">
         <div class="history-popover-header">
           <span>历史分析记录</span>
+          <label class="history-scope-toggle" title="历史记录是跨标签页共享的（用户级数据）。勾选后可浏览所有品种的分析结果，而不只是当前订阅的标的。">
+            <input type="checkbox" id="chk-history-all-symbols">
+            <span>全部品种</span>
+          </label>
           <button id="btn-history-refresh" class="icon-btn" title="刷新">🔄</button>
         </div>
         <div id="history-list" class="history-list">
@@ -688,10 +692,10 @@
 <!-- 下单机会提醒 Toast 容器（固定右下角，Phase E Task 12） -->
 <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
-<script src="/js/api.js?v=3"></script>
+<script src="/js/api.js?v=4"></script>
 <script src="/js/chart.js?v=9"></script>
 <script src="/js/indicators.js?v=5"></script>
 <script src="/js/continuous_gate.js?v=2"></script>
-<script src="/js/app.js?v=62"></script>
+<script src="/js/app.js?v=63"></script>
 </body>
 </html>

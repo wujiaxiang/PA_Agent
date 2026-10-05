@@ -2743,6 +2743,27 @@ button.secondary:hover { background: var(--border); }
   color: var(--text-dim);
   flex-shrink: 0;
 }
+/* 「全部品种」开关：跨标签页浏览共享的历史记录（L2 用户级数据） */
+.history-scope-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+  margin-left: auto;
+  margin-right: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.history-scope-toggle:hover { color: var(--text); }
+/* 跨品种浏览时每条记录必须显示归属标的，否则一堆条目无法区分 */
+.history-item-symbol {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent, #58a6ff);
+  font-family: 'JetBrains Mono', monospace;
+  flex-shrink: 0;
+}
 .history-list {
   overflow-y: auto;
   max-height: 350px;

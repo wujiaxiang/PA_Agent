@@ -110,6 +110,29 @@ class PendingWriter:
                 exc,
             )
 
+    def _mirror_to_sqlite(self, record: AnalysisRecord, data: dict, path: Path) -> None:
+        """把刚写盘的分析记录同步一份到 SQLite（索引层）。
+
+        策略是**写双份**：文件仍是权威副本，SQLite 只做索引/快照。两条硬约束：
+
+        1. **SQLite 写失败绝不能影响文件写**。落盘已成功，这里任何异常都只记
+           warning —— 索引层故障不该让一条分析记录消失（AGENTS.md 已有先例：
+           一次静默失败让整条链路变死）。
+        2. **传脱敏后的 data**，不传原始 record —— 否则 API key 会绕过
+           ``_sanitize`` 进入数据库。``_partial_reason`` 必须带上，否则失败
+           记录会被误标为 ``ok`` 并混入增量分析的锚点候选。
+        """
+        try:
+            from pa_agent.storage.repositories import upsert_record
+
+            upsert_record(record, raw=data, file_path=path)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning(
+                "PendingWriter: SQLite mirror failed for %s (file already saved): %s",
+                path.name,
+                exc,
+            )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -128,6 +151,7 @@ class PendingWriter:
         data = record.model_dump()
         data = self._sanitize(data, self._api_key)
         self._write_json(path, data)
+        self._mirror_to_sqlite(record, data, path)
         try:
             from pa_agent.records.analysis_history import invalidate_latest_record_cache
 
@@ -158,6 +182,7 @@ class PendingWriter:
             data["exception"] = {**data["exception"], "partial_reason": reason}
         data = self._sanitize(data, self._api_key)
         self._write_json(path, data)
+        self._mirror_to_sqlite(record, data, path)
         try:
             from pa_agent.records.analysis_history import invalidate_latest_record_cache
 

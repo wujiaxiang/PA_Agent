@@ -11,6 +11,7 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -73,6 +74,29 @@ async def lifespan(app: FastAPI):
         logger.info("Bars stream background task started successfully")
     except Exception as exc:
         logger.error("Failed to start bars stream background task: %s", exc)
+
+    # ── 存储层（SQLite）+ 会话注册表 ────────────────────────────────────────
+    # 纯增量接入：DB 只是索引/快照层，文件仍是权威副本。任何一步失败都降级
+    # 为纯文件模式并继续启动 —— 绝不让存储层故障导致 K 线出不来。
+    try:
+        from pa_agent.storage.db import get_hub
+        from pa_agent.storage.ephemeral import get_registry
+        from pa_agent.storage.importer import import_all
+
+        hub = get_hub()
+        logger.info("SQLite storage: %s", hub.stats())
+        if hub.disabled:
+            logger.warning(
+                "SQLite unavailable (%s) — running in file-only mode",
+                hub.stats()["disabled_reason"],
+            )
+        else:
+            reg = get_registry()
+            logger.info("Session registry ready (max=%d)", len(reg.all_sessions()))
+            stats = await asyncio.to_thread(import_all)
+            logger.info("Storage import on startup: %s", stats)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Storage layer init failed, continuing file-only: %s", exc)
 
     yield
     # shutdown
@@ -222,11 +246,22 @@ async def health():
 
     Returns cached health status from the background heartbeat task.  If no
     heartbeat has run yet, returns ``"starting"`` so callers can retry.
+
+    Also surfaces storage-layer state: 存储层是索引层，故障时数据仍可从文件
+    读取，但让运维能一眼看出「DB 已降级」而不是静默变慢。
     """
     report = getattr(app.state, "last_health_report", None)
+    storage: dict[str, Any] = {}
+    try:
+        from pa_agent.storage.db import get_hub
+        from pa_agent.storage.ephemeral import get_registry
+
+        storage = {"db": get_hub().stats(), "sessions": len(get_registry().all_sessions())}
+    except Exception as exc:  # noqa: BLE001
+        storage = {"error": str(exc)}
     if report is None:
-        return {"status": "starting"}
-    return {"status": report["status"]}
+        return {"status": "starting", "storage": storage}
+    return {"status": report["status"], "storage": storage}
 
 
 @app.get("/api/health/check")

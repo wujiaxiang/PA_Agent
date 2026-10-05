@@ -575,15 +575,34 @@ def test_list_records_limit_above_maximum_returns_422(tmp_path, monkeypatch):
     assert resp.status_code == 422
 
 
-def test_list_records_missing_required_param_returns_422(tmp_path, monkeypatch):
-    """缺少必填参数返回 422。"""
+def test_list_records_filters_are_optional_for_cross_symbol_browse(tmp_path, monkeypatch):
+    """过滤条件可省略 → 跨全部品种返回（L2 用户级共享历史）。
+
+    契约变更（docs/SESSION_STORAGE_DESIGN.md §2.1）：三个过滤条件曾是必填，
+    导致历史面板只能看到「当前订阅品种」的记录，多标签页互相看不到对方分析
+    出的结果。现在留空即不过滤。
+    """
     monkeypatch.setattr(routes_records, "RECORDS_DIR", tmp_path)
+    _write_record(tmp_path, exchange="GATEIO", symbol="BTCUSDT", timeframe="1d")
+    _write_record(tmp_path, exchange="NASDAQ", symbol="NVDA", timeframe="1h")
     app = _make_app()
     with TestClient(app) as c:
-        resp = c.get("/api/records", params={
-            "exchange": "GATEIO", "symbol": "BTCUSDT",  # 缺 timeframe
-        })
-    assert resp.status_code == 422
+        resp = c.get("/api/records")          # 无任何过滤条件
+    assert resp.status_code == 200
+    symbols = {r["symbol"] for r in resp.json()}
+    assert symbols == {"BTCUSDT", "NVDA"}
+
+
+def test_list_records_partial_filters_still_narrow(tmp_path, monkeypatch):
+    """给了过滤条件时行为与改造前一致：按品种收窄。"""
+    monkeypatch.setattr(routes_records, "RECORDS_DIR", tmp_path)
+    _write_record(tmp_path, exchange="GATEIO", symbol="BTCUSDT", timeframe="1d")
+    _write_record(tmp_path, exchange="NASDAQ", symbol="NVDA", timeframe="1h")
+    app = _make_app()
+    with TestClient(app) as c:
+        resp = c.get("/api/records", params={"symbol": "NVDA"})
+    assert resp.status_code == 200
+    assert {r["symbol"] for r in resp.json()} == {"NVDA"}
 
 
 # ── 删除记录 ──────────────────────────────────────────────────────────────────

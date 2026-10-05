@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,6 +22,8 @@ from pa_agent.records.pending_writer import PendingWriter, _safe_path_segment
 from pa_agent.records.schema import AnalysisRecord
 # 复用 SSE done 事件的序列化逻辑，保证历史记录回看与实时分析字段一致
 from web.api.routes_analyze import _serialize_record
+
+logger = logging.getLogger("pa_agent.web.records")
 
 router = APIRouter(tags=["records"])
 
@@ -116,22 +119,10 @@ def _derive_last_close_bar_iso(record: AnalysisRecord) -> str:
     return ""
 
 
-def _list_records(
-    exchange: str,
-    symbol: str,
-    timeframe: str,
-    limit: int,
-    include_partial: bool,
-) -> list[dict]:
-    """列出指定 (exchange, symbol, timeframe) 下的记录摘要。
-
-    扫描新分区目录和旧平铺布局文件，按 mtime 倒序、去重、截断到 limit。
-    损坏的记录文件被静默跳过。
-    """
-    if not RECORDS_DIR.exists():
-        return []
-
-    # 新分区布局目录
+def _glob_partitioned(
+    exchange: str, symbol: str, timeframe: str, limit: int
+) -> list[Path]:
+    """三个过滤条件齐全时的快路径：直接定位分区目录。行为与改造前一致。"""
     target_dir = (
         RECORDS_DIR
         / _safe_path_segment(exchange)
@@ -156,10 +147,88 @@ def _list_records(
 
     # 按 mtime 倒序
     unique_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-    unique_files = unique_files[:limit]
+    return unique_files[:limit]
+
+
+def _browse_filtered(
+    exchange: str, symbol: str, timeframe: str, limit: int
+) -> list[Path]:
+    """缺任一过滤条件时的路径：SQLite 优先，DB 未命中/不可用则回退全扫描。
+
+    分区目录需要三者齐全才能定位，所以部分过滤（如只给 symbol）无法走
+    ``_glob_partitioned``。SQLite 的索引天然支持可选过滤条件，故优先用它。
+    """
+    from pa_agent.records.analysis_history import list_record_paths, load_record
+
+    # ① SQLite：有索引，跨品种浏览的主要快路径
+    try:
+        from pa_agent.storage.repositories import list_records as db_list
+
+        rows = db_list(
+            exchange=exchange,
+            symbol=symbol,
+            timeframe=timeframe,
+            limit=limit,
+        )
+        paths = [Path(r["file_path"]) for r in rows if r.get("file_path")]
+        paths = [p for p in paths if p.is_file()]
+        if paths:
+            return paths
+    except Exception:  # noqa: BLE001
+        logger.debug("SQLite browse failed, falling back to full scan", exc_info=True)
+
+    # ② 回退：全扫描 + 按记录 meta 过滤（DB 未导入或已降级时）
+    paths = list_record_paths(RECORDS_DIR)
+    if not (exchange or symbol or timeframe):
+        return paths[:limit]
+
+    out: list[Path] = []
+    for p in paths:
+        if len(out) >= limit:
+            break
+        rec = load_record(p)
+        if rec is None:
+            continue
+        meta = rec.meta
+        if exchange and (meta.exchange or "") != exchange:
+            continue
+        if symbol and meta.symbol != symbol:
+            continue
+        if timeframe and meta.timeframe != timeframe:
+            continue
+        out.append(p)
+    return out
+
+
+def _list_records(
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    include_partial: bool,
+) -> list[dict]:
+    """列出记录摘要，按 mtime 倒序、去重、截断到 limit。
+
+    ``exchange``/``symbol``/``timeframe`` **全部可选**：三者皆空时跨全部品种
+    浏览（历史是 L2 用户级共享资产，A tab 分析出的记录 B tab 也要能查到，
+    见 docs/SESSION_STORAGE_DESIGN.md §2.1）。给定过滤条件时行为与改造前一致。
+    损坏的记录文件被静默跳过。
+
+    两条路径：
+    - **三个过滤条件齐全** → 分区目录 glob（既有快路径，行为完全不变）
+    - **缺任意一个** → 无法用分区路径定位，改用 SQLite 索引查询；
+      DB 未命中或不可用时回退全扫描 + 按记录 meta 过滤
+    """
+    if not RECORDS_DIR.exists():
+        return []
+
+    if exchange and symbol and timeframe:
+        candidates = _glob_partitioned(exchange, symbol, timeframe, limit)
+    else:
+        candidates = _browse_filtered(exchange, symbol, timeframe, limit)
 
     result: list[dict] = []
-    for f in unique_files:
+    for f in candidates:
         try:
             with f.open("r", encoding="utf-8") as fp:
                 data = json.load(fp)
@@ -187,6 +256,11 @@ def _list_records(
         result.append({
             "record_id": record_id,
             "timestamp": record.meta.timestamp_local_iso,
+            # 跨品种浏览时前端不知道每条记录属于哪个标的，必须回传这三个字段
+            # —— 否则「历史数据都能看」拿到的是一堆无法区分的条目。
+            "symbol": record.meta.symbol,
+            "timeframe": record.meta.timeframe,
+            "exchange": record.meta.exchange,
             "order_type": s2_decision_inner.get("order_type") if isinstance(s2_decision_inner, dict) else None,
             "direction": s2_decision_inner.get("order_direction") if isinstance(s2_decision_inner, dict) else None,
             "terminal_outcome": _terminal_outcome(s2),
@@ -204,13 +278,18 @@ def _list_records(
 
 @router.get("/records")
 async def list_records(
-    exchange: str = Query(..., description="交易所，如 GATEIO"),
-    symbol: str = Query(..., description="品种，如 BTCUSDT"),
-    timeframe: str = Query(..., description="周期，如 1d"),
+    exchange: str = Query("", description="交易所，如 GATEIO；留空=不过滤"),
+    symbol: str = Query("", description="品种，如 BTCUSDT；留空=不过滤"),
+    timeframe: str = Query("", description="周期，如 1d；留空=不过滤"),
     limit: int = Query(50, ge=1, le=500, description="返回数量上限"),
     include_partial: bool = Query(False, description="是否包含失败记录"),
 ):
-    """列出指定 (exchange, symbol, timeframe) 下的历史记录摘要。"""
+    """列出历史记录摘要。
+
+    三个过滤条件**均为可选**：留空即跨全部品种返回 —— 历史记录是 L2 用户级
+    共享资产，多标签页必须都能看到全量历史（docs/SESSION_STORAGE_DESIGN.md §2.1）。
+    传入过滤条件时行为与改造前完全一致。
+    """
     # Offloaded: _list_records globs the partitions, stats and JSON-parses every
     # candidate (records embed full stage1+stage2 payloads). Pure blocking file
     # I/O — inline it stalls the event loop and every SSE stream.

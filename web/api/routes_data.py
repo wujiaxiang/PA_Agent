@@ -220,6 +220,27 @@ async def subscribe(req: SubscribeRequest, request: Request):
     from pa_agent.config.settings import save_settings
     await asyncio.to_thread(save_settings, ctx.settings, SETTINGS_JSON_PATH)
 
+    # ── 会话游标（L3）────────────────────────────────────────────────────
+    # 同时写入本 tab 的游标：会话快照 + 内存热层。有了它，切品种不再只是
+    # 改全局订阅 —— 别的 tab 仍读自己的游标（docs/SESSION_STORAGE_DESIGN.md §3）。
+    # 写入失败只记 warning：游标是缓存，丢了回落全局设置即可。
+    try:
+        from web.api.session_ctx import session_id_of
+
+        sid = session_id_of(request)
+        if sid:
+            from pa_agent.storage import sessions as sess_repo
+            from pa_agent.storage.ephemeral import Cursor, get_registry
+
+            get_registry().get_or_create(sid).cursor = Cursor(
+                symbol, timeframe, exchange
+            )
+            sess_repo.set_cursor(
+                sid, symbol=symbol, timeframe=timeframe, exchange=exchange
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("session cursor persist failed: %s", exc)
+
     return {
         "status": "subscribed",
         "kind": kind,

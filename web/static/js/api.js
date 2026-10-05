@@ -1,8 +1,39 @@
 // api.js — PA Agent Web API client
 
+// ── 会话身份 ────────────────────────────────────────────────────────────────
+// 每个标签页一个独立会话：UUID 存 sessionStorage，随每次请求带上 X-Session-Id。
+//
+// 为什么必须是 sessionStorage 而不是 Cookie：Cookie 同源共享，同一浏览器的
+// 所有标签页拿到同一个 id，「一个标签页服务自己的 K 线图」直接失效。
+// sessionStorage 的语义天生是「每标签页独立」，且能扛住 F5 刷新。
+//
+// 后端据此隔离游标与增量分析锚点（见 docs/SESSION_STORAGE_DESIGN.md §3）。
+// 缺失或非法时后端回落到全局设置，行为与改造前一致。
+const SESSION_ID_KEY = 'pa_agent_session_id';
+
+function getSessionId() {
+  try {
+    let id = sessionStorage.getItem(SESSION_ID_KEY);
+    if (!id) {
+      id = (crypto.randomUUID ? crypto.randomUUID()
+                             : 'sid-' + Date.now() + '-' + Math.random().toString(36).slice(2));
+      sessionStorage.setItem(SESSION_ID_KEY, id);
+    }
+    return id;
+  } catch (_) {
+    // 隐私模式 / 禁用 storage：返回空串，后端按「无会话」回落
+    return '';
+  }
+}
+
+function sessionHeaders(extra = {}) {
+  const sid = getSessionId();
+  return sid ? { ...extra, 'X-Session-Id': sid } : extra;
+}
+
 const API = {
   async get(endpoint) {
-    const r = await fetch(endpoint, { cache: 'no-cache' });
+    const r = await fetch(endpoint, { cache: 'no-cache', headers: sessionHeaders() });
     if (!r.ok) throw new Error(await r.text());
     return r.json();
   },
@@ -10,7 +41,7 @@ const API = {
   async put(endpoint, body) {
     const r = await fetch(endpoint, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: sessionHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(body),
     });
     if (!r.ok) throw new Error(await r.text());
@@ -22,7 +53,7 @@ const API = {
   async post(endpoint, body, options = {}) {
     const opts = {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: sessionHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(body),
     };
     const timeoutMs = options.timeout || 15000;
@@ -57,7 +88,7 @@ const API = {
   },
 
   async delete(endpoint) {
-    const r = await fetch(endpoint, { method: 'DELETE' });
+    const r = await fetch(endpoint, { method: 'DELETE', headers: sessionHeaders() });
     if (!r.ok) {
       const err = new Error(await r.text());
       err.status = r.status;
@@ -70,7 +101,10 @@ const API = {
   sse(endpoint) {
     const controller = new AbortController();
     const source = (async function* () {
-      const r = await fetch(endpoint, { signal: controller.signal });
+      const r = await fetch(endpoint, {
+        signal: controller.signal,
+        headers: sessionHeaders(),
+      });
       if (!r.ok) throw new Error(await r.text());
       const reader = r.body.getReader();
       const decoder = new TextDecoder();

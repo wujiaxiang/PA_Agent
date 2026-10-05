@@ -697,6 +697,14 @@ function bindEvents() {
       loadHistoryList();
     });
   }
+  // 「全部品种」开关：切到跨品种浏览（历史是 L2 用户级共享数据，多标签页通用）
+  const chkHistAll = $('#chk-history-all-symbols');
+  if (chkHistAll) {
+    chkHistAll.addEventListener('click', (e) => {
+      e.stopPropagation();
+      loadHistoryList();
+    });
+  }
   // 返回实时按钮：清除回看状态，隐藏 badge，切回 stream tab
   const btnBack = $('#btn-live');
   if (btnBack) {
@@ -4864,23 +4872,38 @@ function updateStreamStats() {
 }
 
 // ── 历史分析记录（回看 / replay） ─────────────────────────────────────
-// 加载当前 (exchange, symbol, timeframe) 的最近 50 条历史分析记录并渲染到 popover 列表
+// 默认加载当前 (exchange, symbol, timeframe) 的最近 50 条历史分析记录。
+//
+// 「全部品种」模式：历史记录是 **L2 用户级共享数据** —— 一个标签页分析出的
+// 记录，另一个标签页也应当能看到（docs/SESSION_STORAGE_DESIGN.md §2.1）。
+// 勾选后请求不带任何过滤条件，后端跨全部品种返回。
+//
+// 注意：过滤条件必须「三者齐全或三者皆空」。只传 symbol 无法用分区目录定位，
+// 后端会退化成全扫描，比默认路径慢 —— 故部分过滤不作为 UI 选项暴露。
 async function loadHistoryList() {
   try {
-    const exchange = $('#ds-exchange').value || currentSettings?.general?.last_tradingview_exchange || '';
-    const symbol = $('#ds-symbol').value || currentSettings?.general?.last_symbol || 'BTCUSDT';
-    const timeframe = $('#ds-timeframe').value || currentSettings?.general?.last_timeframe || '1d';
-    if (!exchange || !symbol || !timeframe) return;
-    const data = await API.get(`/api/records?exchange=${encodeURIComponent(exchange)}&symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=50`);
-    renderHistoryList(data || []);
+    const browseAll = !!$('#chk-history-all-symbols')?.checked;
+    let url;
+    if (browseAll) {
+      url = '/api/records?limit=50';
+    } else {
+      const exchange = $('#ds-exchange').value || currentSettings?.general?.last_tradingview_exchange || '';
+      const symbol = $('#ds-symbol').value || currentSettings?.general?.last_symbol || 'BTCUSDT';
+      const timeframe = $('#ds-timeframe').value || currentSettings?.general?.last_timeframe || '1d';
+      if (!exchange || !symbol || !timeframe) return;
+      url = `/api/records?exchange=${encodeURIComponent(exchange)}&symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=50`;
+    }
+    const data = await API.get(url);
+    renderHistoryList(data || [], { showSymbol: browseAll });
   } catch (e) {
     console.error('loadHistoryList:', e);
-    renderHistoryList([]);
+    renderHistoryList([], { showSymbol: false });
   }
 }
 
 // 渲染历史记录列表项到 popover
-function renderHistoryList(records) {
+function renderHistoryList(records, opts = {}) {
+  const showSymbol = !!opts.showSymbol;
   const list = $('#history-list');
   if (!list) return;
   if (!records.length) {
@@ -4895,12 +4918,17 @@ function renderHistoryList(records) {
     const closeBarTime = r.last_close_bar_iso
       ? new Date(r.last_close_bar_iso).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
       : '';
+    // 跨品种浏览时必须显示归属标的，否则一堆条目无法区分
+    const symbolBadge = showSymbol && r.symbol
+      ? `<span class="history-item-symbol">${escapeHtml(r.symbol)}·${escapeHtml(r.timeframe || '')}</span>`
+      : '';
     // 增量分析 / 持续分析标识
     const tags = [];
     if (r.incremental) tags.push('<span class="history-tag history-tag-incremental">增量</span>');
     if (r.continuous) tags.push('<span class="history-tag history-tag-continuous">持续</span>');
     const tagsHtml = tags.join('');
     return `<div class="history-item" data-record-id="${recordId}">
+      ${symbolBadge}
       <span class="history-item-time">${escapeHtml(time)}</span>
       ${closeBarTime ? `<span class="history-item-close-bar">📍 ${escapeHtml(closeBarTime)}</span>` : ''}
       ${tagsHtml}
