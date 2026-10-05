@@ -2770,6 +2770,20 @@ button.secondary:hover { background: var(--border); }
   font-family: 'JetBrains Mono', monospace;
   flex-shrink: 0;
 }
+/* 交易所标注：同名同周期的标的分属不同交易所（NVDA 在 NASDAQ 与 GATEIO 下
+   都有），不标出来条目无法分辨。视觉权重必须**低于**标的本身 —— 它是消歧信息，
+   不是主信息，故用既有 --text-dim + --border + 3px 圆角（沿用 .history-tag 的
+   形状语汇），不新造配色。 */
+.history-item-exchange {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-dim);
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
 .history-list {
   overflow-y: auto;
   max-height: 350px;

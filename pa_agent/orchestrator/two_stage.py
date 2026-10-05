@@ -217,8 +217,17 @@ def _build_empty_record(
     incremental: bool = False,
     continuous: bool = False,
     user_id: str = "",
+    exchange: str = "",
 ) -> AnalysisRecord:
-    """Build a partial AnalysisRecord with meta populated from the frame."""
+    """Build a partial AnalysisRecord with meta populated from the frame.
+
+    *exchange* 必须由调用方显式传入**本次分析实际使用的交易所**（Web 层由
+    `resolve_view(ctx, session_id)` 给出，即本会话游标）。留空时才回落
+    ``settings.general.last_tradingview_exchange`` —— 那是
+    ``routes_settings._CURSOR_FIELDS`` 标注的**只读冻结值**：`POST /api/subscribe`
+    早已不再更新它，读它拿到的是上一次某人订阅时的残留值，于是用户订阅
+    NASDAQ/NVDA 却被记成 GATEIO，历史弹窗按三元组过滤自然一条都查不到。
+    """
     ts_ms = now_local_ms()
     ts_iso = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat(timespec="milliseconds")
 
@@ -252,9 +261,16 @@ def _build_empty_record(
             getattr(settings.general, "decision_stance", "conservative")
         )
 
-    exchange = ""
-    if settings is not None:
-        exchange = str(getattr(settings.general, "last_tradingview_exchange", "") or "")
+    # 落库的 exchange：显式入参优先（会话游标），否则回落全局冻结值。
+    # 桌面 GUI 不传该参数，行为与改造前逐字一致。
+    if exchange:
+        exchange = str(exchange)
+    else:
+        exchange = ""
+        if settings is not None:
+            exchange = str(
+                getattr(settings.general, "last_tradingview_exchange", "") or ""
+            )
 
     # Derive last_close_bar_iso from the first *closed* bar's ts_open.
     #
@@ -436,6 +452,7 @@ class TwoStageOrchestrator:
         incremental: bool = False,
         continuous: bool = False,
         user_id: str = "",
+        exchange: str = "",
     ) -> AnalysisRecord:
         """Run the two-stage analysis pipeline and return an AnalysisRecord.
 
@@ -452,6 +469,11 @@ class TwoStageOrchestrator:
             Token checked before each stage and after each API call.
         on_event:
             Callback invoked with OrchestratorEvent values.
+        exchange:
+            本次分析实际使用的交易所，**直接落进** ``record.meta.exchange``。
+            必须由调用方传「本次请求的」交易所（Web 层用
+            ``resolve_view(ctx, session_id)``），不能让它回落全局冻结值 ——
+            否则记录带上的是上一次订阅残留的交易所。留空 = 沿用旧行为。
 
         Returns
         -------
@@ -462,6 +484,7 @@ class TwoStageOrchestrator:
         record = _build_empty_record(
             frame, self._settings,
             incremental=incremental, continuous=continuous, user_id=user_id,
+            exchange=exchange,
         )
 
         # ── Step 2: Pre-Stage-1 cancel check ─────────────────────────────────

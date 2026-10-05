@@ -61,6 +61,16 @@ def upsert_record(
     ``raw`` 是磁盘 JSON 的原始 dict（含 ``_partial_reason``）。未提供时从
     record 序列化 —— 注意那样会丢掉 ``_partial_reason``，status 会被记成
     ok/error，故双写路径必须传 raw。
+
+    ## ``user_id`` 必须显式传，且**必须**出现在 ``ON CONFLICT`` 的列清单里
+
+    ``record_id`` 是文件 stem，同名复用时走 DO UPDATE 分支。而该分支的列
+    清单**曾经不含** ``user_id`` —— 归属只在 INSERT 时生效。后果：一条先以
+    admin 身份落库、随后被非 admin 用户复写的记录，归属会**永远卡在 admin**，
+    用户看到的仍然是一份空列表。写入方对「这条属于我」的声明必须能改写既有行。
+
+    默认值 ``DEFAULT_USER_ID`` 保留给**一次性导入/播种**路径（那些地方确实
+    不知道归属）；生产写入方（``PendingWriter._mirror_to_sqlite``）必须传。
     """
     if record is None:
         return False
@@ -93,6 +103,7 @@ def upsert_record(
              payload_json, file_path, created_at, updated_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(record_id) DO UPDATE SET
+            user_id=excluded.user_id,
             status=excluded.status,
             incremental=excluded.incremental,
             continuous=excluded.continuous,
@@ -195,11 +206,36 @@ def find_latest_successful_record_db(
 
 
 def delete_record(record_id: str, *, user_id: str = DEFAULT_USER_ID) -> bool:
-    """删除 DB 副本。磁盘文件由调用方处理（保持既有 DELETE 语义）。"""
-    return get_hub().execute(
+    """删除 DB 副本。磁盘文件由调用方处理（保持既有 DELETE 语义）。
+
+    返回值是「**确实删掉了行**」而不是「SQL 执行成功」—— 走
+    ``DatabaseHub.execute_count``。``execute()`` 在 0 行匹配时同样返回 True，
+    把它直接当「删干净了」上报，会让跨用户删除（``WHERE user_id`` 不匹配）
+    在接口上显示成 ``db_deleted: true``，而索引行原封不动地留着 —— 接口
+    撒谎比删不掉更难排查。
+
+    返回类型仍是 ``bool``（不是 ``(ok, rows_deleted)`` 元组）：全仓调用方与
+    既有断言都按 ``is True`` 用，改成元组是一次跨模块的契约变更，收益仅是
+    多暴露一个本端点用不上的数字。需要行数的调用方改用
+    ``get_hub().execute_count(...)`` 即可。
+    """
+    rows = get_hub().execute_count(
         "DELETE FROM analysis_records WHERE record_id = ? AND user_id = ?",
         (record_id, user_id),
     )
+    if rows is None:
+        logger.warning(
+            "delete_record failed for %s (DB degraded? user_id=%s)", record_id, user_id
+        )
+        return False
+    if rows == 0:
+        # 0 行匹配有两种同形的原因：归属不匹配，或行本来就不存在。两者都不该
+        # 上报成「删掉了」，故此处与「执行失败」同样返回 False。
+        logger.info(
+            "delete_record matched 0 rows for %s (user_id=%s) — nothing removed",
+            record_id, user_id,
+        )
+    return rows > 0
 
 
 def db_has_records(*, user_id: str = DEFAULT_USER_ID) -> bool:

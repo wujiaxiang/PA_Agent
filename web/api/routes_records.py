@@ -431,13 +431,67 @@ def _validate_record_id(record_id: str) -> Path:
     return target
 
 
-@router.delete("/records/{record_id:path}")
-async def delete_record(record_id: str):
-    """删除单条记录：**先删文件，再删 SQLite 索引行**。
+def _delete_target_is_owned(record_id: str, target: Path, user_id: str) -> bool:
+    """删除前判归属：这条记录是不是 ``user_id`` 自己的？
 
-    成功返回 ``{ok: true, record_id, db_deleted: bool}``；文件不存在返回 404；
-    record_id 含路径遍历或绝对路径返回 400；文件删不掉返回 500（此时**索引行
-    一定还在**，绝不出现「库里有、磁盘上没有」）。
+    与 ``get_record`` 端点共用 ``get_record_detail``（它本身就按
+    ``user_id`` 过滤），所以「读详情」与「删记录」用的是**同一条**归属判据
+    —— 两端点对同一条记录给出不一致的答案本身就是漏洞。
+
+    ## 为什么试着匹配两个 ``file_path`` 字符串
+
+    ``target`` 是 ``_validate_record_id`` 解析过的绝对路径，而库里存的
+    ``file_path`` 是**写入那一刻**的原样字符串。父目录含符号链接时（macOS 的
+    ``/tmp``、部分容器的 bind mount）两者会不同，只认解析后的那一份会让
+    用户**删不掉自己的记录**。两份都认，判据仍严格是 ``user_id`` 相等，
+    不会因此放宽到「认不出来就当自己的」。
+
+    ## 认不出来就是 404，不放行
+
+    反过来（拿不到索引行就默认放行）等于把漏洞原样留下：DB 一抖动、刚播种
+    完没数据、或行落在别的用户名下，全都变成「照删不误」。
+    """
+    from pa_agent.storage.repositories import get_record_detail
+
+    candidates = [str(target)]
+    unresolved = str(RECORDS_DIR / f"{record_id}.json")
+    if unresolved != candidates[0]:
+        candidates.append(unresolved)
+
+    return any(
+        get_record_detail(user_id=user_id, file_path=c) is not None
+        for c in candidates
+    )
+
+
+@router.delete("/records/{record_id:path}")
+async def delete_record(record_id: str, request: Request):
+    """删除单条记录：**先判归属，再删文件，最后删 SQLite 索引行**。
+
+    成功返回 ``{ok: true, record_id, db_deleted: bool}``；文件不存在或不属于
+    当前用户返回 404；record_id 含路径遍历或绝对路径返回 400；文件删不掉返回
+    500（此时**索引行一定还在**，绝不出现「库里有、磁盘上没有」）。
+
+    ## 用户作用域（本参数此前不存在，是真实的越权漏洞）
+
+    签名里**曾经没有** ``request``，于是端点根本拿不到调用者身份：
+
+    1. ``target.unlink()`` 只看路径、不看归属 ⇒ **任何登录用户删得掉别人的记录
+       文件**（含完整 stage1/stage2 推理）；
+    2. ``repo_delete(target.stem)`` 用仓储默认 ``user_id='admin'`` ⇒ 索引行因
+       ``WHERE user_id = 'admin'`` 不匹配而**删不掉**，留下一行死索引行；
+    3. 却回报 ``db_deleted: true`` —— ``hub.execute()`` 返回的是「SQL 执行
+       成功」而不是「删掉了行数」，0 行匹配也是 True。**接口撒谎比删不掉更难
+       排查**，调用方拿它当成功信号就再也不会去核对。
+
+    现在三件事都堵上：``request`` 进签名；删之前用
+    ``get_record_detail(user_id=…, file_path=…)`` 判归属，取不到即 404；
+    ``repo_delete`` 显式收 ``user_id`` 并按**实际命中行数**上报。
+
+    ## 为什么归属判不掉与不存在同形
+
+    都返回 404 + 同一个 detail。区分开等于向探测者确认「这个 id 确实存在，
+    只是不属于你」—— 那本身就是信息泄露（见 ``get_record`` 端点的同款处理）。
 
     ## 为什么是这个顺序
 
@@ -485,6 +539,11 @@ async def delete_record(record_id: str):
     if not target.exists():
         raise HTTPException(status_code=404, detail="record not found")
 
+    # ── 0. 判归属 ────────────────────────────────────────────────────────────
+    # 必须在 unlink **之前**：一旦文件没了，再怎么查都证明不了它属于谁。
+    if not _delete_target_is_owned(record_id, target, _request_user_id(request)):
+        raise HTTPException(status_code=404, detail="record not found")
+
     # ── 1. 先删磁盘文件 ────────────────────────────────────────────────────
     try:
         target.unlink()
@@ -498,11 +557,13 @@ async def delete_record(record_id: str):
     # 即 ``Path.stem`` 作 record_id（见 repositories.py:81）。分区布局下 URL
     # 是 ``GATEIO/BTCUSDT/1d/<stem>``，两者差一段目录 —— 用 record_id 去删
     # 会「删不掉任何行」且无任何报错，正是本函数要消灭的那类静默失败。
-    db_deleted = True
+    db_deleted = False
     try:
         from pa_agent.storage.repositories import delete_record as repo_delete
 
-        db_deleted = bool(repo_delete(target.stem))
+        db_deleted = bool(
+            repo_delete(target.stem, user_id=_request_user_id(request))
+        )
     except Exception:
         # DB 不可用 / 未初始化 / 表不存在：记录本身已从磁盘消失，用户的意图
         # 已达成。**不得因此回 500** —— 那会告诉用户「删除失败」并诱发重试，

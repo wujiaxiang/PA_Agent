@@ -64,6 +64,45 @@ def _build_basename(record: AnalysisRecord) -> str:
     return f"{ts_str}_{ms:03d}_{uuid.uuid4().hex[:6]}"
 
 
+def _resolve_owner(record: AnalysisRecord, user_id: str) -> str:
+    """决定这条记录落库时的 ``user_id``。
+
+    解析顺序（先到先得，**任一非空即止**）：
+
+    1. 调用方显式传的 ``user_id``；
+    2. ``record.meta.user_id`` —— 记录**自己**带的归属；
+    3. ``DEFAULT_USER_ID``（admin），即改造前的行为。
+
+    ## 为什么第 2 步是主要通道，而不是「每个调用点都得记得传」
+
+    ``TwoStageOrchestrator.submit(user_id=...)`` 在构造记录时就把同一个
+    ``user_id`` 盖进了 ``record.meta.user_id``（``_build_empty_record``）。
+    归属因此**随记录本身走**，而不是依赖十几次 ``save_partial`` 调用点各自
+    传参是否漏了 —— 漏一个就是一条落到 admin 名下、用户永远看不到的记录，
+    而且**没有任何报错**。
+
+    这与经验库的口径完全一致（AGENTS.md「``user_id`` 必须一路落库」）：
+    结算跑在调度器线程上、结算的是几小时前的记录，那时没有请求上下文，
+    **记录本身是唯一依据**。
+
+    显式入参仍然保留，是给「同一个 writer 实例被不同用户共用」的场景用的
+    —— ``ctx.pending_writer`` 是**进程级单例**，靠实例字段存归属会在
+    并发分析下互相串写；把它做成参数（且默认取记录自带的）就没有这个竞态。
+    """
+    explicit = str(user_id or "").strip()
+    if explicit:
+        return explicit
+
+    meta = getattr(record, "meta", None)
+    carried = str(getattr(meta, "user_id", "") or "").strip()
+    if carried:
+        return carried
+
+    from pa_agent.storage.db import DEFAULT_USER_ID
+
+    return DEFAULT_USER_ID
+
+
 def _build_record_path(record: AnalysisRecord, pending_dir: Path) -> Path:
     """Construct the partitioned storage path for a record.
 
@@ -110,7 +149,13 @@ class PendingWriter:
                 exc,
             )
 
-    def _mirror_to_sqlite(self, record: AnalysisRecord, data: dict, path: Path) -> None:
+    def _mirror_to_sqlite(
+        self,
+        record: AnalysisRecord,
+        data: dict,
+        path: Path,
+        user_id: str = "",
+    ) -> None:
         """把刚写盘的分析记录同步一份到 SQLite（索引层）。
 
         策略是**写双份**：文件仍是权威副本，SQLite 只做索引/快照。两条硬约束：
@@ -121,11 +166,21 @@ class PendingWriter:
         2. **传脱敏后的 data**，不传原始 record —— 否则 API key 会绕过
            ``_sanitize`` 进入数据库。``_partial_reason`` 必须带上，否则失败
            记录会被误标为 ``ok`` 并混入增量分析的锚点候选。
+
+        ``user_id`` 必须解析出真实归属并透传给 ``upsert_record``：不传就是
+        ``DEFAULT_USER_ID``，于是**所有非 admin 用户的记录恒落 admin 名下**，
+        而读端按 ``current_user_id`` 过滤 ⇒ 用户「分析成功、文件落盘、接口
+        200」，列表却永远为空。见 :func:`_resolve_owner`。
         """
         try:
             from pa_agent.storage.repositories import upsert_record
 
-            upsert_record(record, raw=data, file_path=path)
+            upsert_record(
+                record,
+                raw=data,
+                file_path=path,
+                user_id=_resolve_owner(record, user_id),
+            )
         except Exception as exc:  # noqa: BLE001
             self._logger.warning(
                 "PendingWriter: SQLite mirror failed for %s (file already saved): %s",
@@ -137,8 +192,11 @@ class PendingWriter:
     # Public API
     # ------------------------------------------------------------------
 
-    def save_full(self, record: AnalysisRecord) -> Path:
+    def save_full(self, record: AnalysisRecord, *, user_id: str = "") -> Path:
         """Serialize and save a complete analysis record.
+
+        ``user_id`` 是**可选**的落库归属；留空时按 :func:`_resolve_owner` 的
+        顺序回落（先看记录自带的 ``meta.user_id``，再回落默认用户）。
 
         Returns the path written to, or a best-effort path on failure.
         """
@@ -151,7 +209,7 @@ class PendingWriter:
         data = record.model_dump()
         data = self._sanitize(data, self._api_key)
         self._write_json(path, data)
-        self._mirror_to_sqlite(record, data, path)
+        self._mirror_to_sqlite(record, data, path, user_id)
         try:
             from pa_agent.records.analysis_history import invalidate_latest_record_cache
 
@@ -160,13 +218,15 @@ class PendingWriter:
             pass
         return path
 
-    def save_partial(self, record: AnalysisRecord, reason: str) -> Path:
+    def save_partial(self, record: AnalysisRecord, reason: str, *, user_id: str = "") -> Path:
         """Serialize and save a partial analysis record with a reason field.
 
         The ``_partial_reason`` key is injected into the serialized dict
         (it is not part of the Pydantic model). When ``record.exception`` is
         set, ``partial_reason`` is also copied into that dict for easier
         filtering without reading ``_partial_reason``.
+
+        ``user_id`` 语义同 :meth:`save_full`。
 
         Returns the path written to, or a best-effort path on failure.
         """
@@ -182,7 +242,7 @@ class PendingWriter:
             data["exception"] = {**data["exception"], "partial_reason": reason}
         data = self._sanitize(data, self._api_key)
         self._write_json(path, data)
-        self._mirror_to_sqlite(record, data, path)
+        self._mirror_to_sqlite(record, data, path, user_id)
         try:
             from pa_agent.records.analysis_history import invalidate_latest_record_cache
 

@@ -292,7 +292,12 @@ class _ConnectionHub:
 
     # ── 事务辅助 ──────────────────────────────────────────────────────────────
     def execute(self, sql: str, params: tuple = ()) -> bool:
-        """单条写。失败仅记 warning 并降级，绝不冒泡进业务流。"""
+        """单条写。失败仅记 warning 并降级，绝不冒泡进业务流。
+
+        返回的是「**SQL 执行成功**」，不是「影响了多少行」——``DELETE ... WHERE
+        命中 0 行`` 同样返回 True。**不要**拿它当「删掉了」的证据，见
+        :meth:`execute_count`。
+        """
         if not self._initialized:
             logger.warning(
                 "SQLite 尚未初始化，拒绝写入（调用 initialize_storage）。sql=%.40s", sql
@@ -312,6 +317,41 @@ class _ConnectionHub:
             # 成文件模式 —— 而实际只是慢了几毫秒。
             self._maybe_latch(str(exc))
             return False
+
+    def execute_count(self, sql: str, params: tuple = ()) -> int | None:
+        """单条写，**返回受影响行数**；写失败返回 ``None``。
+
+        与 :meth:`execute` 的区别只有一处：把「执行成功」换成「真的动了行」。
+        这是 ``DELETE`` 端点唯一能区分「删掉了」与「匹配 0 行却报成功」的
+        手段 —— 而后者正是 ``db_deleted: true`` 撒谎的根因。
+
+        **为什么是新增方法而不是改 ``execute`` 的返回类型**：``execute()`` 全仓
+        有 90+ 个调用点，且几乎全部写的是 ``ok = execute(...)`` / ``return
+        execute(...)``。把返回类型从 ``bool`` 改成 ``int`` 会让所有
+        ``assert ... is True`` 与 ``if execute(...)`` 的真值语义静默漂移
+        （``0`` 与 ``False`` 同为假，于是「删掉了 0 行」和「执行失败」再也
+        分不开）。改成新增原语则**零调用方改动**，是纯增量。
+
+        ``None`` 与 ``0`` 必须分开看：前者是「写没成功」（DB 不可用/未初始化/
+        SQL 出错），后者是「成功执行但一行没匹配」。
+        """
+        if not self._initialized:
+            logger.warning(
+                "SQLite 尚未初始化，拒绝写入（调用 initialize_storage）。sql=%.40s", sql
+            )
+            return None
+        conn = self.connect()
+        if conn is None:
+            return None
+        try:
+            with conn:
+                cur = conn.execute(sql, params)
+                # rowcount 只对 INSERT/UPDATE/DELETE 有意义；DDL 返回 -1。
+                return max(int(cur.rowcount), 0)
+        except sqlite3.Error as exc:
+            logger.warning("SQLite execute_count failed (sql=%.60s): %s", sql, exc)
+            self._maybe_latch(str(exc))
+            return None
 
     def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         """读。失败返回空列表 —— **但请先看 :attr:`read_failed` 再判断语义**。

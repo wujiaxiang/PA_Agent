@@ -723,6 +723,66 @@ function isLlmCustomSelected() {
   return $(LLM_SOURCE_CUSTOM)?.checked === true;
 }
 
+/* ── 会话游标 → <select> 回显（唯一真源 = 服务端游标） ─────────────────────
+ *
+ * 一个游标轴在页面上有**三处**投影，必须始终指向同一个值：
+ *   1. `dataset.current` —— **权威载体**。`loadExchanges()` / `loadTimeframes()`
+ *      会整块重写 `<select>` 的 innerHTML，`.value` 随之清零；只有 dataset
+ *      能活过这次重建，并被它们读出来标 `<option selected>`。
+ *   2. `.value` —— 用户实际看见/被上层读到的值。
+ *   3. `currentSettings.general.last_*` —— 服务端快照，本函数的**数据来源**。
+ * 三者不是三个真源：服务端游标是唯一的，dataset 是它的载体，`.value` 是载体
+ * 在「选项已就位」时的投影。
+ *
+ * ⚠ 为什么这里**不能**直接 `sel.value = v`
+ *
+ * init 顺序是 loadSettings() → loadExchanges()（app.js:522-523），此刻
+ * `<select>` 里**一个 `<option>` 都还没有**（index.html 只给了空壳标签）。
+ * 按 HTML 规范，`select.value = <不存在的值>` 会把选中集清空、`.value`
+ * 静默变成 `''`（实测 selectedIndex=-1）。那比不写更糟：下拉框不再是
+ * 「未回显」，而是「回显成空」，紧随其后的 loadSymbols() 会拿空交易所去
+ * 要品种列表。
+ *
+ * 故策略是**挂起**：dataset 先记下，选项就位后由 loadExchanges/
+ * loadTimeframes 兑现成 `.value`；选项已在（applySubscribe 后再调
+ * loadSettings 的那条路径）则当场兑现，并对不上时报错而不是静默改选。
+ */
+function setCursorSelect(sel, value) {
+  // undefined/null = 服务端没给这一轴，保持原样（别用空值覆盖已知游标）
+  if (!sel || value === undefined || value === null) return;
+  const v = String(value);
+  // ① 权威载体：选项在不在都写。它同时是「挂起」这个机制本身。
+  sel.dataset.current = v;
+
+  // ② 选项尚未就位 → 到此为止。loadExchanges/loadTimeframes 会读 dataset.current
+  //    选中对应 <option>，这正是「先 settings 后 exchanges」顺序的用途。
+  const opts = sel.options || [];
+  if (!opts.length) return;
+
+  // ③ 选项已就位：兑现 .value，让 dataset 与可见值不漂移
+  //    （applySubscribe 成功后重调 loadSettings 走的就是这条路径）。
+  const hit = opts.find(o => String(o.value) === v);
+  if (!hit) {
+    // 对不上时**绝不**静默落到「自动（探测）」或首个 option —— 那会让用户
+    // 以为在看 A 标的，实际按 B 标的取数，且全程无报错。
+    console.error(`[cursor] #${sel.id}: 服务端游标 ${JSON.stringify(v)} 不在选项列表中，`
+      + `保持 ${JSON.stringify(sel.value)}`);
+    if (typeof showSwitchError === 'function') {
+      showSwitchError(`服务端会话游标「${v}」不在${sel.id === 'ds-exchange' ? '交易所' : '周期'}列表中，请手动选择`, 'symbol');
+    }
+    return;
+  }
+  if (sel.value !== v) sel.value = v;
+}
+
+/** 读一个游标轴：DOM 有合法选中就用它，否则回落到服务端游标。
+ *  UI 回显与出站请求共用这一个解析口 —— 规则只写一遍，两者不可能各写各的。 */
+function cursorValue(sel, fallback) {
+  const dom = sel && sel.value ? String(sel.value) : '';
+  if (dom) return dom;
+  return (fallback === undefined || fallback === null) ? '' : String(fallback);
+}
+
 async function loadSettings() {
   try {
     const s = await API.get('/api/settings');
@@ -748,14 +808,14 @@ async function loadSettings() {
       window._chartAPI.setDisplayTimezone(displayTimezone);
     }
     updateTimezoneLabel(displayTimezone);
-    // 回填工具栏的交易所/品种/周期（loadExchanges/loadTimeframes 会读取这些值选中）
+    // 回填工具栏的交易所/品种/周期。
+    // #ds-symbol 是 <input type="hidden">，.value 恒合法，直接写。
+    // #ds-exchange/#ds-timeframe 是**空壳 <select>**（选项由 loadExchanges/
+    // loadTimeframes 注入），此处只能经 setCursorSelect 写 dataset 载体 ——
+    // 直接 .value = 'NASDAQ' 会因选项尚未就位而静默变 ''（详见该函数注释）。
     $('#ds-symbol').value = s.general?.last_symbol || 'BTCUSDT';
-    if (s.general?.last_tradingview_exchange) {
-      $('#ds-exchange').dataset.current = s.general.last_tradingview_exchange;
-    }
-    if (s.general?.last_timeframe) {
-      $('#ds-timeframe').dataset.current = s.general.last_timeframe;
-    }
+    setCursorSelect($('#ds-exchange'), s.general?.last_tradingview_exchange);
+    setCursorSelect($('#ds-timeframe'), s.general?.last_timeframe);
     // 飞书设置
     const fs = s.feishu || {};
     $('#s-feishu-enabled').checked = fs.enabled !== false;
@@ -831,15 +891,36 @@ function updateApiKeyAlert(settings) {
   }
 }
 
+// 交易所 id → 可读名（如 GATEIO → Gate.io、SSE → 上交所、NASDAQ → 纳斯达克）。
+// 真源是后端 `web/api/routes_data.py::list_tv_exchanges` 的 label_map，由
+// `/api/tv/exchanges` 下发；**前端不另抄一份** —— 抄一份必然与后端漂移，
+// 而漂移的后果是「历史列表里显示了一个已经改掉的旧名」。
+let exchangeLabels = {};
+
 async function loadExchanges() {
   try {
     const list = await API.get('/api/tv/exchanges');
+    // 历史列表跨品种浏览时要标注交易所（NVDA 在 NASDAQ 与 GATEIO 下同名同周期，
+    // 只看 `NVDA·5m` 分辨不出来）。同一个响应顺带缓存成可读名映射。
+    const labels = {};
+    (list || []).forEach(d => { if (d && d.id !== undefined) labels[d.id] = d.label || d.id; });
+    exchangeLabels = labels;
     const sel = $('#ds-exchange');
     const cur = sel.dataset.current || '';
     sel.innerHTML = list.map(d => `<option value="${d.id}"${d.id === cur ? ' selected' : ''}>${d.label}</option>`).join('');
   } catch (e) {
+    // 保留旧缓存：加载失败只降级成裸代号，不该把已知名字也一起丢掉
     console.error('loadExchanges:', e);
   }
+}
+
+// 交易所的展示名。**必须有名字**：这次要修的病就是「看不出这条属于哪个交易所」，
+// 映射没加载 / 遇到后端尚未收录的 id 时回落到裸代号，绝不返回空串
+//（空串会让那条记录**比原来更难分辨**，等于把 bug 换了个形态）。
+function exchangeDisplayName(exchange) {
+  const raw = String(exchange == null ? '' : exchange).trim();
+  if (!raw) return '';
+  return exchangeLabels[raw] || raw;
 }
 
 async function loadSymbols() {
@@ -1064,7 +1145,10 @@ function bindEvents() {
         const hid = $('#ds-symbol'); if (hid) hid.value = live.symbol;
         const shown = $('#ds-symbol-search'); if (shown) shown.value = live.symbol;
         const tf = $('#ds-timeframe'); if (tf) tf.value = live.timeframe;
-        const ex = $('#ds-exchange'); if (ex && live.exchange) ex.value = live.exchange;
+        // 走 setCursorSelect 而不是裸写 .value：历史记录的交易所若不在当前
+        // 选项列表里，裸写会让 select.value **静默变 ''**（比不回显更糟），
+        // 且 dataset.current 不会被更新，下一次重渲染又跳回旧值。
+        if (live.exchange) setCursorSelect($('#ds-exchange'), live.exchange);
         if (wasLive) startSSEBarsStream();
         showToast(`已返回实时：${live.symbol} ${live.timeframe}`, 'success');
       } catch (err) {
@@ -2429,7 +2513,10 @@ async function fetchAndUpdateNextCloseTs(force = false) {
   try {
     const symbol = $('#ds-symbol')?.value || currentSettings?.general?.last_symbol || '';
     const tf = $('#ds-timeframe')?.value || currentSettings?.general?.last_timeframe || '';
-    const ex = $('#ds-exchange')?.value || currentSettings?.general?.last_tradingview_exchange || '';
+    // 交易所与上面两轴走同一个解析口：DOM 有合法选中就用它，否则回落到服务端游标。
+    // 不能只看 `.value`：下拉框在「自动（探测）」（option value=""）或选项尚未
+    // 就位时它是空串，直接发出去等于告诉后端「交易所不限」。
+    const ex = cursorValue($('#ds-exchange'), currentSettings?.general?.last_tradingview_exchange);
     if (!symbol || !tf) return;
     const url = `/api/bars/next-close?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(tf)}&exchange=${encodeURIComponent(ex)}`;
     const data = await API.get(url);
@@ -5231,25 +5318,65 @@ function updateStreamStats() {
 //
 // 注意：过滤条件必须「三者齐全或三者皆空」。只传 symbol 无法用分区目录定位，
 // 后端会退化成全扫描，比默认路径慢 —— 故部分过滤不作为 UI 选项暴露。
+//
+// ── 并发守卫（缺了它就是「勾了全部品种、接口 200、列表却是空的」）────────
+// 本函数有 4 个触发点，且**都不是 await 的**（boot 行 528 明确不 await，
+// popover 打开 / 刷新按钮 / 勾选框同样都是 fire-and-forget）。触发点之间可以
+// 任意交错，而 `renderHistoryList` 是**就地覆写** `#history-list`：
+//
+//   T0  点「历史」        → GET /api/records?exchange=..&limit=50   （慢：扫全表载荷）
+//   T1  勾「全部品种」    → GET /api/records?limit=50                （慢：返回全部）
+//   T2  T1 的响应到达     → 渲染 25 条 ✅
+//   T3  T0 的响应到达     → 渲染 [] → **「暂无历史记录」**，25 条被抹掉
+//
+// 实测（真实容器 + 真实 Chromium，游标 NVDA/5m/NASDAQ，该组合库里零行）：
+// 勾选框处于勾选态、`?limit=50` 返回 200 共 25 条，列表最终却是
+// 「暂无历史记录」—— 与「后端正常、前端空态」的现象完全吻合。
+//
+// 注意别把这个「回来的空列表」当成增量探针的锅：探针走的是 `limit=1`
+// （app.js:refreshIncrementalButtonState）且**不渲染列表**。日志里那条
+// 带过滤的 `limit=50` 请求是**本函数自己**在过滤分支发的。
+//
+// 修法：单调递增的序号，只有最新一次调用有资格渲染。早到的结果直接丢弃。
+let _historyListSeq = 0;
+
 async function loadHistoryList() {
-  try {
-    const browseAll = !!$('#chk-history-all-symbols')?.checked;
-    let url;
-    if (browseAll) {
-      url = '/api/records?limit=50';
-    } else {
-      const exchange = $('#ds-exchange').value || currentSettings?.general?.last_tradingview_exchange || '';
-      const symbol = $('#ds-symbol').value || currentSettings?.general?.last_symbol || 'BTCUSDT';
-      const timeframe = $('#ds-timeframe').value || currentSettings?.general?.last_timeframe || '1d';
-      if (!exchange || !symbol || !timeframe) return;
-      url = `/api/records?exchange=${encodeURIComponent(exchange)}&symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=50`;
-    }
-    const data = await API.get(url);
-    renderHistoryList(data || [], { showSymbol: browseAll });
-  } catch (e) {
-    console.error('loadHistoryList:', e);
-    renderHistoryList([], { showSymbol: false });
+  // 先占号：即使下面因为过滤条件不全而提前 return，也会让在途的旧请求作废，
+  // 否则「最新的意图」会让「过期的响应」继续往 DOM 上写。
+  const seq = ++_historyListSeq;
+  const browseAll = !!$('#chk-history-all-symbols')?.checked;
+  let url;
+  if (browseAll) {
+    url = '/api/records?limit=50';
+  } else {
+    const exchange = $('#ds-exchange').value || currentSettings?.general?.last_tradingview_exchange || '';
+    const symbol = $('#ds-symbol').value || currentSettings?.general?.last_symbol || 'BTCUSDT';
+    const timeframe = $('#ds-timeframe').value || currentSettings?.general?.last_timeframe || '1d';
+    if (!exchange || !symbol || !timeframe) return;
+    url = `/api/records?exchange=${encodeURIComponent(exchange)}&symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=50`;
   }
+  let data;
+  try {
+    data = await API.get(url);
+  } catch (e) {
+    if (seq !== _historyListSeq) return;   // 已有更新的请求在路上，别用它覆盖
+    console.error('loadHistoryList:', e);
+    // ⚠️ 读失败**不能**渲染成「暂无历史记录」：那是「确实没有记录」的说法。
+    // 两者混同过一次真实误判 —— 接口 401/500 时用户看到的是「你没历史」，
+    // 于是去反复重跑分析，而真正的问题是登录态或后端。
+    renderHistoryError(e);
+    return;
+  }
+  if (seq !== _historyListSeq) return;     // ← 守卫：过期响应就地丢弃
+  renderHistoryList(data || [], { showSymbol: browseAll });
+}
+
+// 读失败的独立空态。与「暂无历史记录」视觉上区分开，避免用户误判成「没数据」。
+function renderHistoryError(err) {
+  const list = $('#history-list');
+  if (!list) return;
+  const msg = (err && err.message) ? String(err.message) : '未知错误';
+  list.innerHTML = `<div class="history-empty muted-text">历史记录加载失败：${escapeHtml(msg.slice(0, 120))}</div>`;
 }
 
 // 渲染历史记录列表项到 popover
@@ -5273,13 +5400,23 @@ function renderHistoryList(records, opts = {}) {
     const symbolBadge = showSymbol && r.symbol
       ? `<span class="history-item-symbol">${escapeHtml(r.symbol)}·${escapeHtml(r.timeframe || '')}</span>`
       : '';
+    // 交易所也要显示：同名同周期的标的在不同交易所下并不可分 ——
+    // 页面上订阅的是 NASDAQ/NVDA/5m，列表里那条 NVDA·5m 却是 GATEIO 下的，
+    // 于是「当前品类查不到、全部品种查得到」这个现象完全无法自查（写库取错
+    // 游标是根因，但展示层若连交易所都不给，用户就只能来问）。
+    // 用可读名而非裸代号；「当前品类」模式不加 —— 那里过滤已锁定
+    // (exchange, symbol, timeframe) 三元组，再显示是冗余噪音。
+    const exchangeName = showSymbol ? exchangeDisplayName(r.exchange) : '';
+    const exchangeBadge = exchangeName
+      ? `<span class="history-item-exchange">${escapeHtml(exchangeName)}</span>`
+      : '';
     // 增量分析 / 持续分析标识
     const tags = [];
     if (r.incremental) tags.push('<span class="history-tag history-tag-incremental">增量</span>');
     if (r.continuous) tags.push('<span class="history-tag history-tag-continuous">持续</span>');
     const tagsHtml = tags.join('');
     return `<div class="history-item" data-record-id="${recordId}">
-      ${symbolBadge}
+      ${symbolBadge}${exchangeBadge}
       <span class="history-item-time">${escapeHtml(time)}</span>
       ${closeBarTime ? `<span class="history-item-close-bar">📍 ${escapeHtml(closeBarTime)}</span>` : ''}
       ${tagsHtml}
@@ -5383,7 +5520,7 @@ async function applyReplayChart(record) {
     const hid = $('#ds-symbol'); if (hid) hid.value = symbol;
     const shown = $('#ds-symbol-search'); if (shown) shown.value = symbol;
     const tf = $('#ds-timeframe'); if (tf) tf.value = timeframe;
-    const ex = $('#ds-exchange'); if (ex && exchange) ex.value = exchange;
+    if (exchange) setCursorSelect($('#ds-exchange'), exchange);
     if (wasLive) startSSEBarsStream();
 
     // ── 先解析「分析当时」的锚点 bar ──────────────────────────────────
