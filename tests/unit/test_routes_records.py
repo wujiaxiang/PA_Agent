@@ -6,8 +6,9 @@
 - GET /api/records/{record_id} 单条详情（200、404、路径遍历防护 400）
 - 脱敏：api_key 出现在记录字符串中时被替换为掩码
 
-mock 策略：用 monkeypatch 替换 routes_records.RECORDS_DIR 到 tmp_path，
-在临时目录下构造分区布局的记录文件，实现测试隔离。
+mock 策略：monkeypatch ``routes_records.RECORDS_DIR`` 到 tmp_path，并在临时
+库里镜像一份记录 —— 读端自 2026-10-05 起**只查库**（正文取 ``payload_json``），
+只写文件的话这些用例会全部拿到空列表，却因为断言只看状态位而看不出问题。
 """
 from __future__ import annotations
 
@@ -98,7 +99,25 @@ def _write_record(
     if partial_reason is not None:
         data = {**data, "_partial_reason": partial_reason}
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _mirror_to_db(path, data, exchange, symbol, timeframe)
     return path
+
+
+def _mirror_to_db(path, data, exchange, symbol, timeframe) -> None:
+    """把刚写的记录镜像进库 —— 与生产写入链路一致（文件 + 双写）。"""
+    from pa_agent.records.schema import AnalysisRecord
+    from pa_agent.storage.repositories import upsert_record
+
+    payload = dict(data)
+    reason = payload.pop("_partial_reason", None)
+    try:
+        record = AnalysisRecord.model_validate(payload)
+    except Exception:
+        record = None
+    upsert_record(
+        record, raw={**payload, **({"_partial_reason": reason} if reason else {})},
+        file_path=path, user_id="admin",
+    )
 
 
 def _make_app() -> FastAPI:
@@ -109,6 +128,21 @@ def _make_app() -> FastAPI:
     ctx.settings.provider.api_key = "test-secret-key-12345"
     app.state.ctx = ctx
     return app
+
+
+@pytest.fixture(autouse=True)
+def _isolated_db(tmp_path_factory):
+    """每个用例一份干净的库。
+
+    读端只查库了，不隔离就会读到别的用例（或 conftest 的 session 级库）
+    写进去的记录 —— 断言照样绿，验的不是它声称的东西。
+    """
+    from pa_agent.storage.db import reset_hub_for_tests
+
+    d = tmp_path_factory.mktemp("db")
+    hub = reset_hub_for_tests(d / "iso.db")
+    yield hub
+    hub.close_all()
 
 
 # ── 列表查询 ──────────────────────────────────────────────────────────────────
@@ -235,10 +269,9 @@ def test_list_records_legacy_flat_layout(tmp_path, monkeypatch):
     # 旧布局文件直接放在 RECORDS_DIR 根下
     legacy_name = "2026-07-18_09-00-00_BTCUSDT_1d.json"
     legacy_path = tmp_path / legacy_name
-    legacy_path.write_text(
-        json.dumps(_make_record_dict(timestamp_iso="2026-07-18_09-00-00"), ensure_ascii=False),
-        encoding="utf-8",
-    )
+    legacy_dict = _make_record_dict(timestamp_iso="2026-07-18_09-00-00")
+    legacy_path.write_text(json.dumps(legacy_dict, ensure_ascii=False), encoding="utf-8")
+    _mirror_to_db(legacy_path, legacy_dict, "GATEIO", "BTCUSDT", "1d")
 
     app = _make_app()
     with TestClient(app) as c:
@@ -583,8 +616,12 @@ def test_list_records_filters_are_optional_for_cross_symbol_browse(tmp_path, mon
     出的结果。现在留空即不过滤。
     """
     monkeypatch.setattr(routes_records, "RECORDS_DIR", tmp_path)
-    _write_record(tmp_path, exchange="GATEIO", symbol="BTCUSDT", timeframe="1d")
-    _write_record(tmp_path, exchange="NASDAQ", symbol="NVDA", timeframe="1h")
+    # 文件名必须各不相同：库主键是文件名 stem（生产命名带 uuid8 后缀保证唯一），
+    # 同名会让第二条 UPDATE 掉第一条 —— 这正是测试最初只看到 NVDA 的原因。
+    _write_record(tmp_path, exchange="GATEIO", symbol="BTCUSDT", timeframe="1d",
+                  filename="2026-07-18_14-00-13_btc.json")
+    _write_record(tmp_path, exchange="NASDAQ", symbol="NVDA", timeframe="1h",
+                  filename="2026-07-18_14-00-13_nv.json")
     app = _make_app()
     with TestClient(app) as c:
         resp = c.get("/api/records")          # 无任何过滤条件
@@ -596,8 +633,10 @@ def test_list_records_filters_are_optional_for_cross_symbol_browse(tmp_path, mon
 def test_list_records_partial_filters_still_narrow(tmp_path, monkeypatch):
     """给了过滤条件时行为与改造前一致：按品种收窄。"""
     monkeypatch.setattr(routes_records, "RECORDS_DIR", tmp_path)
-    _write_record(tmp_path, exchange="GATEIO", symbol="BTCUSDT", timeframe="1d")
-    _write_record(tmp_path, exchange="NASDAQ", symbol="NVDA", timeframe="1h")
+    _write_record(tmp_path, exchange="GATEIO", symbol="BTCUSDT", timeframe="1d",
+                  filename="2026-07-18_14-00-13_btc.json")
+    _write_record(tmp_path, exchange="NASDAQ", symbol="NVDA", timeframe="1h",
+                  filename="2026-07-18_14-00-13_nv.json")
     app = _make_app()
     with TestClient(app) as c:
         resp = c.get("/api/records", params={"symbol": "NVDA"})

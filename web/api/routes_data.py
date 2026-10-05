@@ -405,6 +405,7 @@ def _status_label(status: str) -> str:
 
 @router.get("/experience")
 async def list_experience(
+    request: Request,
     cycle: str = Query(default="", description="按市场周期过滤，空=全部"),
     symbol: str = Query(default="", description="按交易对过滤，如 BTCUSDT；空=全部"),
     timeframe: str = Query(default="", description="按 K 线周期过滤，如 15m；空=全部"),
@@ -417,120 +418,129 @@ async def list_experience(
     ``symbol`` / ``timeframe`` filter on the **entry content** rather than the
     filename, because the same code appears under different cycles. The UI
     defaults both to the currently-subscribed instrument so the panel shows
-    "经验来自你正在看的这个品种" instead of an undifferentiated pile.
-    """
-    from pa_agent.config.paths import EXPERIENCE_DIR
+    "经验来自你正在看的这个标的" instead of an undifferentiated pile.
 
+    数据源：**先查 SQLite，查不到或读不出来再扫文件**（设计文档 §7 的 C 阶段）。
+    只读文件的话 ``user_id`` 那一列在浏览端也等于装饰品 —— 文件系统里没有
+    用户概念，多用户隔离在面板上是假的。
+    """
     sym_filter = (symbol or "").strip().upper()
     tf_filter = (timeframe or "").strip().lower()
+    try:
+        from web.api.auth_ctx import current_user_id
+
+        uid = current_user_id(request)
+    except Exception:  # noqa: BLE001
+        from pa_agent.storage.db import DEFAULT_USER_ID
+
+        uid = DEFAULT_USER_ID
 
     def _scan() -> dict:
-        from pa_agent.records.experience_reader import ExperienceReader
+        """只查库（2026-10-05 起文件布局已废弃）。
 
-        root = Path(EXPERIENCE_DIR)
-        if not root.is_dir():
-            return {"total": 0, "entries": [], "cycles": {}, "symbols": [], "timeframes": []}
+        pending / unresolved 一并取回：它们**不是**可检索的经验（不进提示词），
+        但面板必须看得见，否则用户分不清「还没判定」和「系统坏了」。
+        """
+        from pa_agent.records.experience_writer import STATUS_PENDING, STATUS_WIN
+        from pa_agent.storage.experience_repo import list_entries
 
-        cycles = sorted(
-            d.name for d in root.iterdir()
-            if d.is_dir() and not d.name.startswith(".")
-        )
-        if cycle:
-            cycles = [c for c in cycles if c == cycle]
-
-        reader = ExperienceReader(experience_dir=root)
-        entries: list[dict] = []
-        counts: dict[str, dict[str, int]] = {}
-        all_rows: list[dict] = []
-
-        def _read_status_dir(cycle_dir_name: str, status: str, limit: int = 60):
-            """Read pending_cases / unresolved_cases directly.
-
-            ``ExperienceReader`` only knows success/failure by design — an
-            undecided setup must not be retrievable as an experience. But the
-            browser still needs to *see* pending records, otherwise the two-stage
-            flow is invisible: the user cannot tell "nothing happened yet" from
-            "the system is broken".
-            """
-            from pa_agent.records.experience_writer import STATUS_DIRS
-
-            d = root / cycle_dir_name / STATUS_DIRS[status]
-            if not d.is_dir():
-                return []
-            out = []
-            for f in sorted(d.glob("*.json")):
-                try:
-                    out.append((f, json.loads(f.read_text(encoding="utf-8"))))
-                except Exception:  # noqa: BLE001
-                    continue
-                if len(out) >= limit:
-                    break
-            return out
-
-        def _fake_entry(f, content, cycle_name, case_type):
-            """Adapt a raw (path, content) pair to the reader's entry shape."""
-            return SimpleNamespace(
-                filename=f.name,
-                case_type=case_type,
-                cycle_position=content.get("cycle_position") or cycle_name,
-                timestamp_ms=int(f.stat().st_mtime * 1000),
-                content=content,
+        rows = list_entries(user_id=uid, limit=600)
+        if getattr(rows, "failed", False):
+            # 存储层读不出来：不能伪装成「库是空的」—— 那与「还没积累够案例」
+            # 长得一模一样，用户无从分辨。只记 error，面板显示空。
+            logger.error(
+                "experience browse: store unreadable (%s)",
+                getattr(rows, "error", "") or "unknown",
             )
+        all_rows = [_row_dict(e) for e in _rows_to_entries(rows)]
+        return _browse_payload(all_rows, _counts_by_cycle(all_rows))
 
-        for name in cycles:
+    def _rows_to_entries(rows) -> list[SimpleNamespace]:
+        """DB 行 → 与 reader 同构的 entry，供下游拼装逻辑复用。"""
+        from pa_agent.records.experience_writer import STATUS_PENDING, STATUS_WIN
+
+        out = []
+        for r in rows:
             try:
-                found = list(reader.read_top5(name))
-            except Exception:  # noqa: BLE001
-                found = []
-            for status, case_type in (("pending", "pending"), ("unresolved", "failure")):
-                for f, content in _read_status_dir(name, status):
-                    found.append(_fake_entry(f, content, name, case_type))
-            success = 0
-            failure = 0
-            for e in found:
-                content = getattr(e, "content", {}) or {}
-                case_type = str(getattr(e, "case_type", "") or "")
-                if case_type == "success":
-                    success += 1
-                elif case_type in ("failure", "unresolved"):
-                    failure += 1
-                cycle_pos = getattr(e, "cycle_position", None) or content.get("cycle_position") or name
-                st = str(content.get("status") or "").strip().lower()
-                if st not in ("pending", "win", "loss", "unresolved"):
-                    # 老条目没有 status 字段，按所在目录推断
-                    st = "win" if case_type == "success" else "loss"
-                all_rows.append({
-                    "filename": getattr(e, "filename", ""),
-                    "case_type": case_type,
-                    "status": st,
-                    "is_pending": st == "pending",
-                    "exchange": content.get("exchange", ""),
-                    "entry_price": content.get("entry_price"),
-                    "take_profit_price": content.get("take_profit_price"),
-                    "stop_loss_price": content.get("stop_loss_price"),
-                    "is_long": content.get("is_long", True),
-                    "entry_ts_open_ms": content.get("entry_ts_open_ms"),
-                    "resolved_ts_open_ms": content.get("resolved_ts_open_ms"),
-                    "bars_seen": content.get("bars_seen"),
-                    "cycle_position": cycle_pos,
-                    # 枚举同时给出中英标签：中文给操作者看，raw 给提示词/落盘路径对齐
-                    "cycle_label": _bilingual_cycle(cycle_pos),
-                    "direction_label": _bilingual_direction(content.get("direction", "")),
-                    "result_label": _bilingual_result(content.get("result", "")),
-                    "case_type_label": _status_label(st),
-                    "timestamp_ms": getattr(e, "timestamp_ms", 0),
-                    "symbol": content.get("symbol", ""),
-                    "timeframe": content.get("timeframe", ""),
-                    "direction": content.get("direction", ""),
-                    "result": content.get("result", ""),
-                    "pnl_pct": content.get("pnl_pct"),
-                    "confidence": content.get("confidence"),
-                    "summary": content.get("summary", ""),
-                    "detected_patterns": content.get("detected_patterns", []) or [],
-                })
-            counts[name] = {"success": success, "failure": failure}
+                content = json.loads(r.get("content_json") or "{}")
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(content, dict):
+                continue
+            status = str(r.get("status") or "").lower()
+            out.append(SimpleNamespace(
+                filename=str(r.get("entry_id") or ""),
+                # unresolved 在面板上归入 failure（它同样是「没打出预期」）；
+                # pending 单列 —— 它还没结论。
+                case_type="pending" if status == STATUS_PENDING
+                            else ("success" if status == STATUS_WIN else "failure"),
+                cycle_position=str(r.get("cycle_position") or ""),
+                timestamp_ms=int(r.get("timestamp_ms") or 0),
+                content=content,
+            ))
+        return out
 
-        # 可选维度：来自全量（未按 symbol/tf 过滤）的集合，供前端下拉用
+    def _counts_by_cycle(rows: list[dict]) -> dict[str, dict[str, int]]:
+        """按 cycle_position 聚合。pending 不计入成败（它还没结论）。"""
+        counts: dict[str, dict[str, int]] = {}
+        for r in rows:
+            c = counts.setdefault(r["cycle_position"], {"success": 0, "failure": 0})
+            if r["case_type"] == "success":
+                c["success"] += 1
+            elif r["case_type"] == "failure":
+                c["failure"] += 1
+        return counts
+
+    def _row_dict(e, fallback_cycle: str = "") -> dict:
+        """entry → 面板行。字段口径与 reader 保持一致。"""
+        content = getattr(e, "content", {}) or {}
+        case_type = str(getattr(e, "case_type", "") or "")
+        cycle_pos = (
+            getattr(e, "cycle_position", None)
+            or content.get("cycle_position") or fallback_cycle
+        )
+        st = str(content.get("status") or "").strip().lower()
+        if st not in ("pending", "win", "loss", "unresolved"):
+            st = {"success": "win", "pending": "pending"}.get(case_type, "loss")
+        return {
+            "filename": getattr(e, "filename", ""),
+            "case_type": case_type,
+            "status": st,
+            "is_pending": st == "pending",
+            "exchange": content.get("exchange", ""),
+            "entry_price": content.get("entry_price"),
+            "take_profit_price": content.get("take_profit_price"),
+            "stop_loss_price": content.get("stop_loss_price"),
+            "is_long": content.get("is_long", True),
+            "entry_ts_open_ms": content.get("entry_ts_open_ms"),
+            "resolved_ts_open_ms": content.get("resolved_ts_open_ms"),
+            "bars_seen": content.get("bars_seen"),
+            "cycle_position": cycle_pos,
+            "cycle_label": _bilingual_cycle(cycle_pos),
+            "direction_label": _bilingual_direction(content.get("direction", "")),
+            "result_label": _bilingual_result(content.get("result", "")),
+            "case_type_label": _status_label(st),
+            "timestamp_ms": getattr(e, "timestamp_ms", 0),
+            "symbol": content.get("symbol", ""),
+            "timeframe": content.get("timeframe", ""),
+            "direction": content.get("direction", ""),
+            "result": content.get("result", ""),
+            "pnl_pct": content.get("pnl_pct"),
+            "confidence": content.get("confidence"),
+            "summary": content.get("summary", ""),
+            "detected_patterns": content.get("detected_patterns", []) or [],
+        }
+
+    def _browse_payload(all_rows: list[dict], counts: dict) -> dict:
+        """过滤 / 汇总 / 排序。
+
+        ``all_rows`` 必须是**未按 symbol/timeframe 过滤**的全量：下拉选项
+        （symbols / timeframes）要从全量取，过滤后的集合会让选项随筛选漂移。
+        """
+        if cycle:
+            all_rows = [r for r in all_rows if r["cycle_position"] == cycle]
+            counts = {k: v for k, v in counts.items() if k == cycle}
+
         symbols = sorted({r["symbol"] for r in all_rows if r["symbol"]})
         timeframes = sorted({r["timeframe"] for r in all_rows if r["timeframe"]})
 
@@ -544,12 +554,13 @@ async def list_experience(
             per = {}
             for r in rows:
                 c = per.setdefault(r["cycle_position"], {"success": 0, "failure": 0})
-                c["failure" if r["case_type"] == "failure" else "success"] += 1
+                if r["case_type"] == "success":
+                    c["success"] += 1
+                elif r["case_type"] == "failure":
+                    c["failure"] += 1
             counts = {k: v for k, v in per.items() if v["success"] or v["failure"]}
 
         rows.sort(key=lambda x: x.get("timestamp_ms") or 0, reverse=True)
-        # 市场周期下拉选项：value 仍是 raw（用于过滤），label 走中英标签，
-        # 避免前端出现 broad_channel / unknown 这类裸枚举
         cycle_options = [
             {"value": c, "label": _bilingual_cycle(c)} for c in sorted(counts)
         ]

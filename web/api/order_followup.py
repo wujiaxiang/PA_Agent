@@ -149,10 +149,15 @@ def spawn_post_order_followup(
     symbol: str,
     timeframe: str,
     data_source: Any = None,
+    user_id: str = "",
 ) -> bool:
     """Spawn the trade-log + notification follow-up on a daemon thread.
 
     Returns True when a thread was started. Never raises.
+
+    ``user_id`` 必须在**派发时**（请求线程里）取好传进来：下面的
+    ``save_pending_if_resolvable`` 是同步执行的，理论上还能问 ``request``，
+    但线程一旦起来就没有请求上下文了，经验记录的归属就成了猜的。
     """
     if settings is None:
         return False
@@ -201,6 +206,7 @@ def spawn_post_order_followup(
             stage2_flat=_flat_stage2(record),
             entry_ts_open_ms=anchor,
             bars=bars,
+            user_id=user_id,
         )
         if staged is not None:
             logger.info("experience stage-1 pending written: %s %s -> %s",

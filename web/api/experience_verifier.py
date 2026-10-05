@@ -180,7 +180,7 @@ def _shared_fetch(shared: Any, rec_symbol: str, rec_timeframe: str,
 
 def settle_record(
     writer: ExperienceWriter,
-    path: Path,
+    entry_id: str,
     content: dict[str, Any],
     bars: list[dict[str, Any]],
     *,
@@ -205,14 +205,14 @@ def settle_record(
     if outcome is not None:
         result, pnl = outcome
         status = STATUS_WIN if result == "win" else STATUS_LOSS
-        writer.finalize(path, status=status, pnl_pct=pnl, bars_seen=seen)
+        writer.finalize(entry_id, status=status, pnl_pct=pnl, bars_seen=seen)
         return status, seen
 
     if seen >= max(1, int(verify_bars)):
-        writer.finalize(path, status=STATUS_UNRESOLVED, bars_seen=seen)
+        writer.finalize(entry_id, status=STATUS_UNRESOLVED, bars_seen=seen)
         return STATUS_UNRESOLVED, seen
 
-    writer.update_pending_progress(path, bars_seen=seen)
+    writer.update_pending_progress(entry_id, bars_seen=seen)
     return STATUS_PENDING, seen
 
 
@@ -265,7 +265,7 @@ def verify_pending(
         logger.warning("experience verify: listing failed: %s", exc)
         return summary
 
-    for path, content in pending:
+    for entry_id, content in pending:
         if summary["checked"] >= limit:
             break
         symbol = str(content.get("symbol") or "")
@@ -298,11 +298,11 @@ def verify_pending(
 
         summary["checked"] += 1
         try:
-            status, _seen = settle_record(w, path, content, bars,
+            status, _seen = settle_record(w, entry_id, content, bars,
                                           verify_bars=n_bars)
         except Exception as exc:  # noqa: BLE001
             logger.warning("experience verify: settle failed for %s: %s",
-                           path.name, exc)
+                           entry_id, exc)
             continue
         summary[status if status in summary else "pending"] += 1
 

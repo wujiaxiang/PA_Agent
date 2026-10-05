@@ -250,8 +250,8 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 
 ### 经验库闭环（写入端）
 
-- **两阶段状态机**：目录即状态 —— `pending_cases/`（入场瞬间写）→ `success_cases/`(win) / `failure_cases/`(loss) / `unresolved_cases/`（走满 N 根仍未触及，终态无盈亏）。**只有 win/loss 会被 `ExperienceReader` 读到**，未决 setup 不得当成失败经验喂回提示词
-- **写入方唯一入口**：`pa_agent.records.experience_writer.ExperienceWriter`（阶段一 `save_pending_if_resolvable()`，阶段二 `finalize()`/`update_pending_progress()`）。`_status_subdir()` 必须用 `STATUS_DIRS[status]` 取目录名 —— 误把 status 本身当目录名会写出 `pending/` 而非 `pending_cases/`，reader 读不到
+- **两阶段状态机**：`pending`（入场瞬间写）→ `win` / `loss`（触及 TP/SL）/ `unresolved`（走满 N 根仍未触及，终态无盈亏）。**只有 win/loss 会被 `ExperienceReader` 读到**，未决 setup 不得当成失败经验喂回提示词。状态是**列**不是目录，详见下节
+- **写入方唯一入口**：`pa_agent.records.experience_writer.ExperienceWriter`（阶段一 `save_pending_if_resolvable()`，阶段二 `finalize()`/`update_pending_progress()`），**只写库、不写文件**
 - **阶段二必须自备数据源**：`ctx.data_source` 是订阅绑定的单例，待验证记录可能挂几小时后才结算。共享源仅在 (exchange, symbol, timeframe) **三者全等**时复用，否则为该记录单独建源并用完即弃；再叠一道 `bars_belong_to_instrument()` 价格量级兜底。宁可保持 pending，也绝不用别的标的判定
 - **阶段二接线**：`web/api.experience_verifier.verify_pending()`；`POST /api/experience/verify/once` 为 UI 的「验证」按钮与后台调度器的共用入口（走 `experience_scheduler.run_once` 的单飞守卫）
 - **后台结算必须有调度器**：`experience_scheduler` 在 lifespan 启动 daemon 线程。单飞守卫保证 pass 不重叠；范围每轮**重读 settings**（用户随时会切品种）；**只结算当前订阅范围且只用共享数据源** —— 结算其它品种要每条建一个 TradingView 连接，放定时器上会打爆上游
@@ -262,7 +262,7 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **未了结的计划不写入**：触及任一价位前超时（`experience_max_wait_s`，默认 24h）即丢弃
 - **触发点**：`order_followup.spawn_post_order_followup()`（与通知同一入口，AGENTS.md 单一入口约束）
 - **必须 daemon 线程 + 分步 try/except**：轮询数据源可能失败/超时，任何异常只记 warning，**绝不能冒泡进分析主流程**
-- **数据来源必须可追溯**：`experience/` 下的条目只有两种来源 —— ① `ExperienceWriter.save()` 真实写入；② 早期手工种子数据。**不得手写 JSON 造经验**。真实盈亏是连续分布，若发现 `pnl_pct` 取值高度重复、`entry_price` 成等差数列、文件 mtime 集中在同一分钟，即为合成数据，必须隔离（`experience/.seed_demo_*/`，点号前缀会被 API 目录枚举过滤）并告知用户
+- **数据来源必须可追溯**：经验条目只有一种来源 —— `ExperienceWriter` 真实写入。**不得手写行造经验**。真实盈亏是连续分布，若发现 `pnl_pct` 取值高度重复、`entry_price` 成等差数列、创建时间集中在同一分钟，即为合成数据，必须隔离并告知用户。磁盘上遗留的 `experience/.seed_demo_*/`（2026-10-05 文件布局废弃前的手工种子）**已彻底隔离，永不入库**
 - **watcher 必须在轮询前后各校验一次订阅**：`data_source` 是全局共享、订阅绑定的单例，用户随时会切品种/周期。只做前置校验仍有竞态窗口（取数过程中被改掉）→ 两种情况都会拿**另一个标的**的 K 线判定本单，凭空写出胜负
 - **入场锚点不得为 0**：`after_ts_open_ms` 必须晚于最后一根**已收盘** bar（`bars[0]` 是 forming bar，取 `bars[1]`）。为 0 时过滤条件退化成 `ts_open > 0`，入场**之前**的历史 K 线会被当成本单走势。锚点缺失一律放弃写入
 - **`data_source` 必须显式传参**：不要用 `getattr(record, "_data_source")` / `getattr(frame, "data_source")` —— `AnalysisRecord` 与 `KlineFrame` 都没有这些属性，会恒为 `None` 导致整条链路静默变死（曾如此）
@@ -272,44 +272,68 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **经验库浏览必须先过滤**：`GET /api/experience` 支持 `symbol` / `timeframe`，按**条目内容**过滤而非文件名（同一代码会出现在不同市场周期下）。前端默认勾选「跟随当前订阅」；用户手动选下拉会自动取消跟随，避免两控件互相覆盖。`cycles` 汇总计数必须跟着过滤，否则前端显示的数字对不上
 - **读取端默认必须 > 0**：`experience_max_entries` 默认 0 会让整条检索链路空跑；新增/修改 PromptSettings 时注意该默认值
 
-### 经验库读端（2026-10-05 起切库，`SESSION_STORAGE_DESIGN` §7 C 阶段）
+### 经验库：库是唯一真源（2026-10-05 起，不再有文件）
 
-- **切读形态**：三条读路径（提示词注入 / `GET /api/experience` / 复盘取档）一律
-  **先查 SQLite，查不到或读不出来再扫文件**。读端**仍然严格只读**，绝不「顺手补写」：
-  那会把读变成写、顶住 `routes_analyze` 的 `max_workers=2` 分析池
-  （`db._BUSY_TIMEOUT_MS = 5000`，一次撞锁可占住一个分析槽 5 秒），且破坏
-  「写入方唯一入口」。回填交给 `importer`（幂等，本就存在）
+- **状态即列，不是目录**：`experience_entries.status ∈ {pending, win, loss, unresolved}`。
+  流转是一条 UPDATE（`entry_id` 不变），不再是「把文件搬到另一个目录」——
+  搬文件在崩溃时会留下半套状态。旧目录名 `*_cases/` 仅作为
+  `STATUS_DIRS` 兼容字典保留，**不得再据它推导状态**
+- **写入方唯一入口**：`ExperienceWriter`。它**不写任何文件**，`experience_dir`
+  形参已是兼容用的空壳。读端（`ExperienceReader`）同样只查库，**没有文件回落**
+- **状态词表必须与 `experience_writer.STATUS_*` 完全一致**：
+  曾是 `_VALID_STATUSES=("success","failure",...)` 而写入端发 `"win"/"loss"`，
+  `upsert_entry` 的兜底分支把**每一条**都静默改写成 `"pending"` —— 已结算的
+  经验在库里全显示为待验证，检索端永远取不到，整个经验库静默失效且从不报错。
+  由 `test_storage_dualwrite.py::test_status_vocabulary_guard` 守护
+- **只有 `win`/`loss` 可被检索**（`RETRIEVABLE_STATUSES`）。`unresolved` 是
+  终态但**无盈亏结论**，把它当失败经验喂回提示词会凭空制造大量不存在的错误经验
+- **`entry_id = <user_id>_<秒级时间戳>_<uuid8>`**：全局主键，而
+  `ON CONFLICT DO UPDATE SET` 的列清单里**没有** `user_id`。曾用裸文件名做主键，
+  跨用户同记录时后者静默覆盖前者
+- **`user_id` 必须一路落库**：`save_pending()` 写进 content，`finalize()` 不传
+  user_id 时**沿用记录自带的**（先不过滤地读出来才知道归属）。结算跑在调度器
+  线程上、结算的是几小时前的记录，那时没有请求上下文 —— 记录本身是唯一依据。
+  传一个**不匹配**的 user_id 去结算必须干净失败（否则 A 能改写 B 的经验结论）
 - **`hub.query()` 返回 `[]` 有两种含义**：「表里确实没有」与「读不出来」同形。
-  调用方**不得**用「查完再去读 hub 标志位」的方式判断 —— 那是读后时序，同线程内
-  后一次成功读会把前一次的失败标记清掉。`experience_repo` 的查询函数返回
-  `QueryResult(list)`，`.failed` / `.error` **随结果一起**交出，照它判断
-- **`hub.read_failed` 是线程局部的**（`_read_error` 存在 `threading.local` 里）。
-  它曾是普通实例属性且被 `query()` 成功时清空，于是 A 线程的失败标记会被 B 线程
-  任意一次成功读抹掉 —— 而本系统恰恰是高并发读（分析线程池 + 结算调度器 +
-  每次分析新建的 followup 线程），那放行的正是最需要降级的那一刻。
-  **不要把它当进程级共享标志用**
-- **DB 逻辑必须放进 `ExperienceReader.read_top5()` 内部**，不要改
-  `read_for_stage2`：`read_top5` 是唯一漏斗，在它里面改能一次覆盖所有调用方，
-  且 14 处 `mock.read_top5` 测试点继续有效。绕过它会让那些测试**静默失效**
-  —— 它们仍会绿，因为 Mock 不设返回值时返回的是 MagicMock
-- **`user_id` 必须一路落到记录 JSON**：`save_pending()` 把它写进 content，
-  `finalize()` 默认沿用记录自带的值。阶段二结算跑在后台调度器线程上、结算的是
-  几小时前的 pending，那时没有请求上下文 —— **记录本身是唯一的归属依据**。
-  缺了它，多用户下后台只能回落默认用户，等于把 A 的单结算进 B 的账
-- **`entry_id` 是 `<user_id>_<文件名 stem>`**：主键全局唯一，而
-  `ON CONFLICT DO UPDATE SET` 的列清单里**没有** `user_id`。曾用裸 stem 导致两个
-  用户写出同 stem 文件时后者静默覆盖前者。新增写入路径必须带上 user_id
-- **`direction` 比较前必须归一**：三个来源各说各话 —— 阶段一诊断输出
-  `bullish/bearish/neutral`，阶段二 `order_direction` 输出 `做多/做空`（校验限定），
-  种子数据是 `up/down`。直接比字符串则**永远不等**，检索的 +2 分恒为 0，
-  退化成「只看形态交集」且毫无报错。归一在**读侧**做（`experience_reader._normalize_direction`），
-  存量按中文落盘的老条目同样受益
+  不得用「查完再去读 hub 标志位」判断（读后时序）；`experience_repo` 的查询
+  返回 `QueryResult(list)`，`.failed`/`.error` **随结果一起**交出
+- **`hub.read_failed` 是线程局部的**（`_read_error` 在 `threading.local` 里）。
+  曾是普通实例属性且被 `query()` 成功时清空，A 线程的失败标记会被 B 线程的
+  任意一次成功读抹掉 —— 高并发读下那放行的正是最需要降级的那一刻
+- **DB 逻辑必须放在 `ExperienceReader.read_top5()` 内部**（唯一漏斗），
+  不要改 `read_for_stage2`；绕过它会让 14 处 `mock.read_top5` **静默失效**
+- **`direction` 比较前必须归一**：阶段一输出 `bullish/bearish/neutral`，
+  阶段二 `order_direction` 输出 `做多/做空`。直接比字符串则永远不等，
+  +2 分恒为 0，检索退化成「只看形态交集」且毫无报错
+- **复盘（`experience_reviews` 独立表）**：可重跑并留历史；只有**正常返回**
+  才落库（失败/空内容一律不写，否则半截复盘会占掉「最新一版」并被当结论
+  用）；复盘**不改**条目本身的状态与时序；落盘由**后端**在 SSE `done` 之前做，
+  依赖前端回报等于「用户关页面即丢失」
 - **`experience_max_chars_per_entry` 上限 `le=4000` 装不下真实 payload**
-  （含 `analysis_context` + `bars_snapshot` 实测 7032 字符，且 `analysis_context`
-  从第 471 字符才开始）。**调大该参数不是捷径**，渲染层必须做字段感知选取
-- **测试隔离**：切库后「只写 tmp_path」的用例会从 **session 级共享 DB** 读到别的
-  文件镜像进来的行 —— 断言照样绿，验的已经不是它声称的东西。相关测试文件已加
-  autouse 的 `reset_hub_for_tests` 夹具；新增经验库测试必须自带隔离
+  （实测 7032 字符，`analysis_context` 从第 471 字符才开始）。**调参不是捷径**：
+  `_render_experience` 必须字段感知地挑字段，并把复盘结论**单独追加**
+- **经验库测试必须自带库隔离**：落库后不再有「只写 tmp_path」这回事，
+  不隔离就会读到别的用例写的行 —— 断言照样绿，验的不是它声称的东西
+
+### 分析记录：读端只查库（2026-10-05），用户隔离已补上
+
+- **列表与详情都只查库**，正文取 `payload_json`，**不再读任何文件**。
+  磁盘仍保留副本（回放体量大、删除顺序仍先删文件），但那已是**只写不读**的归档
+- **`record_id` 必须与改造前逐字一致**（相对 `RECORDS_DIR` 的路径、无 `.json`）
+  —— 前端把它当 URL 路径段回放，改格式等于让所有历史回看点不动。
+  由 `repositories.get_record_detail(user_id, file_path)` 精确匹配，**必须带
+  user_id**
+- **补上一个真实的用户隔离漏洞**：旧的 `_file_candidates` 自愈回退按
+  exchange/symbol/timeframe 扫盘，**唯独没有 user_id 判断** —— DB 一抖动或刚
+  播种完没数据就走那条路，A 能看到 B 的历史记录；而磁盘 JSON 本身不含任何
+  用户标记，事后无法补救。详情端点此前也是直接 `open()` 且完全不过滤用户，
+  任何人拿到 URL 就能读到别人的完整 stage1/stage2 推理。该回退已整体删除
+- **主键是文件 stem**（`repositories._record_basename`），依赖文件名唯一。
+  生产命名带 `uuid8` 后缀故实际安全，但**测试里写同名文件会被第二条 UPDATE
+  掉** —— 构造多条记录时文件名必须各不相同（曾因此让「跨品种浏览」用例
+  只看到一条而无从解释）
+- **测试播种必须双写**：只 `write_text` 不走 `upsert_record`，读端只查库后会
+  全部拿到空列表。`tests/unit/test_routes_records.py::_write_record` 已内置镜像
 
 ### 侧边栏 tab 分组与子 tab
 

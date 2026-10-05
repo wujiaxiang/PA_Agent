@@ -8,9 +8,13 @@
 - **容错**：单条坏文件（截断 JSON、legacy 格式不符、缺列的 CSV）跳过并计数，
   不中断整批。
 
-覆盖三域：``records/pending/*.json``（分析记录）、``experience/**/*_cases/*.json``
-（经验库）、``trade_records/*.csv``（交易记录）。**三域的文件都是权威副本**，
-DB 只作索引，随时可以从文件重建。
+覆盖两域：``records/pending/*.json``（分析记录）与 ``trade_records/*.csv``
+（交易记录）。**这两域的文件仍是权威副本** —— 回看功能直接读 JSON，
+飞书卡片还要发 PNG 图（图片只在磁盘上）。
+
+**经验库已不再由此导入**：2026-10-05 起经验库完全落库，文件布局废弃，
+``ExperienceWriter`` 不再写任何文件。旧的 ``import_experience_entries`` 与
+``iter_real_experience_files`` 已删除 —— 留着只会指向一个不存在的真源。
 """
 from __future__ import annotations
 
@@ -80,81 +84,9 @@ def import_analysis_records(
     return stats
 
 
-def iter_real_experience_files(experience_dir: Path):
-    """Yield experience entry JSON paths, **skipping dot-prefixed directories**.
-
-    必须跳过点号目录，这是 AGENTS.md 的硬要求：
-    - ``.seed_demo_*/`` —— 合成数据（pnl_pct 成等差数列、mtime 集中在同一分钟），
-      导入后会污染检索结果并被当成本人��验喂回提示词
-    - ``.omc/`` —— 工具状态，与经验库无关
-
-    只认 ``*_cases/`` 目录下的 json —— 那是 ``ExperienceWriter`` 的落盘约定
-    （``success_cases`` / ``failure_cases`` / ``unresolved_cases`` / ``pending_cases``）。
-    """
-    if not experience_dir.is_dir():
-        return
-    for cycle_dir in sorted(experience_dir.iterdir()):
-        if not cycle_dir.is_dir() or cycle_dir.name.startswith("."):
-            continue
-        for sub in sorted(cycle_dir.iterdir()):
-            if not sub.is_dir() or sub.name.startswith("."):
-                continue
-            if not sub.name.endswith("_cases"):
-                continue
-            for p in sorted(sub.glob("*.json")):
-                if p.is_file():
-                    yield p
-
-
 def _status_from_subdir(subdir_name: str) -> str:
     """``success_cases`` → ``success``。无法识别时归 pending（最保守）。"""
     return subdir_name[: -len("_cases")] if subdir_name.endswith("_cases") else "pending"
-
-
-def import_experience_entries(
-    experience_dir: Path,
-    *,
-    user_id: str = DEFAULT_USER_ID,
-    limit: int | None = None,
-) -> dict[str, int]:
-    """Import real experience entries into SQLite.
-
-    ``exchange`` 不在文件名里，只能从 ``content`` 取；缺失时留空字符串 ——
-    经验库筛选只用 symbol/timeframe，不用交易所。
-    """
-    from pa_agent.storage.experience_repo import upsert_entry
-
-    scanned = imported = skipped = 0
-    for path in iter_real_experience_files(experience_dir):
-        scanned += 1
-        if limit is not None and imported >= limit:
-            break
-        raw = _load_raw(path)
-        if raw is None:
-            skipped += 1
-            continue
-        # cycle/<status_cases>/file.json → cycle_position=<cycle>, status=<status>
-        parts = path.relative_to(experience_dir).parts
-        cycle_position = parts[0] if len(parts) >= 3 else ""
-        status = _status_from_subdir(parts[1]) if len(parts) >= 3 else "pending"
-        symbol = str(raw.get("symbol") or "")
-        timeframe = str(raw.get("timeframe") or "")
-        if upsert_entry(
-            raw,
-            cycle_position=cycle_position,
-            status=status,
-            symbol=symbol,
-            timeframe=timeframe,
-            file_path=path,
-            user_id=user_id,
-        ):
-            imported += 1
-        else:
-            skipped += 1
-
-    stats = {"scanned": scanned, "imported": imported, "skipped": skipped}
-    logger.info("import_experience_entries: %s", stats)
-    return stats
 
 
 def import_trade_records(
@@ -165,7 +97,7 @@ def import_trade_records(
 ) -> dict[str, int]:
     """Import every ``trade_records/*.csv`` into SQLite.
 
-    与 ``analysis_records`` / ``experience_entries`` 同契约：
+    与 ``analysis_records`` 同契约：
 
     - **幂等**：``trade_id`` 由 ``(symbol, timeframe, record_time, 行号)`` 决定，
       重复导入只会 UPDATE 同一行，不会多出副本。这也意味着**写双份已经写过的行，
@@ -240,22 +172,14 @@ def _parse_trade_csv(path: Path) -> list[tuple[int, dict]] | None:
 def import_all(
     *,
     records_dir: Path | None = None,
-    experience_dir: Path | None = None,
     trade_dir: Path | None = None,
     user_id: str = DEFAULT_USER_ID,
 ) -> dict[str, Any]:
     """Import all file-backed domains. Used by lifespan startup / CLI."""
-    from pa_agent.config.paths import (
-        EXPERIENCE_DIR,
-        RECORDS_PENDING_DIR,
-        TRADE_RECORDS_DIR,
-    )
+    from pa_agent.config.paths import RECORDS_PENDING_DIR, TRADE_RECORDS_DIR
 
     out: dict[str, Any] = {
         "records": import_analysis_records(records_dir or RECORDS_PENDING_DIR, user_id=user_id),
-        "experience": import_experience_entries(
-            experience_dir or EXPERIENCE_DIR, user_id=user_id
-        ),
         "trades": import_trade_records(trade_dir or TRADE_RECORDS_DIR, user_id=user_id),
     }
     return out

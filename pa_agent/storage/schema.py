@@ -43,7 +43,7 @@ DDL_GLOBAL_CONFIG = (
 DDL_USER_PREFS = (
     """
     CREATE TABLE IF NOT EXISTS user_prefs (
-        user_id    TEXT NOT NULL DEFAULT 'default',
+        user_id    TEXT NOT NULL,
         key        TEXT NOT NULL,
         value_json TEXT NOT NULL,
         updated_at REAL NOT NULL,
@@ -58,7 +58,7 @@ DDL_ANALYSIS_RECORDS = (
     """
     CREATE TABLE IF NOT EXISTS analysis_records (
         record_id       TEXT PRIMARY KEY,
-        user_id         TEXT NOT NULL DEFAULT 'default',
+        user_id         TEXT NOT NULL,
         exchange        TEXT NOT NULL DEFAULT '',
         symbol          TEXT NOT NULL,
         timeframe       TEXT NOT NULL,
@@ -92,7 +92,7 @@ DDL_EXPERIENCE_ENTRIES = (
     """
     CREATE TABLE IF NOT EXISTS experience_entries (
         entry_id      TEXT PRIMARY KEY,
-        user_id       TEXT NOT NULL DEFAULT 'default',
+        user_id       TEXT NOT NULL,
         status        TEXT NOT NULL,
         symbol        TEXT NOT NULL DEFAULT '',
         timeframe     TEXT NOT NULL DEFAULT '',
@@ -115,6 +115,34 @@ DDL_EXPERIENCE_ENTRIES = (
     CREATE INDEX IF NOT EXISTS ix_exp_recent
         ON experience_entries (user_id, timestamp_ms DESC)
     """,
+    # 检索热路径：按周期位置 + 已验证状态取最近 N 条（提示词注入走这条）。
+    # 不建 (cycle_position) 索引是因为查询总是同时带 user_id/status 前缀，
+    # 而 ix_exp_browse 已覆盖该前缀组合。
+)
+
+# 经验条目的 LLM 复盘。**独立表而非 content_json 里的一个字段**：
+# 复盘会重跑（同一交易可能出多版结论），独立表才留得住历史与「当时用的是
+# 哪个模型」。content_json 是给检索/渲染读的原始档案，不该被复盘反复改写。
+DDL_EXPERIENCE_REVIEWS = (
+    """
+    CREATE TABLE IF NOT EXISTS experience_reviews (
+        review_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+        entry_id     TEXT NOT NULL,
+        user_id      TEXT NOT NULL,
+        model        TEXT NOT NULL DEFAULT '',
+        verdict      TEXT NOT NULL DEFAULT '',
+        reusable_criteria TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL,
+        created_at   REAL NOT NULL,
+        FOREIGN KEY (entry_id) REFERENCES experience_entries(entry_id)
+            ON DELETE CASCADE
+    )
+    """,
+    # 一条经验只要「最新一版复盘」是热路径；同一条的历史版本很少被读。
+    """
+    CREATE INDEX IF NOT EXISTS ix_review_entry
+        ON experience_reviews (user_id, entry_id, created_at DESC)
+    """,
 )
 
 # 交易记录。★ 资金面，多会话共享；PNG/CSV 仍落磁盘，库里只存元数据与路径。
@@ -122,7 +150,7 @@ DDL_TRADE_RECORDS = (
     """
     CREATE TABLE IF NOT EXISTS trade_records (
         trade_id     TEXT PRIMARY KEY,
-        user_id      TEXT NOT NULL DEFAULT 'default',
+        user_id      TEXT NOT NULL,
         symbol       TEXT NOT NULL,
         timeframe    TEXT NOT NULL DEFAULT '',
         order_type   TEXT NOT NULL DEFAULT '',
@@ -148,7 +176,7 @@ DDL_CHAT_TURNS = (
     """
     CREATE TABLE IF NOT EXISTS chat_turns (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id     TEXT NOT NULL DEFAULT 'default',
+        user_id     TEXT NOT NULL,
         session_id  TEXT NOT NULL DEFAULT '',
         thread_key  TEXT NOT NULL DEFAULT '',
         record_id   TEXT NOT NULL DEFAULT '',
@@ -176,7 +204,7 @@ DDL_SESSIONS = (
     """
     CREATE TABLE IF NOT EXISTS sessions (
         session_id  TEXT PRIMARY KEY,
-        user_id     TEXT NOT NULL DEFAULT 'default',
+        user_id     TEXT NOT NULL,
         symbol      TEXT NOT NULL DEFAULT '',
         timeframe   TEXT NOT NULL DEFAULT '',
         exchange    TEXT NOT NULL DEFAULT '',
@@ -230,6 +258,21 @@ DDL_USERS = (
 #: authenticate() 对空散列恒失败，不存在误放行。
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("users", "ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''"),
+    # 7 张表的 user_id 曾是 ``TEXT NOT NULL DEFAULT 'default'`` —— 而
+    # ``users`` 表里只有 ``admin``，``default`` 是个**不存在的用户**。写进去
+    # 不报错，按 user_id 过滤时却永远查不到，且没有任何提示。
+    #
+    # SQLite 无法直接「删掉一个列的默认值」（那要重建整表）。重建的代价是
+    # **丢掉该列上的 CHECK / 外键 / 索引**（外键会指向临时表名而失效），
+    # 而这些表的 user_id 上原本没有任何约束 —— 所以重建是安全的，
+    # 但必须逐张表核实过「该列确无索引/约束」才允许做。
+    ("sessions", "drop_default_user_id"),
+    ("chat_turns", "drop_default_user_id"),
+    ("user_prefs", "drop_default_user_id"),
+    ("analysis_records", "drop_default_user_id"),
+    ("experience_entries", "drop_default_user_id"),
+    ("trade_records", "drop_default_user_id"),
+    ("experience_reviews", "drop_default_user_id"),
 )
 
 _ALL_DDL: tuple[tuple[str, ...], ...] = (
@@ -239,6 +282,7 @@ _ALL_DDL: tuple[tuple[str, ...], ...] = (
     DDL_USER_PREFS,
     DDL_ANALYSIS_RECORDS,
     DDL_EXPERIENCE_ENTRIES,
+    DDL_EXPERIENCE_REVIEWS,
     DDL_TRADE_RECORDS,
     DDL_CHAT_TURNS,
     DDL_SESSIONS,
@@ -259,7 +303,8 @@ def tables() -> tuple[str, ...]:
     """Table names only — 供迁移器与诊断使用。"""
     return (
         "users", "global_config", "user_prefs", "analysis_records",
-        "experience_entries", "trade_records", "chat_turns", "sessions",
+        "experience_entries", "experience_reviews", "trade_records",
+        "chat_turns", "sessions",
     )
 
 

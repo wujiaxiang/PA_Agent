@@ -208,3 +208,22 @@ def db_has_records(*, user_id: str = DEFAULT_USER_ID) -> bool:
         "SELECT 1 FROM analysis_records WHERE user_id = ? LIMIT 1", (user_id,)
     )
     return row is not None
+
+
+def get_record_detail(
+    *, user_id: str = DEFAULT_USER_ID, file_path: str = ""
+) -> dict | None:
+    """按 ``file_path`` 取单条记录的**完整载荷**。
+
+    路由侧的 ``record_id`` 是「相对 RECORDS_DIR 的路径、无 .json 后缀」，
+    与主键列（文件 stem）不是一回事，故这里用 ``file_path`` 精确匹配。
+    按 ``user_id`` 过滤 —— 详情接口此前直接读文件，任何人拿到 URL 都能
+    读到别人的分析记录。
+    """
+    if not file_path:
+        return None
+    rows = get_hub().query(
+        "SELECT * FROM analysis_records WHERE user_id = ? AND file_path = ?",
+        (user_id, file_path),
+    )
+    return dict(rows[0]) if rows else None

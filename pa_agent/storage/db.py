@@ -81,7 +81,8 @@ class _ConnectionHub:
         self._disabled = False
         self._disabled_reason = ""
         self._initialized = False
-        self._read_error = ""       # 最近一次读失败的原因；空串=读正常
+        # 最近一次**本线程**读失败的原因；空串=读正常。存 threading.local
+        # 而非实例属性，理由见 :attr:`read_failed`。
         self._all_conns: list[sqlite3.Connection] = []
 
     # ── 连接获取 ──────────────────────────────────────────────────────────────
@@ -206,26 +207,34 @@ class _ConnectionHub:
         """
         conn = self.connect()
         if conn is None:
-            self._read_error = self._disabled_reason or "not initialized"
+            self._local.read_error = self._disabled_reason or "not initialized"
             return []
         try:
             rows = conn.execute(sql, params).fetchall()
         except sqlite3.Error as exc:
             logger.warning("SQLite query failed (sql=%.60s): %s", sql, exc)
-            self._read_error = str(exc)
+            self._local.read_error = str(exc)
             self._maybe_latch(str(exc))
             return []
-        self._read_error = ""      # 读成功才清错误标记
+        self._local.read_error = ""      # 读成功才清**本线程**的错误标记
         return rows
 
     @property
     def read_failed(self) -> bool:
-        """最近一次读是否失败。用于区分「空」与「读不出来」。"""
-        return bool(self._read_error)
+        """**本线程**最近一次读是否失败。用于区分「空」与「读不出来」。
+
+        必须是线程局部而非实例属性：``_read_error`` 曾是普通实例属性，而
+        ``query()`` 成功时会把它清空 —— 于是 A 线程的失败标记会被 B 线程的
+        任意一次成功读抹掉，A 随后读到 ``read_failed == False``，把 ``[]``
+        当成「库里确实没有」。本系统恰恰是高并发读（分析线程池
+        ``max_workers=2`` + 结算调度器 + 每次分析新建的 followup 线程），
+        这不是罕见路径而是常态路径，而它放行的正是最需要降级的那一刻。
+        """
+        return bool(getattr(self._local, "read_error", ""))
 
     @property
     def read_error(self) -> str:
-        return self._read_error
+        return getattr(self._local, "read_error", "")
 
     def _maybe_latch(self, message: str) -> None:
         """只有不可恢复的损坏才置位 ``_disabled``；并发锁冲突不闩死。"""

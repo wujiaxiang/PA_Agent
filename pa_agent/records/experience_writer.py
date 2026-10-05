@@ -1,17 +1,18 @@
-"""ExperienceWriter — the write half of the experience library.
+"""ExperienceWriter — 经验库写入端。
 
-``ExperienceReader`` is documented as "strictly read-only", and nothing else in
-the repo ever created a file under ``EXPERIENCE_DIR``. That made the library a
-dead end: the 59 shipped entries never grow, and no analysis ever feeds back
-into Stage 1/Stage 2 retrieval.
+**2026-10-05 起：数据库是唯一真源，本模块不再写任何文件。**
 
-This module closes that loop. Entries are written to the same layout the reader
-expects::
+此前每个案例是一个 JSON 文件，落在 ``experience/<cycle>/<status>_cases/`` 下，
+「目录即状态」（pending → success/failure/unresolved 靠移动文件实现）。那条
+路已经废弃，理由是它同时踩了三个坑：
 
-    experience/<cycle_position>/success_cases/<ts>_<symbol>_<timeframe>.json
-    experience/<cycle_position>/failure_cases/<ts>_<symbol>_<timeframe>.json
+- **多用户无从隔离**：文件系统里没有用户概念，A 用户的案例 B 用户照样能读到，
+  ``user_id`` 那一列在读端形同装饰
+- **状态流转要搬文件**：结算一个 pending 要把文件移到另一个目录，中途崩溃会
+  留下半套状态；且文件名成了跨模块的隐式契约
+- **读者必须扫目录**：每次分析都 rglob 一遍全局目录，既慢又没法用索引
 
-so a file written here is immediately retrievable by ``ExperienceReader``.
+现在状态是 ``experience_entries.status`` 这一列，流转是一条 UPDATE。
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from pa_agent.config.paths import EXPERIENCE_DIR
+from pa_agent.storage.experience_repo import new_entry_id
 
 #: Timestamp format shared with ExperienceReader (``minutes use '-'``).
 _TS_FORMAT = "%Y-%m-%d_%H-%M-%S"
@@ -44,13 +45,19 @@ STATUS_WIN = "win"
 STATUS_LOSS = "loss"
 STATUS_UNRESOLVED = "unresolved"
 
-#: status → 目录名。只有 pending/success/failure 会被 ExperienceReader 读到。
+#: **兼容字典**。库里状态是 ``experience_entries.status`` 一列，不再有目录；
+#: 保留映射仅为让读侧能按目录名习惯取状态，以及旧调用点不必立刻改写。
+#: 新代码请直接用 STATUS_* 常量。
 STATUS_DIRS: dict[str, str] = {
     STATUS_PENDING: "pending_cases",
     STATUS_WIN: "success_cases",
     STATUS_LOSS: "failure_cases",
     STATUS_UNRESOLVED: "unresolved_cases",
 }
+
+#: 读端唯一允许检索的状态。未决的 pending / 无盈亏的 unresolved 都不是
+#: 已验证经验，不得当成失败经验喂回提示词（AGENTS.md）。
+RETRIEVABLE_STATUSES: tuple[str, ...] = (STATUS_WIN, STATUS_LOSS)
 
 #: 这些状态是终态，不再需要验证
 TERMINAL_STATUSES = frozenset({STATUS_WIN, STATUS_LOSS, STATUS_UNRESOLVED})
@@ -80,47 +87,20 @@ class ExperienceWriter:
     Parameters
     ----------
     experience_dir:
-        Root of the library. Defaults to the configured ``EXPERIENCE_DIR``.
+        **已废弃**：库内不再有文件，本参数只为兼容既有调用点而保留，不影响行为。
     logger:
         Optional logger; a module logger is used when omitted.
     """
 
     def __init__(
         self,
-        experience_dir: Path | str | None = None,
+        experience_dir: Path | str | None = None,   # 兼容参数，已无效果
         logger: Optional[logging.Logger] = None,
     ) -> None:
-        self._dir = Path(experience_dir) if experience_dir else Path(EXPERIENCE_DIR)
+        # 兼容参数：不再决定任何写入位置（写库，不写文件）
+        self._legacy_dir = str(experience_dir) if experience_dir else ""
         self._log = logger or _default_logger()
         self._lock = threading.Lock()
-
-    # ── path helpers ─────────────────────────────────────────────────────
-    def _subdir(self, cycle_position: str, success: bool) -> Path:
-        cycle = _safe_segment(cycle_position, fallback="trending_tr")
-        sub = "success_cases" if success else "failure_cases"
-        path = self._dir / cycle / sub
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def _status_subdir(self, cycle_position: str, status: str) -> Path:
-        """Directory for a *status* (two-stage library)."""
-        cycle = _safe_segment(cycle_position, fallback="trending_tr")
-        # 注意：目录名来自 STATUS_DIRS[status]（pending → pending_cases）。
-        # 曾经误把 status 本身当目录名，写出 pending/ 而不是 pending_cases/，
-        # ExperienceReader 按 *_cases 扫描 → 结算后的记录读不到。
-        st = str(status or "").strip().lower()
-        sub = STATUS_DIRS.get(st)
-        if sub is None:
-            self._log.warning("experience: unknown status %r → pending", status)
-            sub = STATUS_DIRS[STATUS_PENDING]
-        path = self._dir / cycle / sub
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    @staticmethod
-    def _filename(symbol: str, timeframe: str) -> str:
-        stamp = datetime.now().strftime(_TS_FORMAT)
-        return f"{stamp}_{_safe_segment(symbol)}_{_safe_segment(timeframe, '1h')}.json"
 
     # ── public API ───────────────────────────────────────────────────────
     def save(
@@ -137,17 +117,15 @@ class ExperienceWriter:
         success: bool,
         pnl_pct: float | None = None,
         extra: dict[str, Any] | None = None,
-    ) -> Path:
-        """Write one experience entry and return its path.
+        user_id: str = "",
+    ) -> str:
+        """写入一条**已终态**的经验，返回 ``entry_id``。
 
-        ``success`` selects the ``success_cases``/``failure_cases`` subdirectory;
-        ``pnl_pct`` is rounded to 2 decimals and omitted when unknown.
+        ``success`` 决定 status 是 win 还是 loss；``pnl_pct`` 保留 2 位小数，
+        未知则不写该字段。``entry_id`` 自带唯一性（uuid 后缀），不再依赖
+        文件名 —— 旧实现里两个用户在同一秒为同一标的写盘会撞文件名。
         """
         content: dict[str, Any] = {
-            # Previously cycle_position only reached the *directory* name, so
-            # every entry's JSON came back with cycle_position == null and the
-            # reader had to fall back to its parent folder. Persist it so an
-            # entry file is self-describing.
             "cycle_position": str(cycle_position or ""),
             "direction": str(direction or ""),
             "detected_patterns": list(detected_patterns or []),
@@ -164,35 +142,59 @@ class ExperienceWriter:
             for k, v in extra.items():
                 if k not in content:
                     content[k] = v
-
-        with self._lock:
-            subdir = self._subdir(cycle_position, success)
-            target = subdir / self._filename(symbol, timeframe)
-            # 同毫秒内两次落盘也不会互相覆盖
-            if target.exists():
-                stem = target.stem
-                target = subdir / f"{stem}_{uuid.uuid4().hex[:6]}{target.suffix}"
-
-            tmp = target.with_suffix(".json.tmp")
-            try:
-                tmp.write_text(
-                    json.dumps(content, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                os.replace(tmp, target)
-            except Exception:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                raise
-
-        self._log.info(
-            "experience saved: cycle=%s %s %s -> %s",
-            cycle_position, symbol, timeframe, target.name,
+        owner = self._owner(user_id)
+        if owner:
+            content["user_id"] = owner
+        return self._upsert(
+            content,
+            cycle_position=cycle_position,
+            status=STATUS_WIN if success else STATUS_LOSS,
+            symbol=symbol, timeframe=timeframe, user_id=owner,
         )
-        return target
 
+    @staticmethod
+    def _owner(user_id: str) -> str:
+        """归属用户。留空回落存储层默认用户（单机部署下它就是正确答案）。"""
+        if user_id:
+            return str(user_id)
+        from pa_agent.storage.db import DEFAULT_USER_ID
+
+        return DEFAULT_USER_ID
+
+    def _upsert(
+        self,
+        content: dict[str, Any],
+        *,
+        cycle_position: str,
+        status: str,
+        symbol: str,
+        timeframe: str,
+        user_id: str = "",
+        entry_id: str | None = None,
+    ) -> str:
+        """把一条经验写进库里，返回 ``entry_id``。
+
+        状态流转就是**同一条**记录的 UPDATE（``entry_id`` 复用），所以不会
+        因为结算而多出一行。DB 写失败只记 warning —— 经验库是锦上添花的输出，
+        绝不能因为它把分析主流程带崩。
+        """
+        owner = self._owner(user_id)
+        eid = entry_id or new_entry_id(owner)
+        try:
+            from pa_agent.storage.experience_repo import upsert_entry
+
+            upsert_entry(
+                content,
+                entry_id=eid,
+                cycle_position=cycle_position,
+                status=status,
+                symbol=symbol,
+                timeframe=timeframe,
+                user_id=owner,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("experience write failed (cycle=%s): %s", cycle_position, exc)
+        return eid
 
     # ── two-stage API ────────────────────────────────────────────────────
     def save_pending(
@@ -215,13 +217,16 @@ class ExperienceWriter:
         analysis_context: dict[str, Any] | None = None,
         bars_snapshot: list[dict[str, Any]] | None = None,
         extra: dict[str, Any] | None = None,
-    ) -> Path:
-        """Stage 1 — record the plan the moment the signal fires.
+        user_id: str = "",
+    ) -> str:
+        """Stage 1 — 信号出现那一刻就记录这笔计划，返回 ``entry_id``。
 
-        Written immediately as ``pending``: whether the setup worked is not yet
-        known, but *"we took this setup at this price"* already is. Deferring
-        the write until the outcome is known loses everything if the process
-        restarts mid-watch.
+        立即以 ``pending`` 落库：setup 走没走出来还不知道，但「我们在���价位
+        接了这笔单」已经是事实。等结果出来再写会丢掉中途重启的一切。
+
+        ``user_id`` **写进 content 本身**，不只是传给 DB。阶段二结算跑在后台
+        调度器线程上、结算的是几小时前那条 pending —— 那时没有请求上下文，
+        唯一能知道这条属于谁的地方就是记录自己。
         """
         import time as _time
 
@@ -255,39 +260,55 @@ class ExperienceWriter:
             for k, v in extra.items():
                 if k not in content:
                     content[k] = v
-        return self._write(content, cycle_position, STATUS_PENDING, symbol, timeframe)
+        owner = self._owner(user_id)
+        content["user_id"] = owner
+        return self._upsert(
+            content, cycle_position=cycle_position, status=STATUS_PENDING,
+            symbol=symbol, timeframe=timeframe, user_id=owner,
+        )
 
     def finalize(
         self,
-        path: Path | str,
+        entry_id: str,
         *,
         status: str,
         pnl_pct: float | None = None,
         bars_seen: int | None = None,
         resolved_ts_ms: int | None = None,
-    ) -> Path | None:
-        """Stage 2 — move a pending entry into its terminal directory.
+        user_id: str = "",
+    ) -> bool:
+        """Stage 2 — 把一条 pending 结成终态。
 
-        Returns the new path, or ``None`` when *path* is missing/unreadable.
-        The file is rewritten (never copied then deleted) so a crash mid-way
-        leaves either the pending or the terminal version, never a duplicate.
+        现在只是一条 UPDATE（``entry_id`` 不变，只改 status），不再有
+        「把文件搬到另一个目录」这一步 —— 崩溃不再可能留下半套状态。
+        返回是否结算成功；记录不存在或读不出来时为 ``False``。
+
+        ``user_id`` 不传则沿用记录自带的 —— 阶段二跑在后台调度器线程上，
+        没有请求上下文可问，记录本身是唯一的归属依据。
         """
         import time as _time
 
-        src = Path(path)
-        if not src.is_file():
-            return None
-        status = status if status in STATUS_DIRS else STATUS_UNRESOLVED
+        if status not in (STATUS_WIN, STATUS_LOSS, STATUS_UNRESOLVED):
+            status = STATUS_UNRESOLVED
         try:
-            content = json.loads(src.read_text(encoding="utf-8"))
+            from pa_agent.storage.experience_repo import get_entry
+
+            # user_id 为空时先不过滤地读出来：归属就在这条记录里，
+            # 而归属又决定了用什么 user_id 去查 —— 不这样就永远查不到自己。
+            content = get_entry(entry_id, user_id=user_id or None)
+            if content is None:
+                self._log.warning("experience finalize: %s not found", entry_id)
+                return False
+            owner = self._owner(user_id or str(content.get("user_id") or ""))
         except Exception as exc:  # noqa: BLE001
-            self._log.warning("experience finalize: unreadable %s: %s", src.name, exc)
-            return None
-        if not isinstance(content, dict):
-            return None
+            self._log.warning("experience finalize read failed for %s: %s", entry_id, exc)
+            return False
 
         content["status"] = status
-        content["result"] = status if status in (STATUS_WIN, STATUS_LOSS) else None
+        if status in (STATUS_WIN, STATUS_LOSS):
+            content["result"] = status
+        else:
+            content.pop("result", None)
         if pnl_pct is not None:
             content["pnl_pct"] = round(float(pnl_pct), 2)
         else:
@@ -297,134 +318,89 @@ class ExperienceWriter:
         content["resolved_ts_ms"] = int(
             resolved_ts_ms if resolved_ts_ms is not None else _time.time() * 1000
         )
-        content.pop("result_none_marker", None)
-        if content.get("result") is None:
-            content.pop("result", None)
-
-        return self._write(
+        self._upsert(
             content,
-            str(content.get("cycle_position") or "trending_tr"),
-            status,
-            str(content.get("symbol") or ""),
-            str(content.get("timeframe") or "1h"),
-            source=src,
+            cycle_position=str(content.get("cycle_position") or "trending_tr"),
+            status=status,
+            symbol=str(content.get("symbol") or ""),
+            timeframe=str(content.get("timeframe") or "1h"),
+            user_id=owner,
+            entry_id=entry_id,
         )
+        return True
 
-    def update_pending_progress(
-        self, path: Path | str, *, bars_seen: int
-    ) -> None:
-        """Persist how many bars a still-pending record has accumulated."""
-        src = Path(path)
-        if not src.is_file():
-            return
+    def update_pending_progress(self, entry_id: str, *, bars_seen: int) -> bool:
+        """记录一条仍是 pending 的案例已经走过多少根 K 线。"""
         try:
-            content = json.loads(src.read_text(encoding="utf-8"))
-            if not isinstance(content, dict):
-                return
+            from pa_agent.storage.experience_repo import get_entry
+
+            content = get_entry(entry_id, user_id=None)
+            if content is None:
+                return False
             content["bars_seen"] = int(bars_seen)
-            tmp = src.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(tmp, src)
+            self._upsert(
+                content,
+                cycle_position=str(content.get("cycle_position") or "trending_tr"),
+                status=STATUS_PENDING,
+                symbol=str(content.get("symbol") or ""),
+                timeframe=str(content.get("timeframe") or "1h"),
+                user_id=str(content.get("user_id") or ""),
+                entry_id=entry_id,
+            )
+            return True
         except Exception as exc:  # noqa: BLE001
-            self._log.warning("experience progress update failed for %s: %s", src.name, exc)
+            self._log.warning("experience progress update failed for %s: %s", entry_id, exc)
+            return False
 
-    def list_pending(self, limit: int = 100) -> list[tuple[Path, dict[str, Any]]]:
-        """Return ``(path, content)`` for every pending record, oldest first."""
-        out: list[tuple[Path, dict[str, Any]]] = []
-        if not self._dir.is_dir():
-            return out
-        for cycle_dir in sorted(self._dir.iterdir()):
-            if not cycle_dir.is_dir() or cycle_dir.name.startswith("."):
-                continue
-            pending_dir = cycle_dir / STATUS_DIRS[STATUS_PENDING]
-            if not pending_dir.is_dir():
-                continue
-            for f in sorted(pending_dir.glob("*.json")):
-                try:
-                    content = json.loads(f.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-                if isinstance(content, dict):
-                    out.append((f, content))
-                if len(out) >= limit:
-                    return out
-        return out
-
-    def _write(
+    def attach_review(
         self,
-        content: dict[str, Any],
-        cycle_position: str,
-        status: str,
-        symbol: str,
-        timeframe: str,
-        source: Path | None = None,
-    ) -> Path:
-        with self._lock:
-            subdir = self._status_subdir(cycle_position, status)
-            # 状态流转时沿用原文件名（记录时间不该因为结算而改变）
-            target = source.name if source is not None else self._filename(symbol, timeframe)
-            dst = subdir / target
-            if source is None and dst.exists():
-                stem = dst.stem
-                dst = subdir / f"{stem}_{uuid.uuid4().hex[:6]}{dst.suffix}"
+        entry_id: str,
+        payload: dict[str, Any],
+        *,
+        model: str = "",
+        verdict: str = "",
+        reusable_criteria: str = "",
+        user_id: str = "",
+    ) -> bool:
+        """把一次 LLM 复盘挂到条目上（P3）。
 
-            tmp = dst.with_suffix(".json.tmp")
-            try:
-                tmp.write_text(json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
-                os.replace(tmp, dst)
-                if source is not None and source != dst:
-                    try:
-                        source.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-            except Exception:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                raise
-        self._log.info(
-            "experience written: status=%s cycle=%s %s %s -> %s",
-            status, cycle_position, symbol, timeframe, dst.name,
-        )
-        self._mirror_to_sqlite(content, cycle_position, status, symbol, timeframe, dst)
-        return dst
-
-    def _mirror_to_sqlite(
-        self,
-        content: dict[str, Any],
-        cycle_position: str,
-        status: str,
-        symbol: str,
-        timeframe: str,
-        path: Path,
-    ) -> None:
-        """把刚落盘的案例同步一份到 SQLite（索引层）。
-
-        写在 ``_write`` **之后**而非之前：文件是权威副本，索引层失败绝不能让
-        案例丢失。任何异常只记 warning，不冒泡 —— ``_write`` 的调用方是分析主流程
-        与后台结算调度器，异常会中断写入链。
-
-        状态流转（pending → success/failure）会自然变成同一 ``entry_id`` 的
-        UPDATE：``_write`` 在流转时沿用原文件名，故不会产生重复行。
+        独立表，因此**可以重跑并留历史**。不改变条目本身的状态与时序。
         """
         try:
-            from pa_agent.storage.experience_repo import upsert_entry
+            from pa_agent.storage.experience_repo import attach_review as _attach
 
-            upsert_entry(
-                content,
-                cycle_position=cycle_position,
-                status=status,
-                symbol=symbol,
-                timeframe=timeframe,
-                file_path=path,
+            return _attach(
+                payload, entry_id=entry_id, user_id=self._owner(user_id),
+                model=model, verdict=verdict, reusable_criteria=reusable_criteria,
             )
         except Exception as exc:  # noqa: BLE001
-            self._log.warning(
-                "experience SQLite mirror failed for %s (file already saved): %s",
-                path.name,
-                exc,
+            self._log.warning("experience review attach failed for %s: %s", entry_id, exc)
+            return False
+
+    def list_pending(
+        self, limit: int = 100, *, user_id: str = ""
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """返回 ``(entry_id, content)``，按创建时间**由旧到新**。
+
+        结算必须从最旧的开始：先给等得最久的案例定性，才不会让它们永远排不上。
+        """
+        try:
+            from pa_agent.storage.experience_repo import list_entries
+
+            rows = list_entries(
+                user_id=self._owner(user_id), status=STATUS_PENDING, limit=limit,
             )
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("experience list_pending failed: %s", exc)
+            return []
+        out: list[tuple[str, dict[str, Any]]] = []
+        for row in reversed(list(rows)):          # 查询按 ts 倒序，反转成由旧到新
+            content = _loads(row.get("content_json"))
+            if content is None:
+                continue
+            out.append((str(row.get("entry_id") or ""), content))
+        return out
+
 
 
 def evaluate_outcome(
@@ -477,7 +453,8 @@ def save_pending_if_resolvable(
     stage2_flat: dict[str, Any],
     entry_ts_open_ms: int,
     bars: list[Any] | None = None,
-) -> Optional[Path]:
+    user_id: str = "",
+) -> Optional[str]:
     """Stage-1 gate: write a pending record only when the plan is resolvable.
 
     Kept as a module function (not a method) so the gating rules stay
@@ -535,7 +512,21 @@ def save_pending_if_resolvable(
         entry_ts_open_ms=int(entry_ts_open_ms),
         analysis_context=context,
         bars_snapshot=list(bars or []),
+        user_id=user_id,
     )
+
+
+def _loads(raw: Any) -> Optional[dict]:
+    """解析 content_json。坏行跳过，不让单条脏数据毁掉整批。"""
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _num(v: Any) -> Optional[float]:

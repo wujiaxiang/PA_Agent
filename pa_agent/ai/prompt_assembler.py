@@ -1949,8 +1949,20 @@ class PromptAssembler:
             )
         return "\n".join(lines) + "\n"
 
-    @staticmethod
+    #: 经验条目渲染时**优先**呈现的字段。整条 JSON 塞进提示词会被
+    #: ``max_chars_per_entry`` 从尾部截断，而 ``analysis_context`` /
+    #: ``bars_snapshot`` 恰好排在后面 —— 曾经默认 cap=400 时它们**完全不可见**，
+    #: 实测 payload 7032 字符、analysis_context 从第 471 字符才开始，而参数
+    #: 上限 ``le=4000`` 装不下。调参不是捷径，必须字段感知地挑。
+    _EXPERIENCE_HEAD_FIELDS: tuple[str, ...] = (
+        "cycle_position", "direction", "detected_patterns", "confidence",
+        "summary", "symbol", "timeframe", "result", "pnl_pct",
+        "entry_price", "take_profit_price", "stop_loss_price", "is_long",
+    )
+
+    @classmethod
     def _render_experience(
+        cls,
         entries: list[Any],
         *,
         max_chars_per_entry: int = 400,
@@ -1961,17 +1973,51 @@ class PromptAssembler:
             "以下案例仅作对照，**不得**因相似就改变对本图结构/方向的独立判断。",
         ]
         for i, entry in enumerate(entries, 1):
-            if isinstance(entry, dict):
-                blob = json.dumps(entry, ensure_ascii=False, indent=2)
-            elif hasattr(entry, "content"):
-                blob = json.dumps(
-                    getattr(entry, "content", entry),
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            else:
-                blob = str(entry)
+            content = cls._entry_content(entry)
+            head = {
+                k: content.get(k)
+                for k in cls._EXPERIENCE_HEAD_FIELDS
+                if content.get(k) not in (None, "", [], {})
+            }
+            blob = json.dumps(head, ensure_ascii=False, indent=2)
+            # 复盘结论单独追加：它不在 content 里，而是挂在 experience_reviews。
+            # 不单独抽出来就永远挤不进提示词 —— 复盘写得再好也只是躺在库里。
+            review = cls._latest_review(entry)
+            extra = ""
+            if review:
+                crit = str(review.get("reusable_criteria") or "").strip()
+                verdict = str(review.get("verdict") or "").strip()
+                if crit or verdict:
+                    extra = (
+                        "\n该案例的复盘要点（供参考，不得凌驾于本次独立判断）："
+                        + (f"\n- 结论: {verdict}" if verdict else "")
+                        + (f"\n- 下次同类 setup 的判据: {crit}" if crit else "")
+                    )
             if len(blob) > max_chars_per_entry:
                 blob = blob[: max_chars_per_entry - 3] + "..."
-            lines.append(f"\n### 案例 {i}\n```json\n{blob}\n```")
+            lines.append(f"\n### 案例 {i}\n```json\n{blob}\n```{extra}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _entry_content(entry: Any) -> dict:
+        if isinstance(entry, dict):
+            return entry
+        return getattr(entry, "content", None) or {}
+
+    @staticmethod
+    def _latest_review(entry: Any) -> dict | None:
+        """取该案例最新一版复盘。无复盘返回 ``None``。
+
+        失败必须完全吞掉：复盘是锦上添花，取不到就少一段参考，绝不能让
+        提示词组装抛异常把整次分析带崩。
+        """
+        eid = str(getattr(entry, "filename", "") or
+                  (entry.get("entry_id") if isinstance(entry, dict) else "") or "")
+        if not eid:
+            return None
+        try:
+            from pa_agent.storage.experience_repo import latest_review
+
+            return latest_review(eid)
+        except Exception:  # noqa: BLE001
+            return None

@@ -120,117 +120,45 @@ def _derive_last_close_bar_iso(record: AnalysisRecord) -> str:
     return ""
 
 
-def _glob_partitioned(
-    exchange: str, symbol: str, timeframe: str, limit: int
-) -> list[Path]:
-    """三个过滤条件齐全时的快路径：直接定位分区目录。行为与改造前一致。"""
-    target_dir = (
-        RECORDS_DIR
-        / _safe_path_segment(exchange)
-        / _safe_path_segment(symbol)
-        / _safe_path_segment(timeframe)
-    )
-    files: list[Path] = list(target_dir.glob("*.json")) if target_dir.exists() else []
-
-    # 旧平铺布局: records/pending/{timestamp}_{symbol}_{timeframe}.json
-    for f in RECORDS_DIR.glob("*.json"):
-        if f.name.endswith(f"_{symbol}_{timeframe}.json"):
-            files.append(f)
-
-    # 去重（按解析后的绝对路径）
-    seen: set[str] = set()
-    unique_files: list[Path] = []
-    for f in files:
-        key = str(f.resolve())
-        if key not in seen:
-            seen.add(key)
-            unique_files.append(f)
-
-    # 按 mtime 倒序
-    unique_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-    return unique_files[:limit]
-
-
-def _db_candidates(
-    exchange: str,
-    symbol: str,
-    timeframe: str,
-    limit: int,
-    include_partial: bool,
-) -> list[Path]:
-    """**数据库为唯一真源**：返回 DB 指向的、确实存在于 RECORDS_DIR 的记录文件。
-
-    ``include_partial`` 必须下推到 SQL —— 否则失败记录先占掉 LIMIT 配额，
-    真实记录被挤掉，历史面板表现为「明明有记录却显示为空」（评审 H4）。
-
-    返回空列表 = 「库里没有」或「库不可用」，调用方据此回退磁盘（自愈路径，
-    不是双轨：磁盘只是补种来源，读的权威始终是库）。
-    """
+def _loads(raw: object) -> dict | None:
+    """解析 payload_json。坏行跳过，不让单条脏数据毁掉整批。"""
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw:
+        return None
     try:
-        from pa_agent.storage.repositories import list_records as db_list
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
-        rows = db_list(
-            exchange=exchange,
-            symbol=symbol,
-            timeframe=timeframe,
-            include_partial=include_partial,
-            limit=limit,
-        )
-        # 校验「文件存在」且「位于 RECORDS_DIR 内」：DB 里的 file_path 可能已
-        # 移动，而本函数契约是只返回 RECORDS_DIR 下的记录（该目录可被 monkeypatch）。
-        root = RECORDS_DIR.resolve()
-        paths: list[Path] = []
-        for r in rows:
-            fp = r.get("file_path")
-            if not fp:
-                continue
-            f = Path(fp)
-            if not f.is_file():
-                continue
-            try:
-                f.resolve().relative_to(root)
-            except ValueError:
-                continue
-            paths.append(f)
-        return paths
+
+def _request_user_id(request: Request) -> str:
+    """本次请求的 user_id，取不到回落默认用户。"""
+    try:
+        from web.api.auth_ctx import current_user_id
+
+        return current_user_id(request)
     except Exception:  # noqa: BLE001
-        logger.warning("SQLite browse failed, falling back to files", exc_info=True)
-        return []
+        return _default_user_id()
 
 
-def _file_candidates(
-    exchange: str, symbol: str, timeframe: str, limit: int
-) -> list[Path]:
-    """自愈回退：直接从磁盘定位记录文件。
+def _record_id_from_row(row: dict) -> str:
+    """DB 行 → URL 用的 record_id（RECORDS_DIR 下的相对路径，去掉 .json）。
 
-    三条件齐全 → 分区目录 glob（快）；缺任意一个 → 分区路径无法定位，
-    退化为全扫描 + 按记录 meta 过滤。仅用于「库里还没有这条记录」的场景。
+    保持与改造前**逐字一致** —— 前端把它当 URL 路径段回放，改格式等于
+    让所有历史回看点不动。``file_path`` 不在 RECORDS_DIR 下时（目录被
+    monkeypatch、跨机迁移等）退回用主键列，至少不会 404。
     """
-    from pa_agent.records.analysis_history import list_record_paths, load_record
-
-    if exchange and symbol and timeframe:
-        return _glob_partitioned(exchange, symbol, timeframe, limit)
-
-    paths = list_record_paths(RECORDS_DIR)
-    if not (exchange or symbol or timeframe):
-        return paths[:limit]
-
-    out: list[Path] = []
-    for f in paths:
-        if len(out) >= limit:
-            break
-        rec = load_record(f)
-        if rec is None:
-            continue
-        meta = rec.meta
-        if exchange and (meta.exchange or "") != exchange:
-            continue
-        if symbol and meta.symbol != symbol:
-            continue
-        if timeframe and meta.timeframe != timeframe:
-            continue
-        out.append(f)
-    return out
+    fp = str(row.get("file_path") or "")
+    if fp:
+        try:
+            f = Path(fp)
+            rel = f.resolve().relative_to(RECORDS_DIR.resolve())
+            return str(rel.with_suffix("")).replace("\\", "/")
+        except (ValueError, OSError):
+            pass
+    return str(row.get("record_id") or "")
 
 
 def _list_records(
@@ -239,56 +167,58 @@ def _list_records(
     timeframe: str,
     limit: int,
     include_partial: bool,
+    user_id: str = "",
 ) -> list[dict]:
-    """列出记录摘要。
+    """列出记录摘要。**只查库，不再读任何文件。**
 
-    **数据库是唯一真源**：先查 SQLite，只有「库里没有 / 库不可用」才回退磁盘
-    自愈。老的文件体系不再参与读取决策 —— 它只是补种来源，不是权威。
+    2026-10-05 起分析记录与经验库对齐：库是唯一真源，正文取 ``payload_json``。
+    这顺带补上一个真实的用户隔离漏洞 —— 旧的 ``_file_candidates`` 自愈回退
+    按 exchange/symbol/timeframe 扫盘，**唯独没有 user_id 判断**：DB 一抖动或
+    刚播种完没数据就走那条路，于是 A 能看到 B 的历史记录。而磁盘上的 JSON
+    本身也不含任何用户标记，无法事后补救。
 
     ``exchange``/``symbol``/``timeframe`` **全部可选**：三者皆空时跨全部品种
-    浏览（历史是 L2 用户级共享资产，A tab 分析出的记录 B tab 也要能查到，
-    见 docs/SESSION_STORAGE_DESIGN.md §2.1）。
+    浏览（历史是 L2 用户级共享资产，见 docs/SESSION_STORAGE_DESIGN.md §2.1）。
     """
-    if not RECORDS_DIR.exists():
+    from pa_agent.storage.repositories import list_records as db_list
+
+    try:
+        rows = db_list(
+            user_id=user_id or _default_user_id(),
+            exchange=exchange,
+            symbol=symbol,
+            timeframe=timeframe,
+            include_partial=include_partial,
+            limit=limit,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("records browse failed", exc_info=True)
         return []
 
-    candidates = _db_candidates(
-        exchange, symbol, timeframe, limit, include_partial
-    )
-    if not candidates:
-        candidates = _file_candidates(exchange, symbol, timeframe, limit)
-
     result: list[dict] = []
-    for f in candidates:
+    for row in rows:
+        data = _loads(row.get("payload_json"))
+        if data is None:
+            continue
+        # _partial_reason 由 save_partial 注入，不在 Pydantic schema 内
+        # （extra=forbid），必须先弹出再校验。
+        partial_reason = data.pop("_partial_reason", None)
         try:
-            with f.open("r", encoding="utf-8") as fp:
-                data = json.load(fp)
-            # _partial_reason 由 save_partial 注入，不在 Pydantic schema 内（extra=forbid），
-            # 必须先弹出再校验。
-            partial_reason = data.pop("_partial_reason", None)
             record = AnalysisRecord.model_validate(data)
         except Exception:
-            continue  # 跳过损坏的记录文件
+            continue  # 跳过损坏的载荷
 
-        # include_partial=False 时跳过失败记录
         if not include_partial and record.exception is not None:
             continue
 
-        # record_id: 相对 RECORDS_DIR 的路径（去掉 .json）。
-        # 强制使用正斜杠以便作为 URL 路径段（Windows 上 Path 会用反斜杠）。
-        rel = f.relative_to(RECORDS_DIR)
-        record_id = str(rel.with_suffix("")).replace("\\", "/")
-
         s2 = record.stage2_decision
-        # 修复：Stage2 实际结构为 {decision: {order_type, order_direction, ...}, ...}
-        # 直接 s2.get("order_type") 会返回 None，需从 .decision 子对象读取。
-        # 参考：tests/integration/test_gate_shortcircuit.py:54 验证嵌套结构。
+        # Stage2 实际结构为 {decision: {order_type, order_direction, ...}, ...}；
+        # 直接 s2.get("order_type") 会得到 None。
         s2_decision_inner = s2.get("decision") if isinstance(s2, dict) else None
         result.append({
-            "record_id": record_id,
+            "record_id": _record_id_from_row(row),
             "timestamp": record.meta.timestamp_local_iso,
             # 跨品种浏览时前端不知道每条记录属于哪个标的，必须回传这三个字段
-            # —— 否则「历史数据都能看」拿到的是一堆无法区分的条目。
             "symbol": record.meta.symbol,
             "timeframe": record.meta.timeframe,
             "exchange": record.meta.exchange,
@@ -307,14 +237,19 @@ def _list_records(
     return result
 
 
+def _default_user_id() -> str:
+    from pa_agent.storage.db import DEFAULT_USER_ID
+
+    return DEFAULT_USER_ID
+
+
 # ── E2E 专用：播种一条可回看的合成记录 ────────────────────────────────────
 # 端到端测试需要一条「历史记录」才能走回看链路，而 CI 是空库。
 #
 # **为什么必须由服务端播种**：宿主机与容器是两套文件系统视图
 # （宿主 /root/.../records/pending vs 容器 /app/records/pending），
-# 同一 inode 但路径不同。测试进程自己写库必然过不了
-# `_db_candidates` 的 `f.resolve().relative_to(RECORDS_DIR)` 校验。
-# 由服务端进程写盘、用它自己的 RECORDS_DIR、走它自己的 upsert，才是对的。
+# 同一 inode 但路径不同。由服务端进程写盘、用它自己的 RECORDS_DIR、
+# 走它自己的 upsert，才是对的。
 #
 # 安全：仅在 `PA_AGENT_E2E=1` 时注册路由，生产环境该路由**根本不存在**；
 # 记录文件名固定带 `__e2e_seed` 便于识别与清理。
@@ -395,6 +330,7 @@ if _E2E_ENABLED:  # pragma: no cover - 仅 E2E 环境
 
 @router.get("/records")
 async def list_records(
+    request: Request,
     exchange: str = Query("", description="交易所，如 GATEIO；留空=不过滤"),
     symbol: str = Query("", description="品种，如 BTCUSDT；留空=不过滤"),
     timeframe: str = Query("", description="周期，如 1d；留空=不过滤"),
@@ -407,33 +343,37 @@ async def list_records(
     共享资产，多标签页必须都能看到全量历史（docs/SESSION_STORAGE_DESIGN.md §2.1）。
     传入过滤条件时行为与改造前完全一致。
     """
-    # Offloaded: _list_records globs the partitions, stats and JSON-parses every
-    # candidate (records embed full stage1+stage2 payloads). Pure blocking file
-    # I/O — inline it stalls the event loop and every SSE stream.
+    # Offloaded: 载荷内嵌完整 stage1+stage2（数百 KB），JSON 解析是纯阻塞 CPU 工作，
+    # inline 会卡住事件循环与所有 SSE 流。
     return await asyncio.to_thread(
-        _list_records, exchange, symbol, timeframe, limit, include_partial
+        _list_records, exchange, symbol, timeframe, limit, include_partial,
+        _request_user_id(request),
     )
 
 
 @router.get("/records/{record_id:path}")
 async def get_record(record_id: str, request: Request):
-    """获取单条记录详情（已脱敏）。
+    """获取单条记录详情（已脱敏）。**只查库，按 user_id 过滤。**
 
     record_id 为相对 RECORDS_DIR 的路径（无 .json 后缀），例如
     ``GATEIO/BTCUSDT/1d/2026-07-18_14-00-13`` 或旧布局的
     ``2026-07-18_14-00-13_BTCUSDT_1d``。
+
+    此前直接 ``open()`` 读文件且**完全不过滤用户** —— 任何人拿到 URL 都能
+    读到别人的分析记录。记录详情含完整 stage1/stage2 推理，是这个系统里
+    最敏感的数据之一。
     """
     # 路径遍历防护：复用 helper（含 .. / 绝对路径检测）
     target = _validate_record_id(record_id)
 
-    if not target.exists():
-        raise HTTPException(status_code=404, detail="Record not found")
+    from pa_agent.storage.repositories import get_record_detail
 
-    try:
-        with target.open("r", encoding="utf-8") as fp:
-            data = json.load(fp)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load record: {e}")
+    row = get_record_detail(user_id=_request_user_id(request), file_path=str(target))
+    data = _loads(row.get("payload_json")) if row else None
+    if data is None:
+        # 「不属于当前用户」与「不存在」刻意同形：区分开等于确认某 id 存在，
+        # 那本身就是个信息泄露。
+        raise HTTPException(status_code=404, detail="Record not found")
 
     # 校验 schema（弹出 _partial_reason 以兼容 extra=forbid）
     partial_reason = data.pop("_partial_reason", None)
@@ -501,19 +441,18 @@ async def delete_record(record_id: str):
 
     ## 为什么是这个顺序
 
-    **磁盘是权威副本，SQLite 只是索引**（``repositories`` 模块 docstring）。
-    顺序必须让「索引指向真实存在的文件」这条不变式在**任何失败点**都成立：
+    仍以磁盘为权威副本（交易 PNG 要发图、回放历史体量大），故删除顺序不变：
+    **先删文件，成功后再删索引行**。
 
-    - 文件删不掉（权限 / 只读挂载 / 被占用）→ 直接 500，索引行原样保留。
-      库里指向一个还存在的文件，一致。
+    - 文件删不掉（权限 / 只读挂载 / 被占用）→ 直接 500，索引行原样保留，一致。
     - 文件删成功、索引行删失败 → 留下一行指向已消失文件的**死索引行**。
-      它不会显示（``_db_candidates`` 用 ``f.is_file()`` 自愈过滤），也不会
-      让记录复活（``_file_candidates`` 扫的是磁盘，文件已不在），只是留一行。
+      自 2026-10-05 读端只查库（``_list_records`` 直接读 ``payload_json``、
+      不再校验 ``f.is_file()``）后，这类行会直接显示出来。代价是「列表里有个
+      点不开的条目」，好过原先的静默不一致。
 
-    反过来（先删索引行）失败时的残留是**用户看得见**的：文件还在、索引没了，
-    而 ``_list_records`` 在「DB 结果为空」时会回退全盘扫描 —— 于是这条记录
-    又出现在列表里，用户再点删除、再失败，且**没有任何报错解释为什么删不掉**。
-    拿一个静默的行泄漏换一个删不掉的记录，明显不划算。
+    反过来（先删索引行）失败时的残留是**用户看得见**的：文件还在、索引没了。
+    读端不再回退扫盘，所以这条记录会从列表里消失 —— 仍是拿静默的行泄漏换
+    一个删不掉的记录，划算。
 
     ## 为什么不级联清 ``experience_entries`` / ``trade_records``
 

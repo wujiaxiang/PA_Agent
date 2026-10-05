@@ -18,13 +18,11 @@ import asyncio
 import json
 import logging
 import threading
-from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from sse_starlette.sse import EventSourceResponse
 
-from pa_agent.config.paths import EXPERIENCE_DIR
 from pa_agent.util.threading import CancelToken
 
 logger = logging.getLogger(__name__)
@@ -66,26 +64,20 @@ _SYSTEM = """你是一位交易复盘分析师。你会拿到一条交易计划�
 - 不要给出投资建议，只做推理质量评估。"""
 
 
-def _find_entry(record_id: str) -> tuple[Path, dict[str, Any]]:
-    """Locate an entry by basename under the retrievable library dirs."""
+def _find_entry(record_id: str, *, user_id: str) -> dict[str, Any]:
+    """按 ``entry_id`` 取经验条目。
+
+    **只查库**（2026-10-05 起文件布局已废弃）。``user_id`` 必传：复盘里含
+    当时的判断与推理，A 用户不该读到 B 用户的档案。
+    """
+    from pa_agent.storage.experience_repo import get_entry
+
     if not record_id or "/" in record_id or ".." in record_id:
         raise HTTPException(status_code=400, detail="非法 record_id")
-    root = Path(EXPERIENCE_DIR)
-    if not root.is_dir():
-        raise HTTPException(status_code=404, detail="经验库不存在")
-    from pa_agent.records.experience_writer import STATUS_DIRS
-
-    for cycle_dir in sorted(root.iterdir()):
-        if not cycle_dir.is_dir() or cycle_dir.name.startswith("."):
-            continue
-        for sub in STATUS_DIRS.values():
-            p = cycle_dir / sub / record_id
-            if p.is_file():
-                try:
-                    return p, json.loads(p.read_text(encoding="utf-8"))
-                except Exception:  # noqa: BLE001
-                    break
-    raise HTTPException(status_code=404, detail="记录不存在")
+    entry = get_entry(record_id, user_id=user_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="记录不存在或不属于当前用户")
+    return entry
 
 
 def _fmt_bars(bars: list[dict[str, Any]], anchor_ms: int) -> str:
@@ -163,19 +155,60 @@ def _build_prompt(entry: dict[str, Any]) -> list[dict[str, str]]:
     ]
 
 
+def _request_user(request: Request) -> str:
+    """本次请求的 user_id，取不到回落默认用户（身份判定本身不抛）。"""
+    try:
+        from web.api.auth_ctx import current_user_id
+
+        return current_user_id(request)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("user identity unavailable, using default: %s", exc)
+        from pa_agent.storage.db import DEFAULT_USER_ID
+
+        return DEFAULT_USER_ID
+
+
+def _persist_review(
+    record_id: str, user_id: str, reply: Any, ctx: Any
+) -> None:
+    """把复盘结论写进 ``experience_reviews``。
+
+    独立表 → 可以重跑并留历史，且**不改**经验条目本身的状态与时序。
+    失败只记 warning：复盘是附加产物，丢一次不该让用户看到报错。
+    """
+    content = getattr(reply, "content", None) or ""
+    if not str(content).strip():
+        logger.warning("experience review produced empty content; not persisted (%s)", record_id)
+        return
+    try:
+        from pa_agent.records.experience_writer import ExperienceWriter
+
+        ok = ExperienceWriter(logger=logger).attach_review(
+            record_id,
+            {"content": str(content), "reasoning": str(getattr(reply, "reasoning_content", "") or "")},
+            model=str(getattr(ctx.settings.provider, "model", "") or ""),
+            user_id=user_id,
+        )
+        if not ok:
+            logger.warning("experience review persist failed: %s", record_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("experience review persist error for %s: %s", record_id, exc)
+
+
 @router.get("/experience/review/stream")
 async def experience_review_stream(
     request: Request,
-    record_id: str = Query(..., description="经验条目的文件名（basename）"),
+    record_id: str = Query(..., description="经验条目 ID（experience_entries.entry_id）"),
 ):
     """SSE stream of an LLM post-mortem for one experience entry."""
-    _path, entry = _find_entry(record_id)
+    entry = _find_entry(record_id, user_id=_request_user(request))
     ctx = request.app.state.ctx
 
     client = getattr(ctx, "client", None)
     if client is None:
         raise HTTPException(status_code=503, detail="模型客户端不可用")
 
+    uid = _request_user(request)
     history = _build_prompt(entry)
     queue: asyncio.Queue = asyncio.Queue(maxsize=_REVIEW_QUEUE_MAXSIZE)
     loop = asyncio.get_running_loop()
@@ -203,6 +236,9 @@ async def experience_review_stream(
                 on_content_token=on_content,
                 cancel_token=cancel,
             )
+            # 落盘必须在 done **之前**、且由后端做：SSE 一断前端就没了，
+            # 依赖前端回报等于「用户关页面即丢失这次复盘」。
+            _persist_review(record_id, uid, reply, ctx)
             loop.call_soon_threadsafe(
                 queue.put_nowait, {"event": "done", "data": ""})
             _ = reply

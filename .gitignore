@@ -22,6 +22,12 @@ config/settings.json
 config/settings.local.json
 config/exception_state.json
 config/secret.key
+# HMAC 令牌签名密钥（storage/auth.py 开发态自动生成，0600）。
+# 提交它等于把签发权交给所有拿到仓库的人，且 git 历史会永久保留。
+config/token_secret
+# settings.json 的灾备副本：与 settings.json 同样含凭证面，且文件名不匹配
+# 上面的规则，通配符删除事故里已吃过一次亏。
+config/settings.json.*
 config/tv_symbol_aliases.json
 config/feishu.json
 *.pem

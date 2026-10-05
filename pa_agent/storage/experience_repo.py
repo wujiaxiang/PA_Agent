@@ -12,21 +12,55 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
+import uuid
+from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 
 from pa_agent.storage.db import DEFAULT_USER_ID, get_hub, now
 
 logger = logging.getLogger("pa_agent.storage.experience")
 
-#: 与 ``experience_writer.STATUS_DIRS`` 的键一一对应。
-#: 这里不 import experience_writer 是为了避免存储层反向依赖写入端。
-_VALID_STATUSES = ("success", "failure", "unresolved", "pending")
+#: ``experience_entries.status`` 的合法取值。
+#:
+#: **必须与 ``experience_writer.STATUS_*`` 完全一致**（win/loss/pending/
+#: unresolved）。这里曾写成 ("success","failure",...)，而写入端发的是
+#: "win"/"loss"，于是 ``upsert_entry`` 的兜底分支把它们统统静默改写成
+#: "pending" —— 每一条已结算的经验在库里都显示为待验证，检索端因此永远取不到。
+#: 一个不会报错、只会让整个经验库悄悄失效的词表错配。
+#:
+#: 不 import experience_writer 是为了避免存储层反向依赖写入端，所以这份
+#: 重复定义由 ``tests/unit/test_experience_repo_status_vocab.py`` 守护。
+_VALID_STATUSES = ("pending", "win", "loss", "unresolved")
 
 
-def _entry_id(path: Path) -> str:
-    """条目主键。用相对路径的 stem，保证同一 case 状态流转后 ID 不变。"""
-    return path.stem
+def _entry_id(stem: str, user_id: str = DEFAULT_USER_ID) -> str:
+    """条目主键：``<user_id>_<stem>``。
+
+    **为什么必须带 user_id**：``entry_id`` 是全局 PRIMARY KEY，且
+    ``ON CONFLICT ... DO UPDATE SET`` 的列清单里**没有** ``user_id``。曾经
+    entry_id 就是裸的 case id，于是两个用户各自产生同一条记录时，第二个写者
+    会静默覆盖第一个的 ``content_json``，而归属仍留在原主 —— 无任何报错，
+    一方的案例就没了。
+
+    为什么改**取值**而不是改主键：SQLite 不能 ALTER 主键，改成
+    ``(user_id, entry_id)`` 复合主键必须重建整张表。改取值零迁移成本。
+
+    仍能保证「状态流转是 UPDATE 而非新增行」：``entry_id`` 由调用方在
+    「入场那一刻」生成并随后一直复用，结算只改 status。
+    """
+    return f"{user_id}_{stem}"
+
+
+def new_entry_id(user_id: str = DEFAULT_USER_ID) -> str:
+    """为一条新的 pending 经验生成主键。
+
+    库内不再有文件名，``entry_id`` 必须**自带唯一性** —— 旧实现靠
+    ``<秒级时间戳>_<symbol>_<timeframe>`` 的文件名天然唯一，两用户同秒写同一
+    标的会撞。现在用 uuid 后缀彻底消除该碰撞面。
+    """
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    return _entry_id(f"{stamp}_{uuid.uuid4().hex[:8]}", user_id)
 
 
 def upsert_entry(
@@ -36,14 +70,14 @@ def upsert_entry(
     status: str,
     symbol: str,
     timeframe: str,
-    file_path: Path,
+    entry_id: str,
     timestamp_ms: int | None = None,
     user_id: str = DEFAULT_USER_ID,
 ) -> bool:
     """Insert or update one experience entry.
 
-    ``entry_id`` 取 ``file_path.stem`` —— ``ExperienceWriter._write`` 在状态
-    流转时**沿用原文件名**（记录时间不因结算而改变），故同一 case 从
+    ``entry_id`` 取 ``<user_id>_<file_path.stem>`` —— ``ExperienceWriter._write``
+    在状态流转时**沿用原文件名**（记录时间不因结算而改变），故同一 case 从
     ``pending`` 转 ``success`` 时是同一 ID 的 UPDATE，不会产生重复行。
     """
     st = status if status in _VALID_STATUSES else "pending"
@@ -54,8 +88,8 @@ def upsert_entry(
         INSERT INTO experience_entries
             (entry_id, user_id, status, symbol, timeframe, exchange,
              cycle_position, timestamp_ms, pnl_pct, entry_price,
-             content_json, file_path, created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             content_json, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(entry_id) DO UPDATE SET
             status=excluded.status,
             symbol=excluded.symbol,
@@ -66,18 +100,16 @@ def upsert_entry(
             pnl_pct=excluded.pnl_pct,
             entry_price=excluded.entry_price,
             content_json=excluded.content_json,
-            file_path=excluded.file_path,
             updated_at=excluded.updated_at
         """,
         (
-            _entry_id(file_path), user_id, st, symbol, timeframe,
+            entry_id, user_id, st, symbol, timeframe,
             str(content.get("exchange") or ""),
             str(cycle_position or ""),
             int(timestamp_ms if timestamp_ms is not None else content.get("timestamp_ms") or 0),
             _num(content.get("pnl_pct")),
             _num(content.get("entry_price")),
             payload,
-            str(file_path),
             ts, ts,
         ),
     )
@@ -90,24 +122,67 @@ def _num(v: Any) -> float | None:
         return None
 
 
+class QueryResult(list):
+    """查询结果 + **本次查询**是否失败。
+
+    继承 ``list`` 是为了不改动既有调用方（``len()`` / 迭代 / 下标 / ``== []``
+    全部照常）。新增的 ``failed`` / ``error`` 让调用方**不必**在拿到结果后
+    再去读 hub 上的标志位 —— 那是一个「查完再问」的时序，在同线程内连续多次
+    查询时也会误判（后一次成功会清掉前一次的失败标记）。切读路径尤其怕这个：
+    把「读不出来」当成「库里没有」会让经验库静默变空。
+
+    ``db.read_failed`` 已于 P-1 改为线程局部，跨线程污染已消除；这里是
+    再加一道 —— 把状态**随结果一起**交出去，从根上不依赖读后时序。
+    """
+
+    __slots__ = ("failed", "error")
+
+    def __init__(self, rows: Any = (), *, failed: bool = False, error: str = "") -> None:
+        super().__init__(rows)
+        self.failed = bool(failed)
+        self.error = str(error or "")
+
+
+def _run(sql: str, params: tuple = ()) -> QueryResult:
+    """执行一次读并**当场**捕获失败状态（同一线程、紧跟查询，无时序窗口）。"""
+    hub = get_hub()
+    rows = hub.query(sql, params)
+    return QueryResult(rows, failed=hub.read_failed, error=hub.read_error)
+
+
 def list_entries(
     *,
     user_id: str = DEFAULT_USER_ID,
     status: str | None = None,
+    statuses: Sequence[str] | None = None,
     symbol: str = "",
     timeframe: str = "",
     cycle_position: str = "",
     limit: int = 200,
-) -> list[dict]:
+) -> QueryResult:
     """列出经验条目。过滤条件全部可选，空值即不过滤。
 
-    ``status`` 传 ``None`` 表示不限；传具体值时精确匹配。读取端默认只应取
-    ``success``/``failure`` —— 未决的 ``pending``/``unresolved`` 不是已验证经验，
-    不得当失败经验喂回提示词（AGENTS.md「两阶段状态机」）。
+    ``status`` 传 ``None`` 表示不限；传具体值时精确匹配。``statuses`` 是**多值**
+    版本，取「成功 + 失败」这类集合过滤时必须用它。
+
+    **为什么需要多值**：读端要的是「两个目录合并后按时间取最新 N 条」，而不是
+    「成功取 N 条 + 失败取 N 条」。用单值调两次会得到**最多 2N 条**候选，
+    选中集与文件路径的语义不一致，且不会有任何报错 —— 这种偏差要等上线后
+    才发现选出来的案例变了。
+
+    读取端默认只应取 ``success``/``failure`` —— 未决的 ``pending``/``unresolved``
+    不是已验证经验，不得当失败经验喂回提示词（AGENTS.md「两阶段状态机」）。
     """
     where = ["user_id = ?"]
     params: list[Any] = [user_id]
-    if status:
+    if statuses:
+        wanted = [s for s in statuses if s]
+        if wanted:
+            where.append(
+                "status IN (%s)" % ",".join("?" * len(wanted))
+            )
+            params.extend(wanted)
+    elif status:
         where.append("status = ?")
         params.append(status)
     if symbol:
@@ -120,30 +195,53 @@ def list_entries(
         where.append("cycle_position = ?")
         params.append(cycle_position)
     params.append(int(limit))
-    return [
-        dict(r)
-        for r in get_hub().query(
-            "SELECT * FROM experience_entries WHERE "
-            + " AND ".join(where)
-            + " ORDER BY timestamp_ms DESC LIMIT ?",
-            tuple(params),
-        )
-    ]
-
-
-def get_entry(entry_id: str, *, user_id: str = DEFAULT_USER_ID) -> dict | None:
-    """取单条完整 payload。"""
-    row = get_hub().query_one(
-        "SELECT content_json FROM experience_entries WHERE entry_id = ? AND user_id = ?",
-        (entry_id, user_id),
+    res = _run(
+        "SELECT * FROM experience_entries WHERE "
+        + " AND ".join(where)
+        + " ORDER BY timestamp_ms DESC LIMIT ?",
+        tuple(params),
     )
-    if row is None:
+    # sqlite3.Row 只支持 ["key"] 下标，而调用方（含 ExperienceReader 的 DB 路径）
+    # 用的是 .get()，故必须转成 dict。失败状态一并带出。
+    return QueryResult(
+        [dict(r) for r in res], failed=res.failed, error=res.error,
+    )
+
+
+def get_entry(
+    entry_id: str, *, user_id: str | None = DEFAULT_USER_ID
+) -> dict | None:
+    """取单条完整 payload。读失败返回 ``None``（与「不存在」同形，见类文档说明）。
+
+    ``user_id=None`` 表示**不做用户过滤** —— 仅供结算侧使用。``entry_id`` 是
+    全局唯一主键，且结算方拿到的 id 来自本进程 ``list_pending()`` 的结果，
+    不是外部输入。之所以需要这条：当 user_id 为空时，归属只能从记录里读，
+    而归属恰好在 ``content["user_id"]`` 里 —— 不先不过滤地读出来就永远读不到。
+    """
+    if user_id is None:
+        row = _run(
+            "SELECT content_json, user_id, status FROM experience_entries WHERE entry_id = ?",
+            (entry_id,),
+        )
+    else:
+        row = _run(
+            "SELECT content_json, user_id, status FROM experience_entries"
+            " WHERE entry_id = ? AND user_id = ?",
+            (entry_id, user_id),
+        )
+    if not row:
         return None
     try:
-        return json.loads(row["content_json"])
-    except json.JSONDecodeError:
+        payload = json.loads(row[0]["content_json"])
+    except (json.JSONDecodeError, KeyError, TypeError):
         logger.warning("experience entry %s has corrupt payload_json", entry_id)
         return None
+    if isinstance(payload, dict):
+        # 归属与状态都以**库里的列**为准：content 是可被复盘改写的载荷，
+        # 不该当身份/状态来源（save() 写出的 content 压根没有 status 字段）。
+        payload.setdefault("user_id", str(row[0]["user_id"] or ""))
+        payload.setdefault("status", str(row[0]["status"] or ""))
+    return payload
 
 
 def delete_entry(entry_id: str, *, user_id: str = DEFAULT_USER_ID) -> bool:
@@ -169,10 +267,78 @@ def count_by_status(
     if timeframe:
         where.append("timeframe = ?")
         params.append(timeframe)
-    rows = get_hub().query(
+    result = _run(
         "SELECT status, COUNT(*) AS n FROM experience_entries WHERE "
         + " AND ".join(where)
         + " GROUP BY status",
         tuple(params),
     )
-    return {r["status"]: int(r["n"]) for r in rows}
+    return {r["status"]: int(r["n"]) for r in result}
+
+
+# ── 复盘（P3） ─────────────────────────────────────────────────────────────────
+
+def attach_review(
+    payload: dict[str, Any],
+    *,
+    entry_id: str,
+    user_id: str = DEFAULT_USER_ID,
+    model: str = "",
+    verdict: str = "",
+    reusable_criteria: str = "",
+) -> bool:
+    """写一条复盘。
+
+    **独立表而非 ``content_json`` 里的一个字段**：复盘会重跑（同一交易可能出
+    多版结论），独立表才留得住历史与「当时用的是哪个模型」。``content_json``
+    是给检索/渲染读的原始档案，不该被复盘反复改写。
+    """
+    return get_hub().execute(
+        """
+        INSERT INTO experience_reviews
+            (entry_id, user_id, model, verdict, reusable_criteria, payload_json, created_at)
+        VALUES (?,?,?,?,?,?,?)
+        """,
+        (
+            entry_id, user_id, str(model or ""), str(verdict or ""),
+            str(reusable_criteria or ""),
+            json.dumps(payload, ensure_ascii=False),
+            now(),
+        ),
+    )
+
+
+def latest_review(
+    entry_id: str, *, user_id: str = DEFAULT_USER_ID
+) -> dict | None:
+    """该条目最新一版复盘（载荷已解析）。没有则 ``None``。"""
+    row = _run(
+        """
+        SELECT payload_json, model, verdict, reusable_criteria, created_at
+        FROM experience_reviews
+        WHERE entry_id = ? AND user_id = ?
+        ORDER BY created_at DESC, review_id DESC LIMIT 1
+        """,
+        (entry_id, user_id),
+    )
+    if not row:
+        return None
+    try:
+        payload = json.loads(row[0]["payload_json"])
+    except (json.JSONDecodeError, KeyError, TypeError):
+        logger.warning("experience review %s has corrupt payload", entry_id)
+        return None
+    return {
+        "model": row[0]["model"],
+        "verdict": row[0]["verdict"],
+        "reusable_criteria": row[0]["reusable_criteria"],
+        "created_at": row[0]["created_at"],
+        "payload": payload if isinstance(payload, dict) else {},
+    }
+
+
+def delete_reviews(entry_id: str, *, user_id: str = DEFAULT_USER_ID) -> bool:
+    return get_hub().execute(
+        "DELETE FROM experience_reviews WHERE entry_id = ? AND user_id = ?",
+        (entry_id, user_id),
+    )

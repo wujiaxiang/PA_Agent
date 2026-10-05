@@ -21,8 +21,8 @@ from pa_agent.storage import repositories
 from pa_agent.storage.db import reset_hub_for_tests
 from pa_agent.storage.experience_repo import (
     count_by_status,
+    delete_entry,
     get_entry,
-    list_entries,
     upsert_entry,
 )
 
@@ -125,129 +125,130 @@ def test_api_key_never_reaches_db(db, tmp_path):
     assert secret not in rows[0]["payload_json"], "API key 泄漏进数据库"
 
 
-# ── ExperienceWriter 双写 + 状态流转 ─────────────────────────────────────────
+# ── 经验库：存储层关注点（业务行为见 test_experience_*）─────────────────────
 
-
-def test_experience_upsert_and_fetch(db, tmp_path):
-    path = tmp_path / "success_cases" / "2026-10-05_BTCUSDT_1h.json"
-    path.parent.mkdir(parents=True)
-    content = {"symbol": "BTCUSDT", "timeframe": "1h", "pnl_pct": 3.2, "entry_price": 100.0}
-    assert upsert_entry(
-        content, cycle_position="trending_tr", status="success",
-        symbol="BTCUSDT", timeframe="1h", file_path=path,
-    )
-    got = get_entry("2026-10-05_BTCUSDT_1h")
+def test_experience_upsert_and_fetch(db):
+    upsert_entry({"symbol": "BTCUSDT", "pnl_pct": 3.2}, entry_id="admin_e1",
+                 cycle_position="trending_tr", status="win",
+                 symbol="BTCUSDT", timeframe="1h")
+    got = get_entry("admin_e1", user_id="admin")
     assert got is not None and got["pnl_pct"] == 3.2
-    assert count_by_status() == {"success": 1}
+    assert got["status"] == "win", "status 以**列**为准，必须回填进 payload"
+    assert count_by_status() == {"win": 1}
 
 
-def test_experience_status_transition_is_update_not_duplicate(db, tmp_path):
-    """回归守卫：pending → success 沿用原文件名，故必须是同一行 UPDATE。
+def test_entry_id_is_partitioned_by_user(db):
+    """**回归守卫**：跨用户不得互相覆盖。
 
-    ExperienceWriter._write 在状态流转时保留原文件名，若这里按 (entry_id,
-    status) 建复合主键就会每次流转多出一行，经验库越用越重复。
+    ``entry_id`` 是全局 PRIMARY KEY，而 ``ON CONFLICT DO UPDATE SET`` 的列
+    清单里没有 ``user_id``。曾经 entry_id 就是裸的 case id，两个用户各自产生
+    同一条记录时后者会静默覆盖前者的 ``content_json``，归属仍留在原主 ——
+    一方的案例凭空消失且无任何报错。
     """
-    path = tmp_path / "pending_cases" / "case1.json"
-    path.parent.mkdir(parents=True)
-    args = dict(cycle_position="trending_tr", symbol="BTCUSDT",
-                timeframe="1h", file_path=path)
-    upsert_entry({"symbol": "BTCUSDT", "timeframe": "1h"}, status="pending", **args)
-    upsert_entry({"symbol": "BTCUSDT", "timeframe": "1h"}, status="success", **args)
+    from pa_agent.storage.experience_repo import list_entries as _list
 
-    assert count_by_status() == {"success": 1}, "状态流转后不应残留 pending 行"
+    upsert_entry({"who": "alice"}, entry_id="alice_case1", cycle_position="trending_tr",
+                 status="win", symbol="X", timeframe="1h", user_id="alice")
+    upsert_entry({"who": "bob"}, entry_id="bob_case1", cycle_position="trending_tr",
+                 status="win", symbol="X", timeframe="1h", user_id="bob")
+
+    assert len(_list(user_id="alice")) == 1 and len(_list(user_id="bob")) == 1
+    assert "alice" in _list(user_id="alice")[0]["content_json"]
+    assert "bob" in _list(user_id="bob")[0]["content_json"], "B 的内容不得被 A 覆盖"
 
 
-def test_experience_unknown_status_falls_back_to_pending(db, tmp_path):
+def test_status_transition_is_update_not_duplicate(db):
+    """pending → win 必须是同一行 UPDATE，不能每次结算多出一行。"""
+    upsert_entry({"symbol": "BTCUSDT"}, entry_id="admin_c1",
+                 cycle_position="trending_tr", status="pending",
+                 symbol="BTCUSDT", timeframe="1h")
+    upsert_entry({"symbol": "BTCUSDT"}, entry_id="admin_c1",
+                 cycle_position="trending_tr", status="win",
+                 symbol="BTCUSDT", timeframe="1h")
+    assert count_by_status() == {"win": 1}, "结算后不应残留 pending 行"
+
+
+def test_status_vocabulary_guard(db):
+    """**回归守卫**：状态词表必须与 ``experience_writer.STATUS_*`` 一致。
+
+    这里曾写成 ("success","failure",...)，而写入端发的是 "win"/"loss"，
+    ``upsert_entry`` 的兜底分支把它们统统静默改写成 "pending" —— 每一条已结算
+    的经验在库里都显示为待验证，检索端因此永远取不到，整个经验库静默失效。
+    """
+    from pa_agent.records.experience_writer import (
+        STATUS_LOSS, STATUS_PENDING, STATUS_UNRESOLVED, STATUS_WIN,
+    )
+    from pa_agent.storage.experience_repo import _VALID_STATUSES
+
+    assert set(_VALID_STATUSES) == {STATUS_WIN, STATUS_LOSS, STATUS_PENDING, STATUS_UNRESOLVED}
+
+    for want in (STATUS_WIN, STATUS_LOSS):
+        upsert_entry({"i": want}, entry_id=f"admin_{want}", cycle_position="trending_tr",
+                     status=want, symbol="X", timeframe="1h")
+    from pa_agent.storage.experience_repo import list_entries as _list
+
+    got = {r["status"] for r in _list()}
+    assert got == {"win", "loss"}, f"已结算状态被改写了：{got}"
+
+
+def test_unknown_status_falls_back_to_pending(db):
     """未知状态归 pending（最保守），不得凭空造出可检索的成功经验。"""
-    path = tmp_path / "success_cases" / "c.json"
-    path.parent.mkdir(parents=True)
-    upsert_entry({"symbol": "X"}, cycle_position="trending_tr", status="bogus",
-                 symbol="X", timeframe="1h", file_path=path)
+    upsert_entry({"symbol": "X"}, entry_id="admin_x", cycle_position="trending_tr",
+                 status="bogus", symbol="X", timeframe="1h")
     assert count_by_status() == {"pending": 1}
 
 
-def test_experience_filters_and_counts_agree(db, tmp_path):
-    """汇总计数必须跟着过滤走，否则前端显示的数字与列表对不上。"""
-    for i, (sym, tf) in enumerate([("BTCUSDT", "1h"), ("NVDA", "1h"), ("NVDA", "4h")]):
-        p = tmp_path / "success_cases" / f"c{i}.json"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        upsert_entry({"symbol": sym, "timeframe": tf}, cycle_position="trending_tr",
-                     status="success", symbol=sym, timeframe=tf, file_path=p)
-    assert len(list_entries(symbol="NVDA")) == 2
-    assert count_by_status(symbol="NVDA") == {"success": 2}
-    assert count_by_status(symbol="BTCUSDT") == {"success": 1}
+def test_list_entries_statuses_and_filters(db):
+    from pa_agent.storage.experience_repo import list_entries as _list
+
+    for i, (sym, st) in enumerate([("BTCUSDT", "win"), ("NVDA", "loss"),
+                                   ("BTCUSDT", "win"), ("ETHUSDT", "pending")]):
+        upsert_entry({"i": i}, entry_id=f"admin_e{i}", cycle_position="trending_tr",
+                     status=st, symbol=sym, timeframe="1h")
+
+    both = _list(statuses=["win", "loss"])
+    assert {r["status"] for r in both} == {"win", "loss"}
+    assert "pending" not in {r["status"] for r in both}, "未决不得被检索端拿到"
+    assert len(_list(statuses=["win", "loss"], limit=2)) == 2, "limit 必须在合并之后生效"
+    assert len(_list(symbol="BTCUSDT", statuses=["win", "loss"])) == 2
+    assert count_by_status(symbol="BTCUSDT") == {"win": 2}
 
 
-def test_experience_delete(db, tmp_path):
-    from pa_agent.storage.experience_repo import delete_entry
-
-    p = tmp_path / "success_cases" / "d.json"
-    p.parent.mkdir(parents=True)
-    upsert_entry({"symbol": "X"}, cycle_position="trending_tr", status="success",
-                 symbol="X", timeframe="1h", file_path=p)
-    assert delete_entry("d") is True
-    assert get_entry("d") is None
+def test_get_entry_scoped_by_user(db):
+    upsert_entry({"who": "alice"}, entry_id="alice_x", cycle_position="trending_tr",
+                 status="win", symbol="X", timeframe="1h", user_id="alice")
+    assert get_entry("alice_x", user_id="alice") is not None
+    assert get_entry("alice_x", user_id="bob") is None
+    assert get_entry("alice_x", user_id=None) is not None, "结算侧需要不过滤地读"
 
 
-# ── 导入边界：合成数据绝不入库 ────────────────────────────────────────────────
+def test_experience_delete(db):
+    upsert_entry({"symbol": "X"}, entry_id="admin_d", cycle_position="trending_tr",
+                 status="win", symbol="X", timeframe="1h")
+    assert delete_entry("admin_d") is True
+    assert get_entry("admin_d") is None
 
 
-def test_import_skips_dot_prefixed_dirs(db, tmp_path):
-    """AGENTS.md 硬要求：.seed_demo_*/ 是合成数据，.omc/ 是工具状态，都不得进库。"""
-    from pa_agent.storage.importer import import_experience_entries
+# ── 查询结果的失败状态必须自带（P-1b）─────────────────────────────────────────
 
-    root = tmp_path / "experience"
-    real = root / "trending_tr" / "success_cases"
-    real.mkdir(parents=True)
-    (real / "real.json").write_text(
-        json.dumps({"symbol": "BTCUSDT", "timeframe": "1h"}), encoding="utf-8"
-    )
+def test_query_result_reports_failure_explicitly(db):
+    """``list_entries()`` 必须把「本次查询失败」随结果一起交出去。
 
-    seed = root / ".seed_demo_20260817" / "trending_tr" / "success_cases"
-    seed.mkdir(parents=True)
-    (seed / "fake.json").write_text(
-        json.dumps({"symbol": "FAKE", "timeframe": "1d"}), encoding="utf-8"
-    )
+    ``hub.query()`` 失败返回 ``[]``，与「库里确实没有」完全同形。调用方若靠
+    事后去读 hub 上的标志位判断，就有读后时序：同线程内后一次成功读会把前一次
+    的失败标记清掉，于是把故障放行成「空库」。
+    """
+    from pa_agent.storage.experience_repo import list_entries as _list
 
-    omc = root / ".omc" / "state"
-    omc.mkdir(parents=True)
-    (omc / "tool.json").write_text(json.dumps({"x": 1}), encoding="utf-8")
+    upsert_entry({"symbol": "BTCUSDT"}, entry_id="admin_a", cycle_position="trending_tr",
+                 status="win", symbol="BTCUSDT", timeframe="1h")
 
-    stats = import_experience_entries(root)
-    assert stats["imported"] == 1, "只应导入真实条目"
-    assert count_by_status() == {"success": 1}
-    assert get_entry("fake") is None, "合成数据不得入库"
-    assert get_entry("tool") is None, "工具状态不得入库"
+    ok = _list(statuses=["win", "loss"])
+    assert isinstance(ok, list) and ok, "仍是 list，既有调用方不受影响"
+    assert ok.failed is False and ok.error == ""
 
-
-# ── admin 用户 ────────────────────────────────────────────────────────────────
-
-
-def test_admin_user_seeded(db):
-    from pa_agent.storage.users import (
-        ADMIN_USER_ID, default_user_id, ensure_admin_user, get_user, list_users,
-    )
-
-    assert ensure_admin_user() == ADMIN_USER_ID
-    u = get_user(ADMIN_USER_ID)
-    assert u is not None and u["role"] == "admin" and u["is_default"] == 1
-    assert default_user_id() == ADMIN_USER_ID, "UI 暂不做登录，默认恒为 admin"
-    assert [x["user_id"] for x in list_users()] == [ADMIN_USER_ID]
-
-
-def test_ensure_admin_is_idempotent(db):
-    from pa_agent.storage.users import ensure_admin_user, list_users
-
-    for _ in range(3):
-        ensure_admin_user()
-    assert len(list_users()) == 1, "重复播种不得产生重复用户"
-
-
-def test_admin_seeding_tolerates_db_disabled(tmp_path):
-    """DB 降级时不得抛异常 —— 那是设计里的降级路径，配置回落 settings.json。"""
-    from pa_agent.storage.db import reset_hub_for_tests
-    from pa_agent.storage.users import ADMIN_USER_ID, ensure_admin_user
-
-    hub = reset_hub_for_tests(tmp_path / "x.db")
-    hub._disable("simulated")
-    assert ensure_admin_user() == ADMIN_USER_ID
+    db.query("DROP TABLE experience_entries")
+    bad = _list(statuses=["win", "loss"])
+    assert bad == []
+    assert bad.failed is True, "读不出来必须被显式标记，而不是伪装成空库"
+    assert bad.error

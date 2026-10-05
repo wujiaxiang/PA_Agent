@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS global_config (
         updated_at REAL NOT NULL
     );
 CREATE TABLE IF NOT EXISTS user_prefs (
-        user_id    TEXT NOT NULL DEFAULT 'default',
+        user_id    TEXT NOT NULL,
         key        TEXT NOT NULL,
         value_json TEXT NOT NULL,
         updated_at REAL NOT NULL,
@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS user_prefs (
     );
 CREATE TABLE IF NOT EXISTS analysis_records (
         record_id       TEXT PRIMARY KEY,
-        user_id         TEXT NOT NULL DEFAULT 'default',
+        user_id         TEXT NOT NULL,
         exchange        TEXT NOT NULL DEFAULT '',
         symbol          TEXT NOT NULL,
         timeframe       TEXT NOT NULL,
@@ -52,7 +52,7 @@ CREATE INDEX IF NOT EXISTS ix_rec_recent
         ON analysis_records (user_id, ts_local_ms DESC);
 CREATE TABLE IF NOT EXISTS experience_entries (
         entry_id      TEXT PRIMARY KEY,
-        user_id       TEXT NOT NULL DEFAULT 'default',
+        user_id       TEXT NOT NULL,
         status        TEXT NOT NULL,
         symbol        TEXT NOT NULL DEFAULT '',
         timeframe     TEXT NOT NULL DEFAULT '',
@@ -70,9 +70,23 @@ CREATE INDEX IF NOT EXISTS ix_exp_browse
         ON experience_entries (user_id, status, symbol, timeframe, timestamp_ms DESC);
 CREATE INDEX IF NOT EXISTS ix_exp_recent
         ON experience_entries (user_id, timestamp_ms DESC);
+CREATE TABLE IF NOT EXISTS experience_reviews (
+        review_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+        entry_id     TEXT NOT NULL,
+        user_id      TEXT NOT NULL,
+        model        TEXT NOT NULL DEFAULT '',
+        verdict      TEXT NOT NULL DEFAULT '',
+        reusable_criteria TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL,
+        created_at   REAL NOT NULL,
+        FOREIGN KEY (entry_id) REFERENCES experience_entries(entry_id)
+            ON DELETE CASCADE
+    );
+CREATE INDEX IF NOT EXISTS ix_review_entry
+        ON experience_reviews (user_id, entry_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS trade_records (
         trade_id     TEXT PRIMARY KEY,
-        user_id      TEXT NOT NULL DEFAULT 'default',
+        user_id      TEXT NOT NULL,
         symbol       TEXT NOT NULL,
         timeframe    TEXT NOT NULL DEFAULT '',
         order_type   TEXT NOT NULL DEFAULT '',
@@ -89,7 +103,7 @@ CREATE INDEX IF NOT EXISTS ix_trade_recent
         ON trade_records (user_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS chat_turns (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id     TEXT NOT NULL DEFAULT 'default',
+        user_id     TEXT NOT NULL,
         session_id  TEXT NOT NULL DEFAULT '',
         thread_key  TEXT NOT NULL DEFAULT '',
         record_id   TEXT NOT NULL DEFAULT '',
@@ -107,7 +121,7 @@ CREATE INDEX IF NOT EXISTS ix_chat_thread
         ON chat_turns (user_id, thread_key, turn);
 CREATE TABLE IF NOT EXISTS sessions (
         session_id  TEXT PRIMARY KEY,
-        user_id     TEXT NOT NULL DEFAULT 'default',
+        user_id     TEXT NOT NULL,
         symbol      TEXT NOT NULL DEFAULT '',
         timeframe   TEXT NOT NULL DEFAULT '',
         exchange    TEXT NOT NULL DEFAULT '',
@@ -132,5 +146,5 @@ CREATE INDEX IF NOT EXISTS ix_sessions_expiry ON sessions (expires_at);
 -- [users] ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';
 
 -- schema 版本: 1
--- 表: users, global_config, user_prefs, analysis_records, experience_entries, trade_records, chat_turns, sessions
+-- 表: users, global_config, user_prefs, analysis_records, experience_entries, experience_reviews, trade_records, chat_turns, sessions
 

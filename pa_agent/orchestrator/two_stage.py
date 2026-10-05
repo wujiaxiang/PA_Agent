@@ -216,6 +216,7 @@ def _build_empty_record(
     settings: Optional["Settings"],
     incremental: bool = False,
     continuous: bool = False,
+    user_id: str = "",
 ) -> AnalysisRecord:
     """Build a partial AnalysisRecord with meta populated from the frame."""
     ts_ms = now_local_ms()
@@ -287,6 +288,7 @@ def _build_empty_record(
         last_close_bar_iso=last_close_bar_iso,
         incremental=incremental,
         continuous=continuous,
+        user_id=str(user_id or ""),
     )
 
     return AnalysisRecord(
@@ -381,6 +383,40 @@ class TwoStageOrchestrator:
 
         return ValidationSettings()
 
+    def _load_experience(
+        self, stage1_json: dict, prompt_cfg: Any, user_id: str = ""
+    ) -> list[Any]:
+        """检索经验条目。**任何异常都吞掉并返回空列表。**
+
+        经验库是锦上添花的输入，不是分析的前提。让它把整次分析带崩（含已经
+        付费的 Stage 1）是最差的失败模式：存储层抖动、条目 JSON 损坏、reader
+        实现有 bug —— 都不该阻断推理。
+
+        切读 SQLite 之后这条尤其重要：``hub.query()`` 出错返回 ``[]``，
+        而「读不出来」与「库里确实没有」同形。调用方拿到的必须是一个**明确
+        的失败**，由 reader 侧自行回落文件，而不是让这里猜。
+        """
+        max_exp = getattr(prompt_cfg, "experience_max_entries", 0) if prompt_cfg else 0
+        if max_exp <= 0:
+            return []
+        cycle_position = str(stage1_json.get("cycle_position", "unknown") or "unknown")
+        try:
+            if hasattr(self._exp_reader, "read_for_stage2"):
+                return list(self._exp_reader.read_for_stage2(
+                    cycle_position,
+                    direction=str(stage1_json.get("direction", "") or ""),
+                    patterns=stage1_json.get("detected_patterns") or [],
+                    max_entries=max_exp,
+                    user_id=user_id,
+                ))
+            return list(self._exp_reader.read_top5(cycle_position)[:max_exp])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "experience retrieval failed (cycle=%s); continuing without it: %s",
+                cycle_position, exc,
+            )
+            return []
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def submit(
@@ -399,6 +435,7 @@ class TwoStageOrchestrator:
         incremental_new_bar_count: int | None = None,
         incremental: bool = False,
         continuous: bool = False,
+        user_id: str = "",
     ) -> AnalysisRecord:
         """Run the two-stage analysis pipeline and return an AnalysisRecord.
 
@@ -422,7 +459,10 @@ class TwoStageOrchestrator:
             Fully or partially populated record.
         """
         # ── Step 1: Build partial record ──────────────────────────────────────
-        record = _build_empty_record(frame, self._settings, incremental=incremental, continuous=continuous)
+        record = _build_empty_record(
+            frame, self._settings,
+            incremental=incremental, continuous=continuous, user_id=user_id,
+        )
 
         # ── Step 2: Pre-Stage-1 cancel check ─────────────────────────────────
         if cancel_token.is_set():
@@ -657,6 +697,20 @@ class TwoStageOrchestrator:
         # ── Step 9: Stage 1 done ──────────────────────────────────────────────
         on_event(OrchestratorEvent.Stage1Done)
 
+        # ── Step 9.5: 先把「已付费的阶段一」落盘 ────────────────────────────────
+        # 动机：reader、策略路由、后续任何一步抛异常，都不该让这次分析连同**已经
+        # 成功返回的 Stage 1 结果**一起消失 —— 那是一次真实付费的模型调用。
+        # 此前所有 save_partial 都在 Stage1Done 之前，而 reader 在下面、下一次
+        # 落盘在更下面，中间是裸的。save_partial 与 save_full 写同一个路径，
+        # 后续 save_full 会覆盖它，不会留下重复记录。
+        record = record.model_copy(update={
+            "stage1_messages": messages_s1,
+            "stage1_response": reply_s1.raw,
+            "stage1_diagnosis": stage1_json,
+            "usage_total": _accumulate_usage(record.usage_total, reply_s1.usage),
+        })
+        self._pending_writer.save_partial(record, "stage1_completed")
+
         # ── Step 10: Route strategy files ─────────────────────────────────────
         if callable(self._router) and not hasattr(self._router, "route"):
             strategy_files: list[str] = self._router(stage1_json)
@@ -664,26 +718,9 @@ class TwoStageOrchestrator:
             strategy_files = self._router.route(stage1_json)
 
         # ── Step 11: Load experience entries ──────────────────────────────────
-        cycle_position: str = stage1_json.get("cycle_position", "unknown")
-        direction = str(stage1_json.get("direction", "") or "")
-        patterns = stage1_json.get("detected_patterns") or []
         prompt_cfg = getattr(self._settings, "prompt", None) if self._settings else None
-        max_exp = getattr(prompt_cfg, "experience_max_entries", 0) if prompt_cfg else 0
-        max_chars = (
-            getattr(prompt_cfg, "experience_max_chars_per_entry", 400) if prompt_cfg else 400
-        )
-        if max_exp <= 0:
-            experience_entries = []
-        elif hasattr(self._exp_reader, "read_for_stage2"):
-            experience_entries = self._exp_reader.read_for_stage2(
-                cycle_position,
-                direction=direction,
-                patterns=patterns,
-                max_entries=max_exp,
-                max_chars_per_entry=max_chars,
-            )
-        else:
-            experience_entries = self._exp_reader.read_top5(cycle_position)[:max_exp]
+        experience_entries = self._load_experience(stage1_json, prompt_cfg, user_id)
+
 
         # ── Step 12: Pre-Stage-2 cancel check ────────────────────────────────
         if cancel_token.is_set():

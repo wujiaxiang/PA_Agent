@@ -25,6 +25,11 @@ class RecordMeta(BaseModel):
     last_close_bar_iso: str = ""  # Local ISO string of the last closed kline; "" for legacy records
     incremental: bool = False      # Whether this was an incremental analysis (reused prior context)
     continuous: bool = False       # Whether this was triggered by continuous analysis mode
+    #: 发起本次分析的用户。带默认 → 旧记录读出为 ``""``（legacy）。
+    #: 必须随记录一起落盘：经验库的写入方跑在 daemon 线程/调度器线程上，
+    #: 不在请求上下文里，没有它就只能回落成默认用户 —— 多用户下等于把
+    #: A 的单写进 B 的账。
+    user_id: str = ""
 
 
 class AnalysisRecord(BaseModel):

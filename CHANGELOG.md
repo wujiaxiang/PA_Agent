@@ -6,6 +6,54 @@
 
 ## 2026-10-05
 
+### 9. 分析记录读端只查库 —— 补上一个用户隔离漏洞
+
+- **问题**：`/api/records` 的列表与详情此前都会**直接读 JSON 文件**，
+  两条路径都**不过滤 user_id**：
+  1. `_file_candidates` 自愈回退按 exchange/symbol/timeframe 扫盘，唯独没有
+     user_id —— DB 一抖动或刚播种完没数据就走那条路
+  2. `GET /api/records/{id}` 直接 `open()` 文件，任何人拿到 URL 就能读到
+     别人的完整 stage1/stage2 推理（这个系统里最敏感的数据）
+  而磁盘 JSON **本身不含任何用户标记**，事后无法补救
+- **修复**：列表与详情一律走库（`repositories.list_records` /
+  新增 `get_record_detail`，后者强制 user_id 过滤），删除
+  `_file_candidates` / `_db_candidates` / `_glob_partitioned` 三个扫描器。
+  `record_id` 格式保持逐字不变（前端当 URL 路径段用，改格式会让所有历史回看点不动）
+- **实测**（真实服务 + 令牌）：admin 匿名请求看不到 bob 的记录；bob 带令牌只看到自己的
+- **顺带暴露**：库主键是文件 stem，依赖文件名唯一。生产命名带 `uuid8` 故安全，
+  但同名文件会被后者 UPDATE 掉 —— 测试构造多条记录时必须用不同文件名
+- **磁盘仍保留副本**（回放体量大、交易 PNG 要发图），但对记录已是**只写不读**的归档
+- **回归**：全量 unit 对比 —— 新增失败 0、新增 error 0
+
+### 8. 经验库废弃文件布局，库成为唯一真源
+
+- **问题**：经验库每个案例是一个 JSON 文件（「目录即状态」），读取靠扫目录。多用户
+  下文件系统没有用户概念（A 的案例 B 照样能扫到）、状态流转要搬文件（崩溃留半套状态）、
+  每次分析都 rglob 一遍全局目录。写端早已双写进 SQLite，读端却一直没跟上
+- **改动**：
+  - `ExperienceWriter` **不再写任何文件**：`save`/`save_pending`/`finalize`/
+    `list_pending`/`update_pending_progress` 全部以 `entry_id` 为键；状态流转是一条
+    UPDATE。`experience_dir` 形参降级为空壳兼容参数
+  - `ExperienceReader` 只查库，**删除文件回落**（回落本身即旧设计的产物：同一条
+    经验两个真源，静默分叉时没人知道该信哪个）
+  - `GET /api/experience` 与复盘取档全部走库；`importer` 的经验导入段删除
+  - **根因级修复**：`experience_repo._VALID_STATUSES` 曾是
+    `("success","failure",...)` 而写入端发 `"win"/"loss"`，`upsert_entry` 的兜底
+    分支把**每一条**都静默改写成 `"pending"` —— 已结算经验在库里全显示为待验证，
+    检索端永远取不到，整个经验库静默失效且从不报错。这大概就是 `experience_entries`
+    长期 0 行的原因。已统一为 `win/loss/pending/unresolved` 并加词表守护测试
+  - **复盘落库**（原 P3）：新增 `experience_reviews` 独立表（可重跑并留历史），
+    由**后端**在 SSE `done` 之前落盘 —— 依赖前端回报等于「用户关页面即丢失」
+  - **复盘进提示词**（原 P4）：`_render_experience` 改字段感知渲染。原先整条
+    content_json 盲截 400 字符，而 `analysis_context` 从第 471 字符才开始，
+    且 `experience_max_chars_per_entry` 上限 `le=4000` 装不下实测 7032 字符
+    ——**调参不是捷径**
+- **测试**：重写 4 个文件、新增 `test_experience_review.py`（复盘状态机 13 例）
+- **回归**：以 HEAD 干净 worktree 为基线全量 unit 对比 —— **新增失败 0、新增 error 0**，
+  error 由 30 降到 0
+- **未纳入本次**：分析记录（回看功能直接读 JSON）与交易记录（飞书卡片要发 PNG）
+  仍以文件为权威副本，未动
+
 ### 7. 经验库读端切库（P-1 → P2）：修并发降级失效 + 三条读路径接 DB
 
 - **问题**：`650fc8f` 落地了身份/鉴权层，但经验库**读端一行未动** —— 提示词注入、

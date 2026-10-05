@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -427,9 +428,49 @@ def test_read_failure_is_distinguishable_from_empty(db_path_isolated: Path):
     assert hub.query("SELECT * FROM global_config") == []
     assert hub.read_failed is False, "正常读到空表不算失败"
 
-    hub._read_error = "no such table: nope"
+    # 走真实失败而非伪造内部属性：直接查不存在的表。
+    # "no such table" 不在 _maybe_latch 的致命词表里，不会把 hub 闩死。
     assert hub.query("SELECT * FROM nope") == []
     assert hub.read_failed is True, "读失败必须能被上层识别"
+
+
+def test_read_failure_flag_is_thread_local(db_path_isolated: Path):
+    """**回归**：失败标记必须线程局部。
+
+    它曾是普通实例属性，且 ``query()`` 成功时会清空 —— 于是 A 线程的失败标记
+    会被 B 线程任意一次成功读抹掉，A 随后读到 ``read_failed == False``，
+    把「读不出来」的 ``[]`` 当成「库里确实没有」。本系统是高并发读
+    （分析线程池 + 结算调度器 + 每次分析新建的 followup 线程），
+    这不是罕见路径而是常态路径，而它放行的正是最需要降级的那一刻。
+    """
+    hub = initialize_storage()
+    seen: dict[str, bool] = {}
+    failed = threading.Event()
+    other_done = threading.Event()
+
+    def failing_thread() -> None:
+        hub.query("SELECT * FROM nope")          # 本线程失败
+        seen["own"] = hub.read_failed
+        failed.set()
+        other_done.wait(timeout=5)               # 等**另一个线程**的读真正完成
+        seen["after_other_thread_succeeded"] = hub.read_failed
+
+    def succeeding_thread() -> None:
+        failed.wait(timeout=5)
+        hub.query("SELECT 1")                    # 别的线程成功读
+        other_done.set()                         # 必须在查询之后才放行
+
+    t1 = threading.Thread(target=failing_thread)
+    t2 = threading.Thread(target=succeeding_thread)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert seen.get("own") is True, "本线程的失败必须被自己看到"
+    assert seen.get("after_other_thread_succeeded") is True, (
+        "别的线程成功读不得抹掉本线程的失败标记"
+    )
 
 
 # ── 多会话推理：快照游标入参化 + 多槽缓存 ──────────────────────────────────────

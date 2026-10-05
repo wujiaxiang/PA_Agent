@@ -10,26 +10,27 @@ import time
 
 import pytest
 
-from pa_agent.records.experience_writer import (
-    STATUS_DIRS,
-    STATUS_WIN,
-    ExperienceWriter,
-)
+from pa_agent.records.experience_writer import STATUS_WIN, ExperienceWriter
 from web.api import experience_scheduler as sched
 
 
 @pytest.fixture(autouse=True)
-def _redirect_library(tmp_path, monkeypatch):
-    """run_once() builds its own default ExperienceWriter (correct in prod),
-    so the module-level EXPERIENCE_DIR must point at the tmp library."""
-    import pa_agent.records.experience_writer as ew
+def _isolated_db(tmp_path):
+    """每个用例一份干净的库。
 
-    monkeypatch.setattr(ew, "EXPERIENCE_DIR", tmp_path)
+    ``run_once()`` 自己构造 ``ExperienceWriter``（生产上就该如此），而经验库
+    现在完全落库 —— 不隔离就会读到别的用例写进去的 pending。
+    """
+    from pa_agent.storage.db import reset_hub_for_tests
+
+    h = reset_hub_for_tests(tmp_path / "iso.db")
+    yield h
+    h.close_all()
 
 
 @pytest.fixture()
-def lib(tmp_path):
-    return ExperienceWriter(experience_dir=tmp_path, logger=None)
+def lib():
+    return ExperienceWriter()
 
 
 def _pending(lib, symbol="BTCUSDT", timeframe="1h", anchor=1000, **over):
@@ -41,6 +42,14 @@ def _pending(lib, symbol="BTCUSDT", timeframe="1h", anchor=1000, **over):
     )
     kw.update(over)
     return lib.save_pending(**kw)
+
+
+def _last_id(lib) -> str:
+    """最近写的那条（库已无目录可看）。"""
+    from pa_agent.storage.experience_repo import list_entries
+
+    rows = list_entries(user_id="admin", limit=1)
+    return str(rows[0]["entry_id"]) if rows else ""
 
 
 class _DS:
@@ -96,9 +105,12 @@ def test_run_once_settles_matching_record(lib, monkeypatch):
 
     summary = sched.run_once(ctx)
 
+    from pa_agent.storage.experience_repo import get_entry
+
     assert summary["win"] == 1
-    assert len(lib.list_pending()) == 0
-    assert (lib._dir / "trending_tr" / STATUS_DIRS[STATUS_WIN]).is_dir()
+    assert len(lib.list_pending()) == 0, "结算后不得残留 pending"
+    eid = _last_id(lib)
+    assert get_entry(eid, user_id="admin")["status"] == STATUS_WIN
 
 
 def test_run_once_ignores_other_instruments(lib, monkeypatch):
