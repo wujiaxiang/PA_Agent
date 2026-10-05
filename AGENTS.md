@@ -115,7 +115,8 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **持续分析触发时禁止再次等待收盘**：`startAnalysis` / `startIncrementalAnalysis` 必须接受 `triggerSource`（`'user'` / `'continuous'`），由 `web/static/js/continuous_gate.js::shouldWaitForClose` 判定。`'continuous'` 表示本次调用本身就是被 `bar_close` 触发的，此时 bar 刚刚收盘，**再等一根必然出错**——与「持续分析强制勾选等待收盘」的联动规则叠加后会形成自等待，被下一次 `bar_close` 内的 `stopWaitCloseCountdown()` 取消成 `resolve(false)`，表现为持续分析整周期延迟或时灵时不灵。新增触发路径时必须透传 `'continuous'`
 - **`closedBarTs()` 必须按 `closed` 标志查找**：硬编码 offset=2 假定末位恒为 forming bar；休市模式下全部 bar 已收盘，此时「刚收盘」就是最后一根，offset 会返回两根之前的 ts → bar_close 哨兵错位（重新开盘后漏触发或重复触发持续分析）
 - **`lastBars` 是 newest-first**：`/api/bars` 返回 bars[0]=forming bar（数据快照契约）。按 ts_open 定位元素，**不要**用 `lastBars[length-1]` 当最新根 —— 那是**最老**的一根
-- **品种选择器：聚焦 = 浏览，输入 = 搜索**：聚焦时展示「常用 + 分类」清单；拿输入框里已有的当前品种去搜只返回寥寥几条，看起来像功能坏了：「刚收盘 bar 的 ts_open」与「是否需要等待收盘」是无 DOM 依赖的纯逻辑，禁止再内联回 `app.js`。三处哨兵计算曾重复三份且必须永远一致，抽成唯一实现由 Node 单测 `continuous_gate.test.js` 守护
+- **品种选择器：聚焦 = 浏览，输入 = 搜索**：聚焦时展示「常用 + 分类」清单；拿输入框里已有的当前品种去搜只返回寥寥几条，看起来像功能坏了
+- **纯逻辑抽到 `continuous_gate.js`**：「刚收盘 bar 的 ts_open」与「是否需要等待收盘」是无 DOM 依赖的纯逻辑，禁止再内联回 `app.js`。三处哨兵计算曾重复三份且必须永远一致，抽成唯一实现由 Node 单测 `continuous_gate.test.js` 守护
 - **取消「等待收盘」勾选必须调用 `stopWaitCloseCountdown()`**：只停显示定时器不够。`refreshAnalyzeButtonWaitingState()` 会把按钮置回 `idle`，而 `updateSSEStatusWithExpiry` 中 `if (btn.dataset.state !== 'waiting') return` 会提前返回，导致 pending resolver 无人 resolve，`startAnalysis` 永久 await
 - **图表暂停**：分析期间暂停 `bar_update` 的 K线渲染（仍更新 next_close_ts 和状态栏），完成后调用 `loadBars()` 刷新
 - **倒计时统一 HMS 格式**：所有倒计时使用 `formatCountdownHMS()` 函数显示 `HH:MM:SS`
@@ -143,6 +144,14 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - `migrate_general_gold_defaults` 仅在 symbol 为黄金关键词（XAUUSD/GOLD/XAU）时强制修正为 OANDA/XAUUSD
 - 非黄金品种（如 NVDA/AAPL/TSM）保留用户选择配置，不做强制迁移
 - 加密货币代码（BTCUSDT/ETHUSDT…）同样**保留原样**，不迁移为黄金默认品种
+
+### Prompt cache 预热
+
+- **分析前必须预热**：服务端对**逐字相同的前缀**做缓存（实测同一 prompt 连发两次 → 100%），但**存活期远短于人工分析间隔**（相隔 9 小时的两次真实分析缓存率仅 0.2%，而它们有 58.3% 的 prompt 逐字相同）。靠「等上一轮缓存」不可行，必须在真实请求前发一条同前缀、`max_tokens=1` 的廉价请求主动预热
+- **必须接 `chat()` 和 `stream_chat()` 两个入口**：分析走的是流式路径，只改非流式等于没生效
+- **预热失败必须完全吞掉**：它只是优化，绝不能阻断或搞挂真实请求。低于 20k chars 不预热（小 prompt 收益不抵一次往返）
+- **只预热完整消息**：半条消息对不齐缓存块边界，且可能写出永远用不上的缓存条目
+- **缓存命中率必须透出到界面**：否则无法判断预热是否生效。开关为 `provider.prompt_cache_prime`（默认 true）
 
 ### 分层约束：Web 层禁止依赖 PyQt（最高优先级）
 
