@@ -19,6 +19,37 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 24. 分析前主动预热 prompt cache —— 缓存率 0.2% → 100%
+
+用户提出「尽量走增量加速推理，前提是推测服务端还有缓存」。先验证这个前提，结果比预期糟：**缓存机制完好，但我们的 prompt 布局让缓存几乎永远落空。**
+
+- **实测：服务端缓存完全正常**
+  - 同一 prompt 连发两次 → 缓存率 **100%**（真实 Stage1 prompt，62k tokens）
+  - 前缀相同 + 追加尾部 → **99.6%**（追加式扩展能保住缓存）
+  - 前缀中途改动 → 掉到 **43.6%**
+- **问题不在服务端，在我们的 prompt**
+  - 连续两次真实分析记录里 `cached_prompt_tokens = 276 / 134886 = 0.2%`
+  - 逐字节比对两份真实 prompt：system(25,944 chars) 完全相同，user 消息前 58,331 chars 也完全相同 —— 理论可缓存 **58.3%**
+  - 实测 0.2% 说明**缓存存活期远短于人工分析间隔**（那两条记录相隔 9 小时），靠「等上一轮缓存」根本不可行
+- **既然缓存会过期，就在请求前把它重新热起来**（走真实客户端链路实测）
+
+  | | prompt | cached | 命中率 | 耗时 |
+  |---|---|---|---|---|
+  | 关闭预热 | 62,278 | 138 | 0.2% | 4820ms |
+  | 开启预热 | 62,278 | 62,276 | **100%** | **4094ms** |
+
+  - `DeepSeekClient._maybe_prime_cache()`：`chat()` 与 `stream_chat()` **两个入口都要接**（分析实际走流式路径，只改非流式等于没生效）
+  - `_primeable_prefix()`：只预热完整消息（半条消息对不齐缓存块边界，且可能写出永远用不上的缓存条目）；system 太小的直接跳过
+  - `_should_prime()`：低于 20k chars 不预热 —— 小 prompt 收益不抵一次往返
+  - **预热失败必须完全吞掉**：它只是优化，绝不能阻断或搞挂真实请求
+  - 新增开关 `provider.prompt_cache_prime`（默认 true）可一键关闭
+- **缓存命中率透出到界面**：不显示就看不出预热是否生效。token 明细与「分析」tab 用量行都加上「缓存 N (X%)」，命中染绿、未命中染琥珀
+- **一个做错了又撤回的改动**：曾把 prompt 里的稳定尾部提醒从末尾移到变动段之前，想让稳定内容连成整块；实测**只提升 0.1 个百分点**（分叉点本来就在尾部提醒之前，它压根不在断点之后）。属无效改动，已 `git checkout` 撤回
+- **测试**：新增 `tests/unit/test_prompt_cache_priming.py`(9) —— 前缀选取（必须有 system、system 过小跳过、纳入首个 large user、不纳入 small user、不改动入参）、阈值与开关、**预热失败不冒泡且仍是 max_tokens=1 的廉价探针**、小 prompt 不预热。写测试时连踩三次夹具坑（`_Exploding` 缺 `chat.completions` 嵌套、`_Cfg` 缺 `model` 字段、位置参数绑错字段），都会让预热在真发请求前 AttributeError
+- **文件**：`pa_agent/ai/deepseek_client.py`、`pa_agent/config/settings.py`、`web/static/{js/app.js,css/style.css,index.html}`、`tests/unit/test_prompt_cache_priming.py`
+- **版本**：app.js?v=61→62、style.css?v=37→38
+- **备注**：`test_routes_records.py` 有 2 项**既有**不稳定失败（失败项在多次运行间漂移，且在干净工作树的 HEAD 上同样失败），与本次改动无关
+
 ### 23. 数据源模式状态机（实时/历史/Demo）+ 分析按钮合并 + 非实时只读
 
 用户反馈：「增量」按钮不知何时能点、「重要按钮该常驻右上角」、「Demo/历史要有状态灯让人知道这不是真实数据」。
