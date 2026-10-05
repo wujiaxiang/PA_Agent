@@ -140,3 +140,77 @@ def test_bind_session_creates_snapshot(db):
 def test_bind_session_without_header_is_noop(db):
     assert bind_session(_req({})) == ""
     assert sess_repo.purge_expired() == 0
+
+# ── user_id 单一真源（2026-10-05）─────────────────────────────────────────────
+
+
+def test_bind_session_uses_auth_ctx_identity(monkeypatch):
+    """bind_session 的默认 user_id 必须是 current_user_id(request)，不能是字面量。
+
+    历史缺陷：默认写死 ``"default"``，而 ``db.DEFAULT_USER_ID`` 与
+    ``auth_ctx`` 的匿名回落都是 ``"admin`` —— 三方分裂，而 ``users`` 表里
+    压根不存在 ``default`` 这个用户。后果是 ``sessions`` 表按用户过滤时
+    **永远查不到数据**，且没有任何报错。
+    """
+    from starlette.requests import Request
+
+    import web.api.auth_ctx as ac
+    import web.api.session_ctx as sc
+
+    scope = {
+        "type": "http", "method": "GET", "path": "/",
+        # 必须带 session 头，否则 bind_session 在 `if not sid` 处就返回了
+        "headers": [(b"x-session-id", b"sid-abc")],
+    }
+    req = Request(scope)
+
+    seen = {}
+
+    def fake_ensure(sid, *, user_id=""):
+        seen["sid"] = sid
+        seen["user_id"] = user_id
+        return None
+
+    monkeypatch.setattr(
+        "pa_agent.storage.sessions.ensure_session", fake_ensure, raising=False
+    )
+    monkeypatch.setattr(ac, "ALLOW_ANONYMOUS_ADMIN", True)
+    monkeypatch.setattr(sc, "ALLOW_ANONYMOUS_ADMIN", True, raising=False)
+
+    sc.bind_session(req)
+    assert seen["user_id"] == "admin", f"落库身份错成了 {seen['user_id']!r}"
+
+
+def test_bind_session_signature_has_no_literal_default():
+    """守卫：默认参数不得再出现 'default' 这个不存在的用户。"""
+    import inspect
+
+    import web.api.session_ctx as sc
+
+    default = inspect.signature(sc.bind_session).parameters["user_id"].default
+    assert default == "", f"bind_session 的默认 user_id 成了 {default!r}"
+
+
+def test_sessions_rows_reference_a_real_user(tmp_path):
+    """端到端：ensure_session 落库的 user_id 必须能在 users 表里查到。
+
+    这类错配的共同特征是**写入成功、读取永远为空**，只有反向校验能抓住。
+    """
+    import sqlite3
+
+    from pa_agent.storage.db import reset_hub_for_tests
+    from pa_agent.storage.sessions import ensure_session
+    from pa_agent.storage.users import ensure_admin_user
+
+    db = tmp_path / "sess.db"
+    reset_hub_for_tests(db)
+    ensure_admin_user()
+    ensure_session("sid-1")
+
+    conn = sqlite3.connect(str(db))
+    users = {r[0] for r in conn.execute("SELECT user_id FROM users")}
+    refs = {r[0] for r in conn.execute("SELECT DISTINCT user_id FROM sessions")}
+    conn.close()
+
+    assert refs, "sessions 表没有行"
+    assert refs <= users, f"sessions 引用了不存在的用户：{refs - users}"

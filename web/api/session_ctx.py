@@ -120,15 +120,33 @@ def resolve_view(ctx: Any, session_id: str) -> tuple[str, str, str]:
     return symbol, timeframe, exchange
 
 
-def bind_session(request: Any, *, user_id: str = "default") -> str:
+def bind_session(request: Any, *, user_id: str = "") -> str:
     """Ensure a session snapshot row exists for this request.
 
     返回 session_id（无有效请求头时返回空串）。快照是**缓存级**：带 TTL，
     过期即清，游标可恢复而运行时开关刻意不还原。
+
+    ``user_id`` 不再默认 ``"default"``：那是历史遗留的第三种身份，与
+    ``db.DEFAULT_USER_ID``（``"admin"``）和 ``auth_ctx`` 的匿名回落各说各话，
+    ``users`` 表里压根不存在 ``default`` 这个用户。三方分裂的直接后果是
+    **按用户过滤时永远查不到数据**。留空则走 ``current_user_id(request)``
+    ——「本次请求是谁」的唯一答案（令牌 > 直传头 > 匿名回落）。
+
+    显式传 ``user_id`` 的调用方（测试、将来的系统级任务）保留优先权。
     """
     sid = session_id_of(request)
     if not sid:
         return ""
+    if not user_id:
+        try:
+            from web.api.auth_ctx import current_user_id
+
+            user_id = current_user_id(request)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("user identity unavailable, using default: %s", exc)
+            from pa_agent.storage.db import DEFAULT_USER_ID
+
+            user_id = DEFAULT_USER_ID
     try:
         from pa_agent.storage import sessions as sess_repo
 
