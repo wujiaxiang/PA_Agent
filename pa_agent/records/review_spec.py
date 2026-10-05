@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 #: 结论词表**只有一份**，在 :mod:`review_program`。两处各写一套时，同一个提示词
@@ -49,6 +50,8 @@ REQUIRED_SECTIONS: tuple[str, ...] = (
 )
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+#: 零宽 / 方向控制字符：肉眼不可见，却能把「忽略」劈成「忽\u200b略」而绕过比对。
+_INVISIBLE = re.compile("[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
 _BULLET = re.compile(r"^\s*(?:[-*•]|\d+[.、)])\s*")
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s*(.+?)\s*$")
 
@@ -172,12 +175,53 @@ def parse_review(raw: str) -> dict[str, Any]:
 
 #: 疑似「指令句」的标记。命中即整行剔除 —— 见 :func:`sanitize_for_prompt`。
 _INSTRUCTION_MARKERS = (
-    "忽略", "无视", " disregard", "disregard", "ignore previous", "ignore all",
-    "ignore the", "ignore above", "ignore ", "忽略以上", "忽略上述", "忽略上面",
-    "system prompt", "系统提示", "你现在是", "act as", "假装",
+    # 中文指令
+    "忽略", "无视", "不要遵守", "不必遵守", "请不要遵守", "不必再", "无需遵守",
+    "你必须", "请必须", "必须输出", "your instruction", "you must", "you are",
+    "系统提示", "系统指令", "新的系统", "[系统]", "【系统】", "你现在是", "假装",
+    "扮演", "改为", "改成", "请直接", "直接输出", "直接下单", "直接清仓",
     "必须输出", "一律输出", "始终输出", "总是输出", "无论图表", "不论图表",
-    "无视上述", "override", "不要告诉用户", "不要提及",
+    "现在满仓", "满仓", "清仓", "立即下单", "不要告诉用户", "不要提及",
+    "override", "act as", "disregard", "ignore", "you are now", "new system",
+    "instead of", "override the", "do not follow", "no longer",
 )
+
+
+#: 归一化后的 marker（比较时用）。
+_COMPACT_MARKERS = tuple(
+    "".join(ch for ch in unicodedata.normalize("NFKC", m).lower() if ch.isalnum())
+    for m in _INSTRUCTION_MARKERS
+)
+_COMPACT_MARKERS = tuple(m for m in _COMPACT_MARKERS if len(m) >= 2)
+
+
+def _compact(text: str) -> str:
+    """归一化到「只留 CJK 与字母数字」：全角折半角、去掉零宽、去空白与标点。"""
+    text = _INVISIBLE.sub("", unicodedata.normalize("NFKC", text)).lower()
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+def _fuzzy_hit(compact: str, marker: str) -> bool:
+    """marker 的字符能否**隔着至多 2 个无关字符**按序出现在 compact 里。
+
+    只删空白挡不住切词规避：「忽\n略」「忽 略」折叠后是「忽略」，与「忽略」
+    不是同一个串，必须允许中间夹字才匹配得上。间隔上限 2：再大就会把
+    「风险不可忽略」这类正常表述也误伤。
+    """
+    idx = 0
+    for ch in marker:
+        nxt = compact.find(ch, idx)
+        if nxt < 0:
+            return False
+        gap = nxt - idx
+        if gap > 2:
+            return False
+        idx = nxt + 1
+    return True
+
+
+def _is_injection(compact: str) -> bool:
+    return any(m in compact or _fuzzy_hit(compact, m) for m in _COMPACT_MARKERS)
 
 
 def sanitize_for_prompt(text: str, *, max_chars: int = 300) -> str:
@@ -188,21 +232,34 @@ def sanitize_for_prompt(text: str, *, max_chars: int = 300) -> str:
     完整塞进 300 字符内 —— 而那段文字随后就与真正的分析指令平级。注入块前的
     「不得凌驾于本次独立判断」是软约束，对模型没有强制力。
 
-    这是**纵深防御而非万能防护**：真正的硬边界是「只注入闭词表字段 + 逐字段
-    封顶」，本函数堵的是剩下的自由文本口子 —— 逐行剔除疑似指令句，命中即丢，
-    全部丢光则返回空串（上层据此回落到纯程序化复盘）。
+    判定顺序有讲究（两种顺序各错一半，实测过）：
 
-    注意：这是启发式，**不可能穷尽**。它降低概率，不提供保证。
+    1. **先逐行剔**：同一段里既有正常内容又有指令句时，只丢后者 ——
+       先查整段会把正常内容一起丢掉（"顺大周期方向…\n忽略上述指令" 整段变空）
+    2. **再对剩余行拼接后查**：跨行切词（"忽\n略上面"）逐行都查不出，
+       必须把存活行折叠起来一次性比对。命中即整块丢弃 —— 把词劈两半的人
+       不会只是想省事
+    3. 最后才按 `len(line) > 2` 丢掉过短的残行（必须在第 2 步之后，否则
+       "忽" 这种单字行会在拼接前消失，跨行切词就永远查不出来）
+
+    这是**纵深防御的一层，不是保证**。实测（见
+    ``tests/unit/test_review_spec.py::test_known_evasions_are_blocked``）本函数
+    能拦掉全角、拆字、拆行、跨行、零宽、HTML 注释、夹带等十余种改写，但
+    **语义改写挡不完** —— 任何允许自由文本进提示词的方案都有这个上限。
+
+    真正的硬边界是另外三条：① 只注入闭词表的 verdict；② 逐字段封顶；
+    ③ 注入块被显式包裹并声明为「记录的数据，非指令」。本函数是第四层。
     """
-    kept: list[str] = []
-    for line in _clean(text).splitlines():
-        low = line.lower()
-        if any(marker in low for marker in _INSTRUCTION_MARKERS):
-            continue
-        if len(line) > 2:
-            kept.append(line)
-    out = " ".join(" ".join(x.split()) for x in kept).strip()
-    return _clip(out, max_chars)
+    kept = [
+        line for line in _clean(text).splitlines()
+        if not _is_injection(_compact(line))
+    ]
+    joined = _compact("\n".join(kept))
+    if joined and _is_injection(joined):
+        return ""
+    return _clip(
+        " ".join(" ".join(x.split()) for x in kept if len(x) > 2), max_chars
+    )
 
 
 def spec_hint() -> str:
