@@ -280,7 +280,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadOrderOpportunityTypes();  // 从后端拉下单机会订单类型（避免前后端枚举漂移）
   await loadBars();          // 最后拉 K 线
   loadHistoryList();         // 拉当前 (exchange, symbol, timeframe) 的历史分析记录
-  refreshIncrementalButtonState();  // 初始化增量分析按钮可用性
+  setDataMode('live');              // 把模式状态同步到 body / 按钮 / 只读态
+  refreshIncrementalButtonState();  // 判定有无可复用上下文 → 「分析」按钮文案/提示
   // 经验库范围恒等于当前订阅（交易对 + 周期），切品种/周期后必须同步刷新，
   // 否则面板会停在上一个标的的结果上。
   if (typeof loadExperienceLibrary === 'function') {
@@ -389,6 +390,7 @@ function applyBarsToChart(bars, opts) {
 
 async function loadBars() {
   try {
+    _demoBarsStale = false;
     const barCount = parseInt($('#ds-bar-count')?.value) || 100;
     const data = await API.get(`/api/bars?count=${barCount}`);
     applyBarsToChart(data.bars || []);
@@ -641,6 +643,9 @@ function markMaskedSecretFields() {
 let currentAnalysisStream = null;
 
 function bindEvents() {
+  // 记住原始 placeholder，退出只读态时还原
+  const ci0 = $('#chat-input');
+  if (ci0 && !ci0.dataset.ph) ci0.dataset.ph = ci0.placeholder || '';
   $('#btn-refresh').addEventListener('click', loadBars);
   // 恢复图表按钮：自适应缩放显示所有数据
   const btnFitView = $('#btn-fit-view');
@@ -669,13 +674,8 @@ function bindEvents() {
       }
     });
   }
-  // 增量分析按钮
-  const btnIncremental = $('#btn-incremental');
-  if (btnIncremental) {
-    btnIncremental.addEventListener('click', () => {
-      if (!btnIncremental.disabled) startIncrementalAnalysis();
-    });
-  }
+  // 「强制完整」开关：切换后立刻让「分析」按钮反映它将走哪条路
+  $('#cb-force-full')?.addEventListener('change', updateAnalyzeButtonHint);
   // 应用按钮：调用 /api/subscribe 切换交易所/品种/周期，然后刷新 K 线
   $('#btn-apply-subscribe').addEventListener('click', applySubscribe);
 
@@ -698,24 +698,43 @@ function bindEvents() {
     });
   }
   // 返回实时按钮：清除回看状态，隐藏 badge，切回 stream tab
-  const btnBack = $('#btn-back-to-live');
+  const btnBack = $('#btn-live');
   if (btnBack) {
     btnBack.addEventListener('click', async () => {
+      const dataModeWas = currentDataMode();
       hideReplayBadge();
       lastRecord = null;
       $$('.sidebar-tabs .tab').forEach(b => b.classList.remove('active'));
       document.querySelector('.sidebar-tabs .tab[data-tab="stream"]')?.classList.add('active');
       $$('.tab-panel').forEach(p => p.classList.remove('active'));
       $('#tab-stream').classList.add('active');
+      setDataMode('live');
+
+      // Demo 会覆盖主图数据却不动订阅（品种/周期可能和演示内容对不上），
+      // 因此从 Demo 返回必须**无条件重载真实 K 线**，不能只清叠加层。
+      if (dataModeWas === 'demo' || isDemoDataActive()) {
+        _liveSubBeforeReplay = null;
+        if (window._indicatorsAPI) window._indicatorsAPI.clearAllData();
+        clearOverlays(candleSeries);
+        clearExperienceLegend();
+        await loadBars();
+        showToast('已返回实时行情', 'success');
+        return;
+      }
+
       // 回看期间主图被切到了历史记录的品种，这里必须恢复实时订阅，
       // 否则「返回实时」只是切了 tab，K 线还停在历史品种上。
       const live = _liveSubBeforeReplay;
       _liveSubBeforeReplay = null;
-      if (!live || !live.symbol) return;
+      if (!live || !live.symbol) {
+        await loadBars();   // 订阅没变也要把演示/残留数据刷回真实 K 线
+        return;
+      }
       const nowSym = $('#ds-symbol')?.value || '';
       const nowTf = $('#ds-timeframe')?.value || '';
       if (nowSym === live.symbol && nowTf === live.timeframe) {
         clearOverlays(candleSeries);
+        await loadBars();
         return;
       }
       try {
@@ -750,6 +769,9 @@ function bindEvents() {
         btnDemo.disabled = true;
         btnDemo.textContent = '加载中...';
         const data = await API.get('/api/demo/sample');
+        // 演示数据进入 demo 模式：状态灯点亮 + 状态条说明，避免被当成真实行情
+        setDataMode('demo', data.sample?.symbol ? `${data.sample.symbol} · 模拟行情` : '模拟行情');
+        _demoBarsStale = true;
         // 设置 lastRecord 并渲染各 tab
         lastRecord = data;
         renderDecision(data);
@@ -1513,8 +1535,9 @@ function showSwitchError(msg, type = 'connection') {
  *  notifications.  Instead callers surface a hint so the user can one-click it.
  */
 async function refreshIncrementalButtonState() {
-  const btn = $('#btn-incremental');
-  if (!btn) return false;
+  // 现在只负责回答一个问题：当前 (exchange, symbol, timeframe) 下有没有
+  // 可复用的完整分析记录 —— 有则「分析」自动走增量，没有则走完整分析。
+  // 不再有独立的增量按钮需要维护禁用态。
   try {
     const exchange = $('#ds-exchange').value
       || currentSettings?.general?.last_tradingview_exchange || '';
@@ -1522,26 +1545,45 @@ async function refreshIncrementalButtonState() {
       || currentSettings?.general?.last_symbol || '';
     const timeframe = $('#ds-timeframe').value
       || currentSettings?.general?.last_timeframe || '';
-    if (!exchange || !symbol || !timeframe) {
-      btn.disabled = true;
-      btn.title = '缺少交易所/品种/周期信息';
-      return false;
-    }
+    if (!exchange || !symbol || !timeframe) return false;
     const data = await API.get(
       `/api/records?exchange=${encodeURIComponent(exchange)}&symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=1`
     );
-    if (Array.isArray(data) && data.length > 0 && !data[0].has_exception) {
-      btn.disabled = false;
-      btn.title = '基于上次成功记录做增量分析';
-      return true;
-    }
-    btn.disabled = true;
-    btn.title = '无可用历史记录，请使用完整分析';
-    return false;
+    const reusable = Array.isArray(data) && data.length > 0 && !data[0].has_exception;
+    _incrementalReusable = reusable;
+    updateAnalyzeButtonHint();
+    return reusable;
   } catch (e) {
-    btn.disabled = true;
-    btn.title = '无可用历史记录，请使用完整分析';
+    _incrementalReusable = false;
+    updateAnalyzeButtonHint();
     return false;
+  }
+}
+
+// 是否走增量：由「强制完整」开关决定；用户不勾选时，有可复用上下文就走增量。
+function shouldUseIncremental() {
+  if ($('#cb-force-full')?.checked) return false;
+  return !!_incrementalReusable;
+}
+
+// 让「分析」按钮自己说清楚它会走哪条路，省掉一个含义模糊的独立按钮。
+function updateAnalyzeButtonHint() {
+  const btn = $('#btn-analyze-toggle');
+  if (!btn) return;
+  const forced = $('#cb-force-full')?.checked;
+  let tip;
+  if (forced) {
+    tip = '完整分析：重新读取全部 K 线，不复用上次上下文';
+  } else if (_incrementalReusable) {
+    tip = '增量分析：复用上次分析上下文，只发送新增 K 线（省 token、上下文连贯）';
+  } else {
+    tip = '完整分析：当前品种/周期没有可复用的历史记录';
+  }
+  btn.title = tip;
+  const text = btn.querySelector('.btn-analyze-text');
+  if (text) {
+    text.textContent = forced ? '完整分析'
+      : (_incrementalReusable ? '增量分析' : '分析');
   }
 }
 
@@ -1994,9 +2036,8 @@ function startSSEBarsStream() {
             : (sorted.length >= 2 ? sorted[sorted.length - 2].ts_open : 0);
           if (newClosedTs && newClosedTs !== keepAnalysisLastClosedTs) {
             keepAnalysisLastClosedTs = newClosedTs;
-            // 自动增量：有增量基础记录时用增量分析，否则完整分析
-            const btnInc = $('#btn-incremental');
-            if (btnInc && !btnInc.disabled) {
+            // 自动选路：有可复用上下文走增量，否则走完整分析
+            if (shouldUseIncremental()) {
               startIncrementalAnalysis(true, 'continuous');
             } else {
               startAnalysis(true, 'continuous');
@@ -4636,8 +4677,12 @@ function parsePercent(v) {
 function enableChat() {
   const input = $('#chat-input');
   const sendBtn = $('#btn-chat-send');
-  if (input) input.disabled = false;
-  if (sendBtn) sendBtn.disabled = false;
+  // 非实时模式下保持禁用：历史回看 / Demo 的追问会对着归档结论或合成数据提问，
+  // 既无意义，又会把 Demo 数据写进记录。此前这里无条件放开，正好覆盖掉
+  // setPanelsReadonly() 的禁用 —— 回看记录时追问框居然是可用的。
+  const ro = isReadonly();
+  if (input) input.disabled = ro;
+  if (sendBtn) sendBtn.disabled = ro;
   renderChatContext();
 }
 
@@ -4891,7 +4936,6 @@ async function replayRecord(recordId) {
     // 关闭 popover
     $('#history-popover').classList.add('hidden');
     // 显示"返回实时"按钮
-    $('#btn-back-to-live').classList.remove('hidden');
     // 切到决策 tab
     $$('.sidebar-tabs .tab').forEach(b => b.classList.remove('active'));
     document.querySelector('.sidebar-tabs .tab[data-tab="decision"]')?.classList.add('active');
@@ -5010,6 +5054,9 @@ async function applyReplayChart(record) {
 
 // 显示回看 badge，并把记录时间填入 #replay-time
 function showReplayBadge(record) {
+  setDataMode('replay', record?.symbol
+    ? `${record.symbol} · ${record.timeframe || ''}`.trim()
+    : '');
   const badge = $('#replay-badge');
   if (!badge) return;
   const time = record?.meta?.timestamp_local_iso || record?.meta?.timestamp || '';
@@ -5021,8 +5068,6 @@ function showReplayBadge(record) {
 function hideReplayBadge() {
   const badge = $('#replay-badge');
   if (badge) badge.classList.add('hidden');
-  const btnBack = $('#btn-back-to-live');
-  if (btnBack) btnBack.classList.add('hidden');
   isReplaying = false;
 }
 
@@ -5403,6 +5448,129 @@ async function loadExperienceLibrary(opts) {
   }
 }
 
+// ── 数据源模式状态机 ────────────────────────────────────────────────────
+// 三种模式：live（实时）/ replay（历史回看）/ demo（演示）。
+// 此前 Demo 完全不在任何状态机里 —— 加载演示数据后界面与真实行情毫无区别，
+// 用户会把它当成真实报价。三个按钮的 LED 与状态条由 setDataMode() 统一驱动，
+// 不要在别处单独改 class。
+let dataMode = 'live';
+
+const DATA_MODE_META = {
+  live:   { label: '实时行情', color: 'live' },
+  replay: { label: '历史回看', color: 'replay' },
+  demo:   { label: '演示数据', color: 'demo' },
+};
+
+function setDataMode(mode, subText) {
+  const m = DATA_MODE_META[mode] ? mode : 'live';
+  dataMode = m;
+  const bar = $('#data-mode-bar');
+  if (bar) bar.dataset.mode = m;
+  const lbl = $('#dmb-label');
+  if (lbl) lbl.textContent = DATA_MODE_META[m].label;
+  const sub = $('#dmb-sub');
+  if (sub) sub.textContent = subText || '';
+
+  // 三个按钮：LED 点亮的那个 = 当前所处的模式
+  $$('.act-btn').forEach(b => {
+    const forMode = b.dataset.modeFor;
+    b.classList.toggle('is-on', forMode === m);
+    if (b.id === 'btn-live') {
+      b.title = m === 'live' ? '当前已是实时行情' : `离开${DATA_MODE_META[m].label}，回到实时行情`;
+      b.disabled = (m === 'live');
+    }
+    if (b.id === 'btn-demo') {
+      b.title = m === 'demo' ? '当前正在看演示数据，再次点击重新加载' : '加载 Demo 演示数据（非真实行情）';
+    }
+    if (b.id === 'btn-history') {
+      b.title = m === 'replay' ? '当前正在回看历史记录，点击可选择其它记录' : '查看历史分析记录（回看模式）';
+    }
+  });
+
+  // 分析只在实时模式下有意义：回看的是已归档的分析结果、Demo 是合成数据，
+  // 对着它们再跑一次分析既没意义又会污染记录。直接隐藏而不是 disabled ——
+  // 灰按钮会让人反复去点它为什么点不动。
+  setPanelsReadonly(m !== 'live');
+  const isLive = (m === 'live');
+  const analyzeBox = $('#btn-analyze-toggle');
+  if (analyzeBox) analyzeBox.classList.toggle('hidden', !isLive);
+  const analyzeRow = document.querySelector('.sidebar-header');
+  if (analyzeRow) analyzeRow.classList.toggle('analyze-hidden', !isLive);
+  $('#dmb-hint-analyze')?.classList.toggle('hidden', isLive);
+
+  // 图表整体加一点色调提示，回看/Demo 时一眼能看出来
+  try {
+    document.body.dataset.dataMode = m;
+  } catch (e) { /* 忽略 */ }
+
+  window._dataMode = m;
+  return m;
+}
+
+function currentDataMode() { return dataMode; }
+// 非实时模式（历史回看 / Demo）下，侧边栏是**只读**的。
+// 回看看到的是一份已归档的分析结果，Demo 是合成行情 —— 对着它们追问、
+// 验证经验、重跑分析都没有意义，还会把 Demo 数据写进记录或经验库。
+// 做法是禁用控件而不是弹提示：逐个 click 拦截迟早漏掉新增控件。
+const READONLY_BLOCKED = [
+  '#btn-chat-send', '#btn-chat-clear', '#btn-chat-resend',
+  '#chat-input',
+  '#btn-exp-verify', '#btn-exp-refresh',
+  '#btn-history-refresh',
+  '#cb-force-full', '#cb-wait-close', '#cb-keep-analysis',
+  '#btn-tree-viz-play',
+  '#s-alert-on-order-opportunity',
+];
+
+let _readOnly = false;
+
+function setPanelsReadonly(ro) {
+  _readOnly = !!ro;
+  // 用 attribute 而不是 classList：CSS 侧是 body[data-readonly] 属性选择器，
+  // 加同名 class 选不中，降饱和/禁用态样式会完全不生效（曾如此）。
+  if (_readOnly) document.body.setAttribute('data-readonly', '');
+  else document.body.removeAttribute('data-readonly');
+
+  READONLY_BLOCKED.forEach(sel => {
+    $$(sel).forEach(el => {
+      if (!el) return;
+      if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'BUTTON') {
+        el.disabled = _readOnly;
+      }
+    });
+  });
+
+  // 追问输入框的 placeholder 也要改，否则灰着还提示「可以问」
+  const chat = $('#chat-input');
+  if (chat) {
+    chat.placeholder = _readOnly
+      ? '回看 / 演示模式下不可追问 —— 切回「实时」后可提问'
+      : (chat.dataset.ph || '针对本次分析提问…');
+  }
+
+  // 经验库条目上的复盘按钮是动态渲染的，用 CSS 兜住，不依赖枚举
+  const tip = $('#readonly-hint');
+  if (tip) tip.classList.toggle('hidden', !_readOnly);
+
+  // 退出只读态后，各控件自己的禁用规则必须重新生效
+  // （#btn-exp-verify 取决于 pending 数量，#chat-input 取决于是否解锁过）
+  if (!_readOnly) {
+    Promise.resolve()
+      .then(() => refreshIncrementalButtonState())
+      .then(() => { if (typeof loadExperienceLibrary === 'function') loadExperienceLibrary(); })
+      .catch(() => {});
+  }
+}
+
+function isReadonly() { return _readOnly; }
+
+// 主图当前是否是演示数据。
+// 不能只看 dataMode —— 加载 Demo 之后若用户又切了品种/周期，订阅变了但
+// 图上仍是演示内容，此时仍需要一次强制重载才能回到真实 K 线。
+let _demoBarsStale = false;
+function isDemoDataActive() { return _demoBarsStale; }
+
+let _incrementalReusable = false;
 let _expSelectedSymbol = '';
 let _expShowAll = false;
 let _expReviewAbort = null;

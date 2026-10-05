@@ -3861,3 +3861,217 @@ button.secondary:hover { background: var(--border); }
   font-size: 11px;
   color: #ef4444;
 }
+
+/* ══ 数据源模式条（实时 / 历史回看 / Demo）═════════════════════════════
+   放在图表右上角常驻：用户在任何 tab 下都能看到「我现在看的是什么数据」。
+   Demo 尤其关键 —— 演示数据长得和真实行情一模一样，没有状态灯就会被
+   当成真实报价。 */
+.data-mode-bar {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+  pointer-events: none;
+}
+.data-mode-bar > * { pointer-events: auto; }
+
+.dmb-modes {
+  display: flex;
+  gap: 5px;
+  padding: 4px;
+  border-radius: 9px;
+  background: rgba(16, 20, 30, 0.86);
+  border: 1px solid rgba(120, 140, 170, 0.22);
+  backdrop-filter: blur(8px);
+}
+
+.act-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 9px;
+  border-radius: 6px;
+  border: 1px solid rgba(120, 140, 170, 0.20);
+  background: rgba(30, 38, 52, 0.75);
+  color: #b8c4d6;
+  font-size: 11.5px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+.act-btn:hover:not(:disabled) {
+  background: rgba(44, 56, 76, 0.9);
+  color: #e6edf7;
+}
+.act-btn:disabled { opacity: 0.34; cursor: not-allowed; }
+
+/* 状态灯：灰=未激活，绿=实时，琥珀=历史回看，紫=Demo */
+.act-led {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: #4a5568;
+  box-shadow: none;
+  flex: 0 0 auto;
+  transition: background 0.2s, box-shadow 0.2s;
+}
+.act-btn[data-led="live"].is-on .act-led {
+  background: #34d399;
+  box-shadow: 0 0 6px 1px rgba(52, 211, 153, 0.75);
+}
+.act-btn[data-led="replay"].is-on {
+  background: rgba(120, 78, 20, 0.55);
+  border-color: rgba(251, 191, 36, 0.6);
+  color: #fcd34d;
+}
+.act-btn[data-led="replay"].is-on .act-led {
+  background: #fbbf24;
+  box-shadow: 0 0 6px 1px rgba(251, 191, 36, 0.8);
+}
+.act-btn[data-led="demo"].is-on {
+  background: rgba(76, 29, 110, 0.55);
+  border-color: rgba(167, 139, 250, 0.6);
+  color: #c4b5fd;
+}
+.act-btn[data-led="demo"].is-on .act-led {
+  background: #a78bfa;
+  box-shadow: 0 0 6px 1px rgba(167, 139, 250, 0.8);
+}
+
+/* 模式状态条 */
+.dmb-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 7px;
+  font-size: 11.5px;
+  background: rgba(16, 20, 30, 0.86);
+  border: 1px solid rgba(120, 140, 170, 0.22);
+  color: #93a3b8;
+  backdrop-filter: blur(8px);
+}
+.dmb-led {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: #34d399;
+  box-shadow: 0 0 7px 1px rgba(52, 211, 153, 0.8);
+  flex: 0 0 auto;
+}
+.dmb-label { font-weight: 600; letter-spacing: 0.2px; }
+.dmb-sub {
+  color: #7c8aa0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+}
+.dmb-sub:empty { display: none; }
+
+.data-mode-bar[data-mode="replay"] { border-radius: 9px; }
+.data-mode-bar[data-mode="replay"] .dmb-status {
+  background: rgba(60, 40, 12, 0.9);
+  border-color: rgba(251, 191, 36, 0.55);
+  color: #fcd34d;
+}
+.data-mode-bar[data-mode="replay"] .dmb-led {
+  background: #fbbf24;
+  box-shadow: 0 0 7px 1px rgba(251, 191, 36, 0.85);
+  animation: dmb-pulse 1.8s ease-in-out infinite;
+}
+.data-mode-bar[data-mode="demo"] .dmb-status {
+  background: rgba(46, 20, 70, 0.9);
+  border-color: rgba(167, 139, 250, 0.55);
+  color: #c4b5fd;
+}
+.data-mode-bar[data-mode="demo"] .dmb-led {
+  background: #a78bfa;
+  box-shadow: 0 0 7px 1px rgba(167, 139, 250, 0.85);
+  animation: dmb-pulse 1.8s ease-in-out infinite;
+}
+@keyframes dmb-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+/* 「强制完整」紧凑开关：与分析按钮并排，不抢主操作权重 */
+.console-toggle-compact { padding: 3px 7px; }
+.console-toggle-compact .toggle-label { font-size: 11px; }
+
+/* 图表区整体色调提示：非实时模式下边框染色，避免忘记自己在看演示/回看 */
+body[data-data-mode="demo"] #chart-pane {
+  box-shadow: inset 0 0 0 2px rgba(167, 139, 250, 0.30);
+}
+body[data-data-mode="replay"] #chart-pane {
+  box-shadow: inset 0 0 0 2px rgba(251, 191, 36, 0.30);
+}
+#chart-pane { transition: box-shadow 0.25s ease; }
+
+/* 模式切换器：三个互斥模式，LED 点亮者即当前模式 */
+.dmb-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 2px;
+  background: rgba(120, 140, 170, 0.25);
+}
+.act-btn-tool { color: #8fa0b6; }
+.act-btn[data-led="live"].is-on {
+  background: rgba(20, 60, 48, 0.62);
+  border-color: rgba(52, 211, 153, 0.55);
+  color: #6ee7b7;
+}
+
+/* 非实时模式下隐藏分析按钮（setDataMode 切换 .analyze-hidden） */
+.sidebar-header.analyze-hidden .btn-analyze,
+.sidebar-header.analyze-hidden .sidebar-header-options { display: none; }
+.sidebar-header.analyze-hidden {
+  border-bottom-color: transparent;
+  padding-bottom: 0;
+}
+
+/* ══ 只读模式（历史回看 / Demo）═══════════════════════════════════════
+   非实时数据下侧边栏整体只读：追问、验证、重跑分析都没有意义，
+   还会把 Demo 数据写进记录或经验库。 */
+.readonly-hint {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  font-size: 11.5px;
+  background: rgba(60, 40, 12, 0.88);
+  color: #fcd34d;
+  border-bottom: 1px solid rgba(251, 191, 36, 0.32);
+}
+.readonly-hint.hidden { display: none; }
+.ro-led {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: #fbbf24;
+  box-shadow: 0 0 6px 1px rgba(251, 191, 36, 0.8);
+}
+body[data-data-mode="demo"] .readonly-hint {
+  background: rgba(46, 20, 70, 0.88);
+  color: #c4b5fd;
+  border-bottom-color: rgba(167, 139, 250, 0.32);
+}
+body[data-data-mode="demo"] .ro-led {
+  background: #a78bfa;
+  box-shadow: 0 0 6px 1px rgba(167, 139, 250, 0.8);
+}
+
+/* 视觉降饱和：一眼看出当前不是可操作态 */
+body[data-readonly] #sidebar {
+  opacity: 0.82;
+}
+body[data-readonly] #sidebar .tab-panel :is(button, input, textarea):disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+/* 动态渲染的复盘按钮等：用 CSS 兜住 */
+body[data-readonly] #sidebar .exp-mini,
+body[data-readonly] #sidebar button[data-needs-live] {
+  opacity: 0.35;
+  pointer-events: none;
+  cursor: not-allowed;
+}

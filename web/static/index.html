@@ -9,7 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="/css/style.css?v=33">
+<link rel="stylesheet" href="/css/style.css?v=37">
 </head>
 <body>
 
@@ -61,6 +61,49 @@
     <div id="chart-pane">
       <div id="chart-main"></div>
       <div id="chart-osc-wrap"></div>
+      <!-- 数据源模式：实时 / 历史回看 / Demo。三种状态必须一眼可辨，
+           否则用户看完演示数据会以为那是真实行情。常驻右上角，不随 tab 切换。 -->
+      <div id="data-mode-bar" class="data-mode-bar" data-mode="live">
+        <div class="dmb-modes">
+          <!-- 三个模式互斥，LED 点亮者即当前模式。点「实时」= 离开回看/Demo -->
+          <button id="btn-live" class="act-btn" data-led="live" data-mode-for="live"
+                  title="实时行情" aria-label="实时">
+            <span class="act-led" aria-hidden="true"></span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            <span class="act-btn-text">实时</span>
+          </button>
+          <button id="btn-history" class="act-btn" data-led="replay" data-mode-for="replay"
+                  title="查看历史分析记录（回看模式）" aria-label="历史">
+            <span class="act-led" aria-hidden="true"></span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
+            <span class="act-btn-text">历史</span>
+          </button>
+          <button id="btn-demo" class="act-btn" data-led="demo" data-mode-for="demo"
+                  title="加载 Demo 演示数据（非真实行情）" aria-label="Demo">
+            <span class="act-led" aria-hidden="true"></span>
+            <span class="act-btn-text">Demo</span>
+          </button>
+          <span class="dmb-sep" aria-hidden="true"></span>
+          <button id="btn-fit-view" class="act-btn act-btn-tool" title="恢复图表（自适应缩放）" aria-label="自适应">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+            <span class="act-btn-text">自适应</span>
+          </button>
+        </div>
+      <div id="history-popover" class="history-popover hidden">
+        <div class="history-popover-header">
+          <span>历史分析记录</span>
+          <button id="btn-history-refresh" class="icon-btn" title="刷新">🔄</button>
+        </div>
+        <div id="history-list" class="history-list">
+          <div class="history-empty muted-text">暂无历史记录</div>
+        </div>
+      </div>
+        <div class="dmb-status">
+          <span class="dmb-led" aria-hidden="true"></span>
+          <span id="dmb-label" class="dmb-label">实时行情</span>
+          <span id="dmb-sub" class="dmb-sub"></span>
+        </div>
+      </div>
       <div id="tz-label">⏰ 浏览器本地时区</div>
       <!-- #chart-legend 的 innerHTML 会被 indicators.js 整体重写，
            因此 #experience-legend 必须是它的**兄弟**而非子节点，
@@ -71,6 +114,13 @@
     </div>
   </div>
   <div id="sidebar">
+    <!-- 只读态提示。必须放在 #sidebar **内部**：#main 是 row flex，
+         放在外面会变成图表与侧边栏之间的第三个 flex item ——
+         占掉一整列宽度、且不显示任何内容（曾如此）。 -->
+    <div id="readonly-hint" class="readonly-hint hidden" role="status">
+      <span class="ro-led" aria-hidden="true"></span>
+      <span class="ro-text">只读模式 · 当前不是实时行情，追问 / 验证 / 分析均已停用</span>
+    </div>
     <!-- 拖拽分隔条：拖拽调整侧边栏宽度（Phase A Task 1） -->
     <div class="sidebar-resizer" id="sidebar-resizer" title="拖拽调整宽度"></div>
     <!-- 侧边栏头部：Aurora Quant Console 设计 -->
@@ -79,27 +129,7 @@
     <!-- 第3行：控制台开关（LED 指示灯 + 锐利 6px 圆角）+ 增量按钮 -->
     <div class="sidebar-header">
       <!-- 第1行：工具图标组 -->
-      <div class="sidebar-header-tools">
-        <button id="btn-history" class="tool-icon-btn" title="历史分析记录" aria-label="历史">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
-        </button>
-        <button id="btn-fit-view" class="tool-icon-btn" title="恢复图表（自适应缩放）" aria-label="自适应">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
-        </button>
-        <button id="btn-back-to-live" class="tool-icon-btn hidden" title="返回实时" aria-label="返回实时">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-        </button>
-        <button id="btn-demo" class="compact-btn" title="加载 Demo 数据体验">Demo</button>
-      </div>
-      <div id="history-popover" class="history-popover hidden">
-        <div class="history-popover-header">
-          <span>历史分析记录</span>
-          <button id="btn-history-refresh" class="icon-btn" title="刷新">🔄</button>
-        </div>
-        <div id="history-list" class="history-list">
-          <div class="history-empty muted-text">暂无历史记录</div>
-        </div>
-      </div>
+
       <!-- 第2行：主操作「分析」CTA — 4 层阴影 + shimmer -->
       <button id="btn-analyze-toggle" class="btn-analyze" data-state="idle" title="开始 AI 分析">
         <span class="btn-analyze-shimmer" aria-hidden="true"></span>
@@ -118,10 +148,13 @@
           <span class="toggle-led" aria-hidden="true"></span>
           <span class="toggle-label">持续分析</span>
         </label>
-        <button id="btn-incremental" class="btn-incremental" title="基于上次成功记录做增量分析" disabled>
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
-          <span>增量</span>
-        </button>
+        <!-- 增量不再是一个独立按钮：有可复用上下文时「分析」自动走增量，
+             没有时自动走完整分析。用户不需要理解两条链路。 -->
+        <label class="console-toggle console-toggle-compact" title="默认自动：有可复用上下文时走增量（省 token），否则走完整分析。打开则强制完整分析">
+          <input id="cb-force-full" type="checkbox">
+          <span class="toggle-led" aria-hidden="true"></span>
+          <span class="toggle-label">强制完整</span>
+        </label>
       </div>
     </div>
     <div id="flow-bar" class="flow-bar" hidden>
@@ -659,6 +692,6 @@
 <script src="/js/chart.js?v=9"></script>
 <script src="/js/indicators.js?v=5"></script>
 <script src="/js/continuous_gate.js?v=2"></script>
-<script src="/js/app.js?v=56"></script>
+<script src="/js/app.js?v=61"></script>
 </body>
 </html>
