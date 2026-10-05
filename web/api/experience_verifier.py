@@ -35,6 +35,7 @@ undecided setup never gets fed back into the prompts as if it were a loss.
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -226,6 +227,65 @@ def settle_record(
     return STATUS_PENDING, seen
 
 
+#: 连续取不到数据多少次后判定「这条永远结算不了」。
+#:
+#: 典型触发是交易所/品种组合本身无效（实测见过 ``GATEIO/NVDA`` —— 美股挂在
+#: 加密交易所下，TradingView 永远无数据）。原先它会**无限期静默重试**：
+#: 每轮都 ``skipped_no_data += 1``，既不改状态也不留痕迹，用户界面上就是
+#: 一条永远停在「待验证」的记录，看不出为什么。
+MAX_NO_DATA_ATTEMPTS = 5
+
+
+def _note_no_data(entry_id: str, content: dict[str, Any], logger) -> None:
+    """取不到数据时累计次数并告警，不能无限静默重试。
+
+    典型触发是交易所/品种组合本身无效（实测见过 ``GATEIO/NVDA`` —— 美股挂在
+    加密交易所下，TradingView 永远无数据）。原先它会**无限期静默重试**：
+    每轮都只 ``skipped_no_data += 1``，既不改状态也不留痕迹，用户界面上就是
+    一条永远停在「待验证」的记录，看不出为什么。
+
+    **不改状态**：``pending → unresolved`` 的语义是「窗口内未触及价位」，而这里
+    是「压根取不到行情」，两者不是一回事；凭空转成 unresolved 会把一条从未
+    参与统计的记录混进终态。所以只记次数 + 报错，处置权留给运维/用户。
+
+    计数必须**从库里读当前值**，不能用调用方传进来的 ``content`` —— 那是
+    ``list_pending`` 在本轮开始时的快照，每轮都是同一个值，计数器永远停在 1。
+    """
+    try:
+        from pa_agent.storage.db import get_hub
+
+        row = get_hub().query(
+            "SELECT content_json FROM experience_entries WHERE entry_id = ?",
+            (entry_id,),
+        )
+        current: dict[str, Any] = {}
+        if row:
+            try:
+                loaded = json.loads(row[0]["content_json"])
+                if isinstance(loaded, dict):
+                    current = loaded
+            except (json.JSONDecodeError, KeyError, TypeError):
+                current = {}
+        if not current:                      # 读不到就用调用方的，至少别丢这一次
+            current = dict(content)
+
+        n = int(current.get("_no_data_attempts") or 0) + 1
+        current["_no_data_attempts"] = n
+        get_hub().execute(
+            "UPDATE experience_entries SET content_json = ? WHERE entry_id = ?",
+            (json.dumps(current, ensure_ascii=False), entry_id),
+        )
+        if n >= MAX_NO_DATA_ATTEMPTS:
+            logger.error(
+                "experience %s (%s/%s/%s) has failed to fetch bars %d times — "
+                "this entry can never settle; exchange/symbol pair is likely invalid",
+                entry_id, current.get("exchange"), current.get("symbol"),
+                current.get("timeframe"), n,
+            )
+    except Exception:  # noqa: BLE001
+        logger.warning("cannot record no-data attempt for %s", entry_id, exc_info=True)
+
+
 def _attach_program_review(writer, entry_id, status, content, info, user_id) -> None:
     """结算即生成程序化复盘。
 
@@ -271,6 +331,7 @@ def verify_pending(
     verify_bars: int | None = None,
     batch: int | None = None,
     scope: tuple[str, str] | None = None,
+    max_dedicated: int = 2,
     writer: ExperienceWriter | None = None,
 ) -> dict[str, Any]:
     """Settle as many pending records as the N-bar rule allows.
@@ -286,6 +347,22 @@ def verify_pending(
         are simply left pending (they will be settled once the user switches
         back, or when a factory is supplied).
     scope:
+        **不要再从 ``settings.general.last_*`` 取** —— 那是「每次请求从会话
+        游标派生、只回给前端」的只读字段，而 ``/api/subscribe`` 早已改写会话
+        游标、不再更新它。调度器从 settings 快照读到的是**冻结的旧值**，实测
+        切到 NVDA/5m 后点验证得到 ``checked=0`` —— 快照里还是上次订阅的品种。
+
+        留这个参数只给**手工「验证」按钮**用（可显式限定范围）；后台调度
+        传 ``None``，改由 :paramref:`max_dedicated` 预算约束。
+
+    max_dedicated:
+        本轮**最多**为多少条不匹配当前订阅的记录单独建数据源。用完就跳过，
+        下一轮再来 —— ``list_pending`` 是由旧到新，所以不会饿死后面的。
+
+        这才是「别打爆上游」的正确形态：**限制工作量，而不是限制正确性**。
+        按品种过滤会让所有非当前品种的记录永久结算不了。
+
+    scope（旧语义，保留兼容）:
         Optional ``(symbol, timeframe)`` — settle only records for this
         instrument. The UI passes the currently-viewed K-line so the library
         panel always reflects what is on screen.
@@ -312,6 +389,7 @@ def verify_pending(
         logger.warning("experience verify: listing failed: %s", exc)
         return summary
 
+    used_dedicated = 0
     for entry_id, content in pending:
         if summary["checked"] >= limit:
             break
@@ -323,14 +401,18 @@ def verify_pending(
 
         bars = _shared_fetch(shared_source, symbol, timeframe, exchange) \
             if shared_source is not None else []
+        dedicated = False
         if not bars:
-            if source_factory is None:
+            if source_factory is None or used_dedicated >= max(0, int(max_dedicated)):
                 summary["skipped_no_data"] += 1
                 continue
+            used_dedicated += 1
+            dedicated = True
             bars = _DedicatedSource(source_factory, symbol, timeframe,
                                     exchange, logger).fetch()
         if not bars:
             summary["skipped_no_data"] += 1
+            _note_no_data(entry_id, content, logger)
             continue
 
         # 价格量级兜底：bars 与本记录价格不在同一量级 → 一定不是这个标的

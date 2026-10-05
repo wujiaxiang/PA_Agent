@@ -357,3 +357,88 @@ def test_dedicated_source_tolerates_sources_without_set_exchange():
     src = ev._DedicatedSource(lambda: _Src(), "BTCUSDT", "1h", "GATEIO",
                               __import__("logging").getLogger())
     assert src.fetch(), "没有 set_exchange 也要能取数"
+
+
+def test_scope_is_not_taken_from_the_frozen_settings_field():
+    """**回归守卫**：后台结算**不得**按 `settings.general.last_*` 过滤。
+
+    那两个字段已是「每次请求从会话游标派生、只回给前端」的只读字段，
+    `/api/subscribe` 早就不更新它们了 —— 调度器读到的是**冻结的旧值**。
+    真机实测：切到 NVDA/5m 后点验证得到 ``checked=0``，因为快照里的
+    ``last_symbol`` 还是上次订阅的 BTCUSDT，等于所有非该品种的记录
+    **永久结算不了**。
+    """
+    import inspect
+
+    from web.api import experience_scheduler as sched
+
+    src = inspect.getsource(sched.run_once)
+    assert "last_symbol" not in src, "仍在读冻结字段"
+    assert "scope=None" in src, "调度器必须不做品种过滤"
+
+
+def test_dedicated_source_budget_limits_work_not_correctness(monkeypatch, tmp_path):
+    """预算约束的是**工作量**，不是**正确性**。
+
+    原设计用「只结算当前订阅范围」来保护上游，代价是所有非当前品种的记录永远
+    结算不了。改成：共享源三轴匹配时复用（零成本），不匹配才建专用源，且每轮
+    最多 ``max_dedicated`` 条 —— 剩下的下一轮再来（``list_pending`` 由旧到新，
+    不会饿死后面的）。
+    """
+    from web.api import experience_verifier as ev
+
+    made: list[tuple] = []
+
+    class _Factory:
+        def __call__(self):
+            made.append(1)
+            raise RuntimeError("no data")     # 假装取不到，用于验证预算封顶
+
+    calls = {"n": 0}
+
+    def _lp(limit):
+        calls["n"] += 1
+        return [(f"e{i}", {"symbol": f"S{i}", "timeframe": "1h",
+                           "exchange": "X", "entry_price": 1.0})
+                for i in range(6)]
+
+    class _W:
+        def list_pending(self, limit):
+            return _lp(limit)
+
+        def finalize(self, *a, **k):
+            raise AssertionError("取不到数据时不得结算")
+
+    s = ev.verify_pending(shared_source=None, source_factory=_Factory(),
+                          settings=None, scope=None, max_dedicated=2,
+                          writer=_W())
+    assert len(made) <= 2, f"专用源预算未生效：建了 {len(made)} 个"
+    assert s["checked"] == 0
+
+
+def test_no_data_attempts_are_counted(tmp_path):
+    """取不到数据要累计次数并告警，不能无限静默重试。
+
+    实测见过一条 `GATEIO/NVDA` 的真实记录（美股挂在加密交易所下），
+    TradingView 永远无数据 —— 原先每轮只 ``skipped_no_data += 1``，
+    既不改状态也不留痕迹，用户界面上就是一条永远停在「待验证」的记录。
+    """
+    from pa_agent.storage.db import reset_hub_for_tests
+    from pa_agent.storage.experience_repo import upsert_entry
+    from web.api import experience_verifier as ev
+
+    hub = reset_hub_for_tests(tmp_path / "nd.db")
+    try:
+        upsert_entry({"symbol": "NVDA", "timeframe": "5m", "exchange": "GATEIO",
+                      "entry_price": 238.0}, entry_id="admin_x",
+                     cycle_position="trending_tr", status="pending",
+                     symbol="NVDA", timeframe="5m")
+        for _ in range(ev.MAX_NO_DATA_ATTEMPTS):
+            ev._note_no_data("admin_x", {"symbol": "NVDA", "exchange": "GATEIO",
+                                         "timeframe": "5m"}, __import__("logging").getLogger())
+        row = hub.connect().execute(
+            "SELECT content_json FROM experience_entries WHERE entry_id='admin_x'"
+        ).fetchone()
+        assert __import__("json").loads(row[0])["_no_data_attempts"] >= ev.MAX_NO_DATA_ATTEMPTS
+    finally:
+        hub.close_all()

@@ -48,6 +48,24 @@
 
 ## 2026-10-05
 
+### 14. 结算 scope 改预算 + 取不到数据要计数告警
+
+- **后台结算不再按品种过滤**：`settings.general.last_*` 是只读的会话游标派生
+  字段，调度器读到的是冻结旧值，导致所有非当前品种的记录**永久结算不了**。
+  实测切到 NVDA/5m 后 `checked=0`，因为快照里还是 BTCUSDT
+- **改用 `max_dedicated` 预算保护上游**：共享源三轴匹配时复用（零成本），
+  不匹配才建专用源，每轮最多 N 条。按品种过滤是用「永久结算不了」换「不超预算」，
+  而后者有预算就能解决 —— **限制工作量，而不是限制正确性**
+- **取不到数据不再无限静默重试**：`_note_no_data` 记 `_no_data_attempts`，
+  达 5 次打 ERROR 点명组合可能无效。**刻意不转 unresolved** —— 那个状态的
+  语义是「窗口内未触及价位」，与「压根取不到行情」不是一回事
+- 修 `_note_no_data` 的计数器缺陷：原先从调用方传入的 `content` 里读，那是
+  `list_pending` 的本轮快照，**每轮都是同一个值，计数永远停在 1** —— 真机上
+  连跑 5 轮才发现。改为从库里的当前值读
+- 真机验证：调度轮现在会真的去查那条 `GATEIO/NVDA` 记录（原先被 scope 挡掉），
+  计数累加到 5 后打出 ERROR：`has failed to fetch bars 6 times — this entry
+  can never settle; exchange/symbol pair is likely invalid`
+
 ### 13. Docker 真机验证：查出结算链路两个从未工作的 bug
 
 第一次在**真实容器 + 真实行情**上跑整条链路，之前所有单测都绿着，却查��：

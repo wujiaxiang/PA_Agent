@@ -43,6 +43,8 @@ class _Guard:
     def __init__(self) -> None:
         self._flag = threading.Lock()
         self._busy = False
+        #: 每轮允许的「专用数据源」预算（保护上游，见 run_once 里的说明）
+        self._dedicated_budget = 1
 
     def try_acquire(self) -> bool:
         with self._flag:
@@ -89,17 +91,27 @@ def run_once(ctx: Any, force: bool = False) -> dict[str, Any] | None:
     try:
         from web.api.experience_verifier import verify_pending
 
-        general = getattr(getattr(ctx, "settings", None), "general", None)
-        scope = (
-            str(getattr(general, "last_symbol", "") or ""),
-            str(getattr(general, "last_timeframe", "") or ""),
-        )
+        # **不按品种过滤**。`settings.general.last_*` 是「每次请求从会话游标派生、
+        # 只回给前端」的只读字段，`/api/subscribe` 早已不更新它 —— 从这里读到的
+        # 是冻结的旧值，实测切到 NVDA/5m 后 `checked=0`（快照里还是 BTCUSDT），
+        # 等于所有非该品种的记录**永久结算不了**。
+        #
+        # 「别打爆上游」的正确形态是**限制工作量**而不是限制正确性：
+        # 共享源三轴匹配时复用（零成本），不匹配才建专用源，且每轮最多 `budget` 条。
+        budget = max(1, int(getattr(_guard, "_dedicated_budget", 1)))
+        try:
+            from pa_agent.data.factory import create_data_source
+
+            factory = lambda: create_data_source("tradingview")  # noqa: E731
+        except Exception:  # noqa: BLE001
+            factory = None
+
         summary = verify_pending(
             shared_source=getattr(ctx, "data_source", None),
-            # No dedicated sources on the timer: one shared snapshot read only.
-            source_factory=None,
+            source_factory=factory,
             settings=getattr(ctx, "settings", None),
-            scope=scope if scope[0] else None,
+            scope=None,
+            max_dedicated=budget,
         )
         settled = (summary.get("win", 0) + summary.get("loss", 0)
                    + summary.get("unresolved", 0))

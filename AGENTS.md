@@ -365,11 +365,22 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
   K 线 → 每条待验证记录静默停在 pending。之所以从没被发现：单测用的是假源，
   而假源只走 `_shared_fetch` 的三轴匹配分支，**压根不碰专用源**。
   **任何只测共享源路径的用例都验不到它**
-- **结算 scope 不能读 `settings.general.last_*`**：那已经是「每次请求从会话游标
-  派生、只回给前端」的只读字段（见 `routes_settings._CURSOR_FIELDS` 注释），
-  而 `/api/subscribe` 早已改写会话游标、不再更新它。调度器从 settings 快照读到的
-  是**冻结的旧值**，于是后台结算永远只匹配那一个品种。实测：我切到 NVDA/5m 后
-  点「验证」，`checked=0` —— 因为快照里的 `last_symbol` 还是先前那次订阅的 BTCUSDT
+- **结算不得按品种过滤**：`settings.general.last_*` 是「每次请求从会话游标派生、
+  只回给前端」的只读字段（见 `routes_settings._CURSOR_FIELDS` 注释），
+  `/api/subscribe` 早已不更新它 —— 调度器读到的是**冻结的旧值**。实测切到
+  NVDA/5m 后点「验证」得到 `checked=0`（快照里还是 BTCUSDT），等于所有非该
+  品种的记录**永久结算不了**
+- **保护上游要限制「工作量」而不是「正确性」**：正确形态是 `max_dedicated`
+  预算 —— 共享源三轴匹配时复用（零成本），不匹配才建专用源，每轮最多 N 条，
+  剩下的下一轮再来（`list_pending` 由旧到新，不会饿死后面的）。按品种过滤是用
+  「永久结算不了」换「不超预算」，后者有预算就能解决
+- **取不到数据必须计数并告警**：交易所/品种组合无效时 TradingView 永远无数据，
+  原先每轮只 `skipped_no_data += 1`，**无限静默重试**，界面上就是一条永远停在
+  「待验证」却看不出为什么的记录。`_note_no_data` 记 `_no_data_attempts`，
+  达 `MAX_NO_DATA_ATTEMPTS` 打 ERROR。**刻意不转 unresolved** —— 那个状态
+  的语义是「窗口内未触及价位」，与「压根取不到行情」不是一回事
+- **`_no_data_attempts` 必须从库里读当前值**，不能用调用方传的 `content` ——
+  那是 `list_pending` 在本轮开始时的快照，每轮都是同一个值，计数器永远停在 1
 - **重建表必须先 `PRAGMA foreign_keys=OFF`**：`connect()` 开着 FK，而重建要
   `DROP TABLE`，SQLite 视为删全部行 → `ON DELETE CASCADE` **静默清空子表**，
   `migrate()` 还返回 True（实测重建 `experience_entries` 会删光
