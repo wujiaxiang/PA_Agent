@@ -9,9 +9,49 @@
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="/css/style.css?v=41">
+<link rel="stylesheet" href="/css/style.css?v=42">
 </head>
-<body>
+<!-- data-auth="pending" = 身份未定（app.js 的闸门正在判定）：
+     此时主界面保持可见但**不接受点击**，登录页也还没显示。
+     闸门是**同步**判定的（PAuth.decideBootGate），所以匿名用户看不到任何
+     一帧空主界面；已登录用户则是在 /api/auth/me 往返期间看着主界面，
+     与改造前的首屏观感一致。 -->
+<body data-auth="pending">
+
+<!-- 登录闸门：全屏不透明遮罩。放在最前面 ⇒ 它盖住后面所有主界面 DOM。
+     ⚠️ 本轮不做注册，只有登录（用户表目前仅 admin，初始密码由管理员持有）。 -->
+<div id="login-screen" class="login-screen" hidden>
+  <div class="login-card">
+    <div class="login-brand">
+      <span class="login-led" id="login-led" data-tone="idle" aria-hidden="true"></span>
+      <div class="login-brand-text">
+        <div class="login-title">PA Agent</div>
+        <div class="login-sub">Aurora Quant Console</div>
+      </div>
+    </div>
+    <form id="login-form" class="login-form" autocomplete="on" novalidate>
+      <label class="login-field" for="login-username">
+        <span class="login-label">用户名</span>
+        <input id="login-username" name="username" type="text"
+               autocomplete="username" autocapitalize="off" autocorrect="off"
+               spellcheck="false" placeholder="admin">
+      </label>
+      <label class="login-field" for="login-password">
+        <span class="login-label">密码</span>
+        <input id="login-password" name="password" type="password"
+               autocomplete="current-password" placeholder="••••••••">
+      </label>
+      <div id="login-error" class="login-error" role="alert" hidden></div>
+      <button id="login-submit" class="login-btn" type="submit">
+        <span class="login-btn-led" aria-hidden="true"></span>
+        <span class="login-btn-text">登录</span>
+        <span class="login-btn-shimmer" aria-hidden="true"></span>
+      </button>
+      <div id="login-status" class="login-status">请输入管理员凭据</div>
+    </form>
+    <div class="login-foot">令牌保存在 localStorage · 刷新不需重登</div>
+  </div>
+</div>
 
 <div id="health-banner" class="health-banner hidden"></div>
 
@@ -47,9 +87,11 @@
     <span id="live-refresh-status" class="muted-text"></span>
   </div>
   <div class="toolbar-right">
+    <span id="auth-user" class="auth-user" title="当前登录用户">—</span>
     <button id="btn-indicators" class="icon-btn" title="指标管理">📐</button>
     <button id="btn-settings" class="icon-btn" title="系统设置">⚙</button>
     <button id="btn-sidebar-toggle" class="icon-btn" title="显示/隐藏侧边栏">📊</button>
+    <button id="btn-logout" class="icon-btn" title="退出登录">🚪</button>
   </div>
 </header>
 <!-- 切换错误提示条：applySubscribe 失败时由 showSwitchError() 显示 -->
@@ -712,12 +754,14 @@
 <!-- 下单机会提醒 Toast 容器（固定右下角，Phase E Task 12） -->
 <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
-<!-- api.js?v 必须递增：会话身份改成「稳定 id + BroadcastChannel 克隆检测」，
-     旧版每次刷新换 id（游标与追问历史全丢）。见 api.js 顶部注释。 -->
-<script src="/js/api.js?v=7"></script>
+<!-- api.js?v 必须递增：会话身份改成「稳定 id + BroadcastChannel 克隆检测」
+     后又加了鉴权闸门（Bearer 令牌 + 401 拦截）；旧版每次刷新换 id（游标与
+     追问历史全丢），且不带 Authorization。见 api.js 顶部注释。 -->
+<script src="/js/api.js?v=8"></script>
 <script src="/js/chart.js?v=9"></script>
 <script src="/js/indicators.js?v=5"></script>
 <script src="/js/continuous_gate.js?v=2"></script>
-<script src="/js/app.js?v=67"></script>
+<!-- app.js?v 必须递增：boot 最前面加了登录闸门（未登录不初始化主界面） -->
+<script src="/js/app.js?v=68"></script>
 </body>
 </html>

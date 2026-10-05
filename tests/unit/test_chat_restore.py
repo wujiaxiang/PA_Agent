@@ -748,6 +748,17 @@ class TestFrontendContract:
         assert "chat-history-note" in fn
 
     def test_html_version_is_bumped(self):
-        """``app.js?v=N`` 必须递增，否则老 webview 会拿旧脚本。"""
+        """``app.js?v=N`` 必须存在且带版本号，否则老 webview 会拿旧脚本。
+
+        **不要断言具体数字**。本用例上一轮写的是 ``v=67``，结果登录界面那轮
+        递增到 68 之后它就红了 —— 而那次递增是**应该**的。这类断言会把
+        「别人正常改版本号」误报成回归，久而久之大家会去改测试而不是去查。
+        真正要防的是「忘了递增」，那是**同一份 HTML 内**引用与文件不匹配，
+        由下面那条对着脚本内容断言的用例守住。
+        """
+        import re
+
         html = Path("web/static/index.html").read_text(encoding="utf-8")
-        assert "app.js?v=67" in html, "index.html 的 app.js 版本号未递增"
+        m = re.search(r"app\.js\?v=(\d+)", html)
+        assert m, "index.html 的 app.js 引用没有 ?v=N（老 webview 会缓存旧脚本）"
+        assert int(m.group(1)) > 0

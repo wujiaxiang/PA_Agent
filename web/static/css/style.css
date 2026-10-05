@@ -4106,3 +4106,269 @@ body[data-readonly] #sidebar button[data-needs-live] {
 /* token 明细里的缓存命中率：命中=绿（便宜且快），未命中=琥珀（提示预热失效） */
 #token-progress-detail.cache-good { color: #34d399; }
 #token-progress-detail.cache-bad  { color: #fbbf24; }
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 登录闸门（#login-screen）
+ * Aurora Quant Console 设计语言，与侧边栏头部同源：
+ *   深色 obsidian + 径向 accent 光晕 + SVG 噪点 + 4 层阴影 + LED + shimmer
+ * 字体：标题/标签 IBM Plex Sans，状态与错误用 JetBrains Mono。
+ *
+ * **必须用属性选择器**：body[data-auth="login"]。用 classList.toggle 加类名
+ * 的话下面这些规则一条都选不中，样式静默失效（AGENTS.md 已记过这个坑）。
+ * ══════════════════════════════════════════════════════════════════════ */
+
+/* 身份未定/未登录时，主界面不可交互也不可被读屏软件读到。
+ * 用 visibility 而非 display —— 闸门放行后布局已就位，不会有跳变。 */
+body[data-auth="login"] #toolbar,
+body[data-auth="login"] #main,
+body[data-auth="login"] .sidebar-expand-fab,
+body[data-auth="login"] #health-banner {
+  visibility: hidden;
+}
+
+.login-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;          /* 高于 modal(100) 与 toast(9999) 的兄弟层 */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  font-family: var(--font-ui);
+  background:
+    radial-gradient(ellipse 70% 55% at 50% 8%, rgba(41, 98, 255, 0.13) 0%, transparent 62%),
+    radial-gradient(ellipse 55% 45% at 82% 92%, rgba(38, 166, 154, 0.08) 0%, transparent 60%),
+    linear-gradient(180deg, #0f1219 0%, var(--bg) 60%, #0e1117 100%);
+  overflow: auto;
+}
+/* 噪点纹理：与 .sidebar-header::before 同款，极低 opacity 营造质感 */
+.login-screen::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: var(--noise-bg);
+  background-repeat: repeat;
+  opacity: 0.6;
+  mix-blend-mode: overlay;
+  pointer-events: none;
+}
+
+/* ⚠️ 必须显式盖掉 hidden 属性：上面的 `.login-screen { display: flex }` 属于
+   **作者样式**，优先级高于浏览器 UA 的 `[hidden] { display: none }` ——
+   不写这一行，`hidden` 属性完全失效，登录页会常驻可见（与既有 `.modal.hidden`
+   同一个坑：类选择器先把 display 定成 flex，UA 的 hidden 就再也压不住）。 */
+.login-screen[hidden] { display: none; }
+
+.login-card {
+  position: relative;
+  width: 380px;
+  max-width: 100%;
+  padding: 26px 26px 20px;
+  border-radius: 12px;
+  border: 1px solid rgba(120, 140, 170, 0.20);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.03) 0%, transparent 34%),
+    linear-gradient(180deg, var(--bg-panel) 0%, rgba(24, 28, 38, 0.98) 100%);
+  /* 4 层阴影：顶部高光 / 底部暗影 / 近距投影 / 蓝色外发光 */
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.30),
+    0 2px 6px rgba(0, 0, 0, 0.45),
+    0 18px 48px rgba(41, 98, 255, 0.18);
+}
+
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 14px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.login-brand-text { display: flex; flex-direction: column; gap: 1px; }
+.login-title {
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 1.4px;
+  color: #e6edf7;
+}
+.login-sub {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+/* LED：登录门的三态指示 —— 空闲灰 / 校验中蓝闪 / 出错红 */
+.login-led {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: #4a5568;
+  box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.35);
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+.login-led[data-tone="busy"] {
+  background: var(--accent);
+  box-shadow: 0 0 6px 1px rgba(41, 98, 255, 0.8), inset 0 1px 1px rgba(255, 255, 255, 0.35);
+  animation: led-pulse 1.1s ease infinite;
+}
+.login-led[data-tone="error"] {
+  background: var(--red);
+  box-shadow: 0 0 6px 1px rgba(239, 83, 80, 0.85), inset 0 1px 1px rgba(255, 255, 255, 0.3);
+}
+
+.login-form { display: flex; flex-direction: column; gap: 12px; }
+.login-field { display: flex; flex-direction: column; gap: 5px; }
+.login-label {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.login-field input {
+  width: 100%;
+  height: 38px;
+  padding: 0 11px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.login-field input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.25),
+    0 0 0 2px rgba(41, 98, 255, 0.18);
+}
+.login-field input::placeholder { color: #5a5f6d; }
+
+/* 主操作 CTA：与侧边栏「分析」按钮同一套 4 层阴影 + shimmer */
+.login-btn {
+  position: relative;
+  width: 100%;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 0 18px;
+  border-radius: 7px;
+  cursor: pointer;
+  overflow: hidden;
+  isolation: isolate;
+  border: 1px solid rgba(41, 98, 255, 0.5);
+  color: #fff;
+  font-family: var(--font-ui);
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.08) 0%, transparent 30%),
+    linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.15),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.25),
+    0 2px 4px rgba(0, 0, 0, 0.4),
+    0 4px 14px rgba(41, 98, 255, 0.25);
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.login-btn:hover:not(:disabled) {
+  filter: brightness(1.1);
+  border-color: rgba(41, 98, 255, 0.8);
+  transform: translateY(-1px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.25),
+    0 4px 8px rgba(0, 0, 0, 0.4),
+    0 8px 22px rgba(41, 98, 255, 0.45);
+}
+.login-btn:active:not(:disabled) { transform: translateY(0); }
+.login-btn:disabled {
+  cursor: progress;
+  filter: saturate(0.6) brightness(0.85);
+}
+.login-btn-led {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: #4a5568;
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+.login-btn[data-busy="1"] .login-btn-led {
+  background: var(--gold);
+  box-shadow: 0 0 7px 1px rgba(240, 185, 11, 0.85);
+  animation: led-pulse 1.1s ease infinite;
+}
+.login-btn-shimmer {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    105deg,
+    transparent 30%,
+    rgba(255, 255, 255, 0.12) 48%,
+    rgba(255, 255, 255, 0.18) 50%,
+    rgba(255, 255, 255, 0.12) 52%,
+    transparent 70%
+  );
+  background-size: 250% 100%;
+  background-position: 250% 0;
+  pointer-events: none;
+  z-index: 1;
+  animation: shimmer-sweep 6s ease-in-out infinite;
+}
+.login-btn:disabled .login-btn-shimmer { display: none; }
+
+/* 错误提示：与 toast 的 error 配色一致，但常驻在表单里（不依赖计时器消失） */
+.login-error {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: #f3a3a1;
+  background: rgba(239, 83, 80, 0.10);
+  border: 1px solid rgba(239, 83, 80, 0.32);
+  border-radius: 5px;
+  padding: 7px 9px;
+}
+.login-status {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: center;
+  min-height: 15px;
+}
+.login-foot {
+  margin-top: 16px;
+  padding-top: 11px;
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  color: #5a5f6d;
+  text-align: center;
+}
+
+/* 顶栏当前用户（#auth-user）：mono 小字，未登录时显示 — */
+.auth-user {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--green);
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 7px;
+  border-radius: 5px;
+  border: 1px solid rgba(38, 166, 154, 0.30);
+  background: rgba(38, 166, 154, 0.08);
+}

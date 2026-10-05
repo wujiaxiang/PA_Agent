@@ -120,12 +120,31 @@ def authenticate(user_id: str, password: str) -> str | None:
 
     区分这两种情况等于给攻击者一个用户名枚举接口：两者响应时间/文案一致。
     用户不存在时仍跑一遍 :func:`verify_password` 的开销以抹平时序差异。
+
+    ⚠️ 空 ``user_id`` **不**回落 admin。``get_user("")`` 因为
+    ``user_id or ADMIN_USER_ID`` 会返回 admin 行 —— 于是
+    ``authenticate("", <admin 的口令>)`` 会**登录成功并返回 "admin"**。
+    那不是「多一条登录途径」（拿着 admin 口令本来就能登 admin），但它是本模块
+    自己在每处都警告「请求路径不许回落 admin」的同时漏掉的一个洞：前端用户名
+    空着、口令被密码管理器自动填上的那一次，会静默变成以 admin 身份登录。
     """
     from pa_agent.storage.auth import verify_password
 
-    row = get_user(user_id)
+    # 绕开 get_user 的「空串即 admin」默认：这里是授权路径，不能有默认身份。
+    row = get_user(user_id) if user_id else None
     stored = (row or {}).get("password_hash") or ""
-    ok = verify_password(password, stored) if row else verify_password(password, "")
+    if not row or not stored:
+        # 用一份**格式完好**的诱饵散列跑一遍完整 PBKDF2。
+        #
+        # 为什么不能直接 verify_password(password, "")：空串在
+        # verify_password 里于 `.split("$", 3)` 处就 ValueError 返回 False，
+        # **一次 PBKDF2 都不跑** —— 那这条 docstring 承诺的「抹平时序差异」
+        # 根本没兑现，反而留下一个比原文更明显的计时侧信道（用户不存在：
+        # <1ms；用户存在但口令错：240k 轮）。侧信道比文案泄露更值钱，
+        # 因为它对**没有账号的人**同样有效。
+        ok = verify_password(password, _decoy_hash())
+    else:
+        ok = verify_password(password, stored)
     if not ok:
         logger.info("authenticate failed for user_id=%s", user_id)
         return None
@@ -134,6 +153,24 @@ def authenticate(user_id: str, password: str) -> str | None:
         "UPDATE users SET last_seen = ? WHERE user_id = ?", (now(), user_id)
     )
     return row["user_id"]
+
+
+#: 「用户不存在 / 未设口令」时用于抹平时序的诱饵散列。进程内懒生成一次。
+#:
+#: 懒生成而非模块级常量：构造它要跑一遍 240k 轮 PBKDF2（约几十毫秒），
+#: 放在 import 期就是**每个进程启动都付一次**，而绝大多数部署根本不会有
+#: 「对不存在的用户登录」这种请求。
+_decoy_hash_cache: str | None = None
+
+
+def _decoy_hash() -> str:
+    """返回一份格式完好、无人知其口令的 PBKDF2 散列（只算一次）。"""
+    global _decoy_hash_cache
+    if _decoy_hash_cache is None:
+        from pa_agent.storage.auth import hash_password, new_salt
+
+        _decoy_hash_cache = hash_password(new_salt())   # 口令 = 随机盐，无人知道
+    return _decoy_hash_cache
 
 
 def _validate_user_id(raw: str) -> str:

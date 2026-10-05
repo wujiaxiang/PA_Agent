@@ -112,8 +112,9 @@ async def lifespan(app: FastAPI):
 
         hub = get_hub()   # 上面已 initialize_storage()，此处只取实例
         if not hub.disabled:
-            # 单机部署恒为 admin；UI 暂不做登录。将来接鉴权只改 default_user_id()
+            # 单机部署恒为 admin。UI 暂不做登录。将来接鉴权只改 default_user_id()
             logger.info("Default user ready: %s", ensure_admin_user())
+            _warn_if_admin_cannot_log_in()
             reg = get_registry()
             logger.info("Session registry ready (max=%d)", len(reg.all_sessions()))
             stats = await asyncio.to_thread(import_all)
@@ -144,6 +145,38 @@ async def lifespan(app: FastAPI):
         ctx.data_source.disconnect()
     except Exception:
         pass
+
+
+def _warn_if_admin_cannot_log_in() -> None:
+    """admin 没有口令时打**响亮**告警。
+
+    强制鉴权（``ALLOW_ANONYMOUS_ADMIN=False``）下，空 ``password_hash`` 意味着
+    **谁也登不进去**，而且没有任何接口能把口令设回来 —— 新建一个空库部署就
+    直接锁死。这类故障在现场只表现为「前端一直跳登录页」，非常难定位，
+    所以必须在启动日志里就喊出来。
+
+    **绝不因此自动放行**：空散列 + 「随便什么都能进」是灾难性组合。补救路径
+    是执行一次
+    ``python -c "from pa_agent.storage.db import initialize_storage; \\
+    initialize_storage(); from pa_agent.storage.users import set_password; \\
+    set_password('admin', '<新口令>')"``。
+    """
+    try:
+        from pa_agent.storage.users import get_user
+
+        row = get_user("admin") or {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("无法检查 admin 口令状态: %s", exc)
+        return
+    if row.get("password_hash"):
+        return
+    logger.error(
+        "============================================================\n"
+        "  admin 用户没有口令，所有 /api 接口都无法登录！\n"
+        "  强制鉴权已开启（ALLOW_ANONYMOUS_ADMIN=False），\n"
+        "  请先执行 set_password('admin', '<新口令>') 再使用本服务。\n"
+        "============================================================"
+    )
 
 
 async def _health_heartbeat(app: FastAPI) -> None:
@@ -193,7 +226,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Cross-origin policy.
+# Cross-origin policy —— **注意：本块必须留在所有 @app.middleware("http") 之后**，
+# 见文件末尾的 `_install_cors()` 调用处。
 #
 # The WebUI is served by this very app (static mount at "/" + /api), so it is
 # always same-origin and needs no CORS at all. The previous `allow_origins=["*"]`
@@ -208,7 +242,35 @@ _CORS_ORIGINS = [
     for origin in os.environ.get("PA_AGENT_CORS_ORIGINS", "").split(",")
     if origin.strip()
 ]
-if _CORS_ORIGINS:
+
+
+def _install_cors() -> None:
+    """挂 CORS 中间件。**必须最后调用**（理由见下）。
+
+    :data:`_CORS_ORIGINS` 为空时什么都不做 —— 同源部署（默认，也是唯一的
+    生产部署形态）连这个中间件都不存在。
+
+    ## 为什么要挪到最后
+
+    Starlette 的中间件按注册顺序**反向**包裹 ⇒ 最后注册的跑在最外层。
+    强制鉴权要在最外层（未认证流量不该先落一次 SQLite），而 CORS 必须在它
+    再外一层：
+
+    * **预检**：浏览器发 OPTIONS 时不带 ``Authorization``，CORS 在最外层
+      直接回 200，根本不会走到鉴权；
+    * **401 也要有 CORS 头**：CORS 若在鉴权**里面**，那么「令牌过期」这个
+      最需要前端处理的响应会**没有** ``Access-Control-Allow-Origin``，
+      浏览器把它报成 CORS 错误，前端只看到一个不含 body 的网络失败 ——
+      于是「静默跳登录页」这条最关键的路径反而拿不到任何信息。
+
+    ## allow_headers 必须含 Authorization
+
+    强制鉴权之后前端每个请求都带 ``Authorization``，带自定义头的跨域请求
+    一定触发预检。若 ``allow_headers`` 只有 ``Content-Type``，预检就失败，
+    分离式前端**一个请求都发不出去**。
+    """
+    if not _CORS_ORIGINS:
+        return
     logger.warning(
         "CORS enabled for %s — /api/settings credentials are readable by these origins",
         _CORS_ORIGINS,
@@ -217,7 +279,11 @@ if _CORS_ORIGINS:
         CORSMiddleware,
         allow_origins=_CORS_ORIGINS,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type"],
+        # Authorization 是强制鉴权后**每个**请求的头，漏了它分离式前端全线失败。
+        allow_headers=["Content-Type", "Authorization", "X-Session-Id", "X-Trace-Id"],
+        # 不开 allow_credentials：身份走 Bearer 头而非 Cookie，开了反而允许
+        # 跨站携带凭证，得不偿失。
+        expose_headers=["X-Trace-Id"],
     )
 
 
@@ -320,6 +386,29 @@ async def session_lifecycle_middleware(request: Request, call_next):
 
     return await _impl(request, call_next)
 
+
+# 鉴权中间件 —— **必须注册在本文件最后**。
+#
+# Starlette 的 `add_middleware` 往 `user_middleware` 头部插入，栈按列表顺序
+# 包裹 ⇒ **最后注册的跑在最外层**。它必须最外层：未认证的流量要在会话解析
+# （`touch` + 限流写 SQLite）与按用户解析配置（一次读库）**之前**就被挡掉，
+# 否则一次「忘了带令牌」的前端 bug 就等于把每个请求都变成一次 SQLite 写。
+#
+# 代价：401 走的是这条最外层的路径，`trace_id_middleware` 在它里面，所以
+# 401 响应上**没有** `X-Trace-Id`。这是有意的取舍 —— 401 是「你没带令牌」，
+# 按定义就不是一次需要跨系统追查的请求；真要追查，日志里有 `401 <method> <path>`。
+@app.middleware("http")
+async def enforce_auth_middleware(request: Request, call_next):
+    """强制鉴权：``/api/**`` 默认要求 Bearer 令牌，放行项逐条见 auth_ctx。"""
+    from web.api.auth_ctx import enforce_auth_middleware as _impl
+
+    return await _impl(request, call_next)
+
+
+# 全app 最后一个中间件注册 —— CORS 在最外层。理由与 allow_headers 的必要性
+# 见 :func:`_install_cors` 的 docstring。**新增中间件时不要写在这行后面**。
+_install_cors()
+
 from web.api.routes_settings import router as settings_router
 from web.api.routes_data import router as data_router
 from web.api.routes_analyze import router as analyze_router
@@ -328,6 +417,7 @@ from web.api.routes_records import router as records_router
 from web.api.routes_experience_review import router as experience_review_router
 from web.api.routes_bars_stream import router as bars_stream_router
 from web.api.routes_demo import router as demo_router
+from web.api.routes_auth import router as auth_router
 
 app.include_router(settings_router, prefix="/api")
 app.include_router(data_router, prefix="/api")
@@ -337,10 +427,13 @@ app.include_router(records_router, prefix="/api")
 app.include_router(bars_stream_router, prefix="/api")
 app.include_router(demo_router, prefix="/api")
 app.include_router(experience_review_router, prefix="/api")
+# 鉴权路由**最先** include：它是唯一免鉴权的 /api 端点，路由表里的先后
+# 不影响匹配，但把它排在前面能让读者一眼看到「登录在最外层」。
+app.include_router(auth_router, prefix="/api")
 
 
 @app.get("/api/health")
-async def health():
+async def health(request: Request):
     """Lightweight liveness probe.
 
     Returns cached health status from the background heartbeat task.  If no
@@ -350,8 +443,30 @@ async def health():
     读取，但让运维能一眼看出「DB 已降级」而不是静默变慢。``storage.gc`` 暴露
     周期性清理（``web.api.storage_gc``）的运行状态与最近一轮各清了多少 ——
     清理静默失效与没有清理在外部表现上完全一样。
+
+    ## 为什么它是免鉴权路径（``web.api.auth_ctx.PUBLIC_API_PATHS``）
+
+    liveness 探针（k8s / docker / 反代）默认**不带** ``Authorization``。把它
+    收进鉴权范围，编排系统会判定容器不健康并反复重启 —— 一次鉴权配置问题被
+    升级成宕机，而且现场只剩「容器不健康」这一个几乎无法定位的信号。
+
+    ## 但身份字段必须对匿名者隐藏
+
+    本端点在鉴权前返回过 ``storage.default_user`` 与 ``storage.users``，
+    即 admin 的用户名与全部用户清单。对着已经登录才能用的
+    ``GET /api/settings``（返回飞书 / PushPlus / Tushare / TradingView 凭证）
+    加一个「不用登录就能读出用户名」的接口，等于把刚关上的门又开了条缝。
+    所以：**带令牌 → 全量；不带令牌 → 去掉身份字段**，并显式标出
+    ``auth_required``，让前端能据此决定要不要弹登录框。
+
+    保留的 ``db`` / ``sessions`` / ``gc`` 是运维可见性，不含身份、也不含
+    任何凭证 —— 拿它们去猜谁登录了是不可能的。
     """
+    from web.api.auth_ctx import ALLOW_ANONYMOUS_ADMIN, current_auth
+
+    auth_required = not ALLOW_ANONYMOUS_ADMIN
     report = getattr(app.state, "last_health_report", None)
+    auth = current_auth(request)
     storage: dict[str, Any] = {}
     try:
         from pa_agent.storage.db import get_hub
@@ -361,9 +476,10 @@ async def health():
         storage = {
             "db": get_hub().stats(),
             "sessions": len(get_registry().all_sessions()),
-            "default_user": default_user_id(),
-            "users": [u["user_id"] for u in list_users()],
         }
+        if auth.authenticated:
+            storage["default_user"] = default_user_id()
+            storage["users"] = [u["user_id"] for u in list_users()]
     except Exception as exc:  # noqa: BLE001
         storage = {"error": str(exc)}
     # GC：清理静默失效与「没有 GC」表现完全一样（数据照涨），故必须可观测 ——
@@ -374,9 +490,20 @@ async def health():
         storage["gc"] = storage_gc.status()
     except Exception as exc:  # noqa: BLE001
         storage["gc"] = {"error": str(exc)}
-    if report is None:
-        return {"status": "starting", "storage": storage}
-    return {"status": report["status"], "storage": storage}
+    payload: dict[str, Any] = {
+        "status": "starting" if report is None else report["status"],
+        "storage": storage,
+        # 前端据此决定「这台部署是否要求登录」：反代已鉴权、开关翻回 True 的
+        # 部署不该弹登录框。鉴权状态本身也一并给出，省掉一次 /api/auth/me。
+        "auth": {
+            "required": auth_required,
+            "authenticated": bool(auth.authenticated),
+            "login_url": "/api/auth/login",
+        },
+    }
+    if auth.authenticated:
+        payload["auth"]["user_id"] = auth.user_id
+    return payload
 
 
 @app.get("/api/health/check")

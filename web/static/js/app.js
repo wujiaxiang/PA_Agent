@@ -262,8 +262,224 @@ function initSidebarResizer() {
   }
 }
 
+// ═══ 登录闸门 ═════════════════════════════════════════════════════════════
+//
+// **位置是这条约束的全部**：initLoginGate() 是 DOMContentLoaded 的第一件事，
+// 早于 createChart、早于 bindEvents、早于 loadSettings → loadBars。
+// 反过来做（先 boot、失败再补救）会付出三重代价：
+//   1. boot 是 7 个 await 的链，loadSettings 一失败后面全不执行，只能事后判断；
+//   2. 每一跳失败都会 showToast 一次，未登录时打出一片红字，用户看到的
+//      是「系统坏了」而不是「请登录」；
+//   3. 后端一旦把 ALLOW_ANONYMOUS_ADMIN 翻成 False，未登录页面上的每个请求都
+//      是一次注定失败的往返 —— 既拖慢首屏，又在服务端日志里刷出一片 401。
+//
+// 与既有约束「bindEvents() 必须在数据加载前调用」同源：**可交互性不依赖数据
+// 加载成功**。登录表单的 handler 在闸门内部当场绑定，闸门自己失败也不影响
+// 用户点「登录」。
+
+/** 登录页元素。集中取一次，避免各处散着 querySelector（id 拼错只在运行期炸）。 */
+function _loginEls() {
+  return {
+    screen: $('#login-screen'),
+    form: $('#login-form'),
+    user: $('#login-username'),
+    pass: $('#login-password'),
+    submit: $('#login-submit'),
+    error: $('#login-error'),
+    status: $('#login-status'),
+    led: $('#login-led'),
+  };
+}
+
+const LOGIN_HINTS = {
+  missing: '请使用管理员凭据登录',
+  expired: '登录已过期，请重新登录',
+  rejected: '会话已失效，请重新登录',
+  loggedOut: '已登出',
+  network: '无法连接服务端',
+};
+
+/** 切换到登录页。reason 只影响文案；tone 决定 LED 颜色（'error' 才是红）。 */
+function showLoginScreen(reason, tone) {
+  const el = _loginEls();
+  PAuth.sessionDead = true;
+  document.body.dataset.auth = 'login';
+  const badge = $('#auth-user');
+  if (badge) badge.textContent = '—';
+  if (el.screen) el.screen.hidden = false;
+  if (el.led) el.led.dataset.tone = tone === 'error' ? 'error' : (tone || 'idle');
+  if (el.status && !tone) el.status.textContent = LOGIN_HINTS[reason] || LOGIN_HINTS.missing;
+}
+
+function setLoginError(message) {
+  const el = _loginEls();
+  if (!el.error) { if (message) showToast(message, 'error', { force: true }); return; }
+  el.error.hidden = !message;
+  el.error.textContent = message || '';
+  if (el.led) el.led.dataset.tone = message ? 'error' : 'idle';
+}
+
+function setLoginBusy(busy, text) {
+  const el = _loginEls();
+  if (el.submit) {
+    el.submit.disabled = !!busy;
+    el.submit.dataset.busy = busy ? '1' : '';
+  }
+  if (el.led) el.led.dataset.tone = busy ? 'busy' : (el.error && el.error.hidden ? 'idle' : 'error');
+  if (el.status && text) el.status.textContent = text;
+}
+
+/** 登录成功后回填顶栏的用户名。display 优先用 /auth/me 里的 username，
+ *  拿不到就退回令牌载荷里的 sub —— 不猜、不留空。 */
+function setAuthBadge(display) {
+  const badge = $('#auth-user');
+  if (badge) badge.textContent = display || PAuth.currentUserId() || '—';
+}
+
+/** 登录提交。**直接用 fetch 而不是 API.post**：需要区分 401（密码错）/
+ *  404（后端端点未落地）/ 422（返回体形状对不上）三种完全不同的处置，
+ *  而 API.post 只抛一个 message 字符串。/api/auth/* 本身也在闸门的免鉴权名单里，
+ *  绕过 API.post 不会削弱任何鉴权检查。 */
+async function handleLoginSubmit(ev) {
+  if (ev) ev.preventDefault();
+  const el = _loginEls();
+  const username = (el.user && el.user.value || '').trim();
+  const password = (el.pass && el.pass.value) || '';
+  setLoginError('');
+  if (!username) { setLoginError('请输入用户名'); if (el.user) el.user.focus(); return; }
+  if (!password) { setLoginError('请输入密码'); if (el.pass) el.pass.focus(); return; }
+
+  setLoginBusy(true, '校验中…');
+  try {
+    const headers = await sessionHeadersAsync({ 'Content-Type': 'application/json' });
+    const r = await fetch('/api/auth/login', {
+      method: 'POST', headers, cache: 'no-cache',
+      body: JSON.stringify({ username, password }),
+    });
+    if (r.status === 404) {
+      setLoginError('登录接口未就绪（404）：后端 /api/auth/login 尚未落地');
+      return;
+    }
+    if (r.status === 401 || r.status === 403) {
+      setLoginError('用户名或密码错误');
+      if (el.pass) { el.pass.value = ''; el.pass.focus(); }
+      return;
+    }
+    if (!r.ok) {
+      setLoginError(`登录失败（HTTP ${r.status}）`);
+      return;
+    }
+    let data = null;
+    try { data = await r.json(); } catch (_) { /* 落到下面的缺字段提示 */ }
+    // 令牌字段名兼容 token / access_token —— 后端尚未落地，先宽进严出。
+    const token = (data && (data.token || data.access_token)) || '';
+    if (!token) {
+      setLoginError('响应里没有 token 字段（需为 {"token": "v1...."}）');
+      return;
+    }
+    if (!PAuth.isTokenUsable(token)) {
+      setLoginError('令牌格式无法识别（期望 v1.<payload>.<sig>，且载荷含 sub 与 exp）');
+      return;
+    }
+    PAuth.setAuthToken(token);
+    setAuthBadge(data.username || data.user_id || PAuth.currentUserId());
+    showToast('登录成功，正在进入控制台…', 'success', { force: true });
+    // 登录成功后**整页重载**，而不是就地启动主界面（取舍见交付说明）。
+    // 重载保证主界面只可能由「一次通过了闸门的 boot」产生 —— 这条不变量
+    // 正是「未登录绝不发业务请求」的结构性保证。
+    location.reload();
+  } catch (e) {
+    setLoginError(`无法连接服务端：${(e && e.message) || e}`);
+  } finally {
+    setLoginBusy(false);
+  }
+}
+
+/** 登出：清 token + 丢会话身份 + 重载。 */
+async function doLogout() {
+  const btn = $('#btn-logout');
+  if (btn) { btn.disabled = true; btn.title = '登出中…'; }
+  // 先通知服务端（尽力而为）：即便它失败/超时，本地也必须登出 ——
+  // 「点登出没反应」比「服务端还留着一条会话」糟糕得多。
+  try { await API.post('/api/auth/logout', {}); } catch (_) { /* 忽略 */ }
+  PAuth.setAuthToken('');
+  PAuth.resetSessionId();
+  PAuth.sessionDead = true;
+  // **为什么直接 reload 而不是手工清理**：主界面内存里散着上一个用户的
+  // lastBars / lastRecord / 各面板 innerHTML / 叠加层 / 追问线程 / 当前订阅。
+  // 手工清理正是本仓库反复踩坑的地方（clearOverlays 漏派生图例、
+  // 置 lastRecord=null 面板内容还在…）。reload 让「干净」由构造保证。
+  // 代价是一次静态资源重载 —— 可接受，且换用户时本来就该重来。
+  location.reload();
+}
+
+/** 会话失效（令牌被服务端拒绝 / 本地过期 / 被登出）的统一处置。
+ *  **刻意不 reload**：boot 期间并发的一批请求会一起 401，reload 会变成
+ *  「重载 → 首屏请求又 401 → 再重载」的循环。切登录页是幂等且有终点的。 */
+function onSessionLost(reason) {
+  showLoginScreen(reason === 'missing' ? 'missing' : 'expired', 'error');
+  showToast(
+    reason === 'missing' ? '登录状态丢失，请重新登录' : '登录已失效，请重新登录',
+    'warning',
+    { force: true }
+  );
+  const el = _loginEls();
+  if (el.pass) el.pass.value = '';
+}
+
+/** 启动闸门。**返回 true 才允许继续 boot**。
+ *  任何异常都按「拒绝进入」处理（fail closed），且**绝不抛**。 */
+async function initLoginGate() {
+  const el = _loginEls();
+  // 1) handler 先绑：闸门自己失败也不该让登录框失去响应
+  if (el.form) el.form.addEventListener('submit', handleLoginSubmit);
+  if (el.pass) {
+    el.pass.addEventListener('input', () => { if (el.error && !el.error.hidden) setLoginError(''); });
+  }
+  PAuth.setUnauthorizedHandler(onSessionLost);
+
+  try {
+    // 2) 同步判定 —— 不 await，所以匿名用户**看不到任何一帧空主界面**
+    if (PAuth.decideBootGate(PAuth.readAuthToken()) !== 'boot') {
+      showLoginScreen('missing');
+      const u = _loginEls().user;
+      if (u) setTimeout(() => u.focus(), 0);
+      return false;
+    }
+    // 3) 令牌本地看是有效的，再向服务端问一次身份。
+    //    **只有 401 才拦**：404 / 500 / 网络抖动一律放行。理由是这一步是
+    //    「锦上添花的身份回显」，真正的鉴权由业务端点自己把关（它们 401 会
+    //    走 onSessionLost）；而如果因为这个可选端点一抖就把人锁在登录页，
+    //    代价远大于收益。
+    const headers = await sessionHeadersAsync();
+    const r = await fetch('/api/auth/me', { headers, cache: 'no-cache' });
+    if (r.status === 401) {
+      PAuth.clearAuthToken();
+      showLoginScreen('expired', 'error');
+      return false;
+    }
+    if (r.ok) {
+      let me = null;
+      try { me = await r.json(); } catch (_) { /* 非 JSON 就只用令牌里的 sub */ }
+      setAuthBadge((me && (me.username || me.user_id)) || PAuth.currentUserId());
+    }
+    document.body.dataset.auth = 'app';
+    return true;
+  } catch (_) {
+    // fetch 本身炸了（网络/被拦截/扩展干扰）：不能假定有身份。
+    PAuth.clearAuthToken();
+    showLoginScreen('network', 'error');
+    setLoginError('无法连接服务端，请检查后端是否已启动');
+    return false;
+  }
+}
+
 // ── Init ───────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
+  // 🔑 登录闸门：必须在任何 createChart / bindEvents / 数据加载之前。
+  // 未登录时**直接 return**，主界面一行代码都不执行 ⇒ 一个业务请求都不会发。
+  if (!(await initLoginGate())) return;
+
   initSidebarResizer();  // 恢复侧边栏宽度（Phase A Task 1），需在 createChart 前完成以避免布局抖动
   const { chart: c, candleSeries: cs, emaSeries: es, emaSeriesMap: em } = createChart($('#chart-main'));
   chart = c; candleSeries = cs; emaSeries = es; emaSeriesMap = em;
@@ -702,6 +918,10 @@ function bindEvents() {
   // 记住原始 placeholder，退出只读态时还原
   const ci0 = $('#chat-input');
   if (ci0 && !ci0.dataset.ph) ci0.dataset.ph = ci0.placeholder || '';
+  // 登出：handler 放在这里（而不是登录闸门里）—— 顶栏属于主界面，
+  // 闸门放行的路径上它必然会被绑定；反过来放进闸门则会出现
+  // 「已登出但按钮还没绑定」的中间态。
+  $('#btn-logout')?.addEventListener('click', doLogout);
   $('#btn-refresh').addEventListener('click', loadBars);
   // 恢复图表按钮：自适应缩放显示所有数据
   const btnFitView = $('#btn-fit-view');
@@ -5895,7 +6115,11 @@ async function initExperienceTab() {
   loadExperienceLibrary();
 }
 
-function showToast(message, type) {
+function showToast(message, type, opts) {
+  // 会话失效后静默：登录页已经盖住主界面，此时在途请求的失败回调再弹一片
+  // 错误提示，只会把登录框盖住、把「请重新登录」这条真正的信息挤掉。
+  // 登录自身要提示的地方传 opts.force。
+  if (typeof PAuth !== 'undefined' && PAuth.sessionDead && !(opts && opts.force)) return;
   // 复用已有 toast-container（HTML 中已定义，CSS 定位在右下角 z-index:9999）
   // type: 'success' | 'warning' | 'error' | undefined（默认中性灰）
   let container = document.getElementById('toast-container');

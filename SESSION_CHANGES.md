@@ -22,6 +22,79 @@
 
 ## 🔴 进行中（有人正在改这些文件，不要动）
 
+### 2026-10-05 · 登录界面 + 强制鉴权
+
+**状态**：已完工
+
+#### 需求
+登录界面（用户名 + 密码），初始密码初始化入库并加密保存，鉴权默认开启。
+
+#### 改动文件
+`web/api/routes_auth.py`（新）、`web/api/auth_ctx.py`、`web/server.py`、
+`pa_agent/storage/users.py`、`web/static/{index.html,js/api.js,js/app.js,css/style.css}`、
+`tests/unit/test_auth_routes.py`（新 45 项）、`tests/js/test_login_gate.test.js`（新）
+
+#### 关键决策
+- **密码 PBKDF2-HMAC-SHA256 / 24 万轮 / 每用户随机盐**，格式
+  `pbkdf2_sha256$<rounds>$<salt>$<dk>`，自描述、可校验强度
+- **初始密码随机生成 16 位**（去掉 `0O1lI` 便于抄写），只在启动时打印一次，
+  明文不入库。播种前先备份到 `.bak/`
+- **登录失败不区分「用户不存在」与「密码错」**：`authenticate()` 已做无枚举处理，
+  路由层**不得**先 `get_user()` 再分支 —— 那等于恢复用户枚举
+- **`PUBLIC_API_PATHS` 只放行两条**：`/api/auth/login`（不放行就是死锁：
+  谁也拿不到令牌，令牌又只有登录能给）与 `/api/health`（探针）
+- **`ALLOW_ANONYMOUS_ADMIN` 翻成 `False`**，是应急退路的反向开关
+- **token 存 `localStorage` 不用 `sessionStorage`**：后者刷新即丢，等于每次
+  刷新都要重登，与「刷新不丢数据」直接冲突
+
+#### 接口变更 ⚠️
+- **所有 `/api/*` 现在都需要 `Authorization: Bearer <token>`**，未带一律 401
+- 新增 `POST /api/auth/login` / `logout` / `password`、`GET /api/auth/me`
+- 401 响应体带 `login_url`，前端不必硬编码路径
+- `app.js?v=68` / `api.js?v=8` / `style.css?v=42`
+
+#### 冲突风险
+- **注册端点本轮没做**（用户明确只要登录），强制登录后**新用户无法自助注册**
+- `test_auth_routes.py` 单独跑 45/45 全过，但**在全量套件里有 3 项失败**
+  ——跨用例污染（吊销表是模块级进程状态），与功能无关，别算到别人头上
+- 现有基线：1561 项 / 36 failed / 0 errors
+
+
+### 2026-10-06 · 鉴权从占位变真能用（登录/登出/身份 + 强制鉴权开关）
+
+**状态**：进行中
+
+#### 需求
+新增 `POST /api/auth/login` / `POST /api/auth/logout` / `GET /api/auth/me`，
+并把 `ALLOW_ANONYMOUS_ADMIN` 翻成 `False`（强制登录）。admin 密码已播种
+（PBKDF2 240k 轮 + 盐），**不得改动生产库里的散列**。
+
+#### 改动文件（独占写集）
+`web/api/routes_auth.py`（新）、`web/api/auth_ctx.py`、`web/server.py`、
+`pa_agent/storage/users.py`、`tests/unit/test_auth_routes.py`（新）
+
+#### 不碰
+`web/static/*` 由另一会话做登录界面；`routes_analyze.py` / `routes_data.py` /
+`routes_chat.py` / `session_ctx.py` / `storage_gc.py` / `storage/sessions.py` /
+`storage/ephemeral.py` / `storage/db.py` / `storage/schema.py` 全部只读。
+
+#### 接口变更 ⚠️
+- 新增 `POST /api/auth/login`（免鉴权）、`POST /api/auth/logout`（需鉴权）、
+  `GET /api/auth/me`（需鉴权）、`POST /api/auth/password`（需鉴权，改密）
+- `web.api.auth_ctx.ALLOW_ANONYMOUS_ADMIN`：`True` → **`False`**
+- 新增 `web.api.auth_ctx.enforce_auth_middleware`，已挂在 `web.server.app`
+  上（**最外层**）：非 `/api` 路径、OPTIONS、`/api/auth/login`、`/api/health`
+  放行，其余 `/api/**` 无有效 Bearer 令牌一律 401 + `WWW-Authenticate: Bearer`
+- `GET /api/health` 改为**匿名降级**：未带令牌时不再返回 `storage.default_user`
+  与 `storage.users`（否则等于给未登录者一个用户名枚举接口）
+
+#### 冲突风险
+- `web/server.py` 在「已完工」条目里也被列过（那是别的会话的收尾改动）。
+  本轮只在 lifespan 加一条启动告警、加挂中间件与 auth 路由、改 `/api/health` 的
+  降级分支，**不碰那段收尾逻辑**
+- 存量失败基线：`tests/unit` 1496 项 / 25 failed（FAILED 清单见
+  `/tmp/base_exact.txt` 抽取结果）。**不得用脏工作区重新生成 CI 基线**
+
 ### 2026-10-05 · 收尾：user_id 统一为 admin + 会话收口补漏
 
 **状态**：已完工
