@@ -22,6 +22,44 @@
 
 ## 🔴 进行中（有人正在改这些文件，不要动）
 
+### 2026-10-05 · 收尾：user_id 统一为 admin + 会话收口补漏
+
+**状态**：已完工
+
+#### 需求
+把剩余收尾项做掉：DDL 里不存在的 `default` 用户、`_chat_sessions` 无上限、
+过时 TTL 注释、握手 ack 窗口。
+
+#### 改动文件
+`pa_agent/storage/schema.py`、`pa_agent/storage/db.py`、`pa_agent/storage/schema.sql`、
+`web/api/routes_chat.py`、`web/api/storage_gc.py`、`web/server.py`、
+`web/static/js/api.js`、`web/static/index.html`、`docs/SESSION_STORAGE_DESIGN.md`、
+`tests/unit/test_user_id_ddl.py`（新）
+
+#### 关键决策
+- **DDL 的 `DEFAULT 'default'` 必须删掉**：`users` 表里只有 `admin`，
+  `default` 是个**不存在的用户**。写进去不报错，按用户过滤时永远查不到。
+  SQLite 无「删列默认值」语句，只能重建表 ⇒ 索引 DDL 从 `sqlite_master`
+  **动态抓取**后补回（硬编码会在将来新增索引时静默丢掉它，退化成全表扫）
+- **存量 `'default'` 行不改写成 `'admin'`**：把「身份未知」谎报成管理员比查不到
+  更糟 —— 用户会看到一批不属于��己的历史。改写反而制造「查得到但归属错误」
+- **`_chat_sessions` 补 LRU 128**：TTL 管的是「空闲多久」，而键是
+  `sid|record|k/n` ⇒ 单 tab 不停换 record_id 就能在 TTL 内堆出任意多条
+- **握手 ack 窗口外保留 + bornAt 仲裁**：⚠️ 这条**未能复现原报告的 bug**
+  （修复前后桩测四档行为完全一致且都正确），按防御性改动记账，不按 bug fix 记账
+
+#### 迁移已在生产库执行
+`.bak/pa_agent.db.<时间戳>` 先备份（独立目录，**不用同名前缀**，否则会被
+`records/pa_agent.db*` 命中）。7 张表迁移后：行数零变化、索引零丢失、
+默认值全部为 None、schema_version 不变。
+
+#### 冲突风险
+- `pa_agent/storage/schema.py` 本轮含**另一会话的未提交改动**（+32 行），
+  我只改 7 处 DEFAULT 与新增 `create_table_ddl`，未触碰其余
+- 存量 `chat_turns` 的旧键（前端此前拼的 `{symbol}_{tf}_{iso}`）仍是孤儿，
+  新键格式为 `{symbol}|{tf}|{ms}`，`chat_repo.clear_thread` 可清
+
+
 ## ✅ 已提交（本条改动待 commit；条目已不再占用写入范围）
 ### 2026-10-05 · 多会话推理收尾（P1 SSE下线 / P2a 追问隔离 / P3 交易域 / P4 配置层）
 

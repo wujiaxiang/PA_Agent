@@ -275,6 +275,29 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("experience_reviews", "drop_default_user_id"),
 )
 
+def create_table_ddl(table: str) -> str | None:
+    """按表名取它的 ``CREATE TABLE`` 语句（迁移重建表时用）。
+
+    DDL 里表名是硬编码字面量，不能靠拼接生成重建语句 —— 那样重建出来的表
+    会与真正的新库 schema 漂移，而漂移出来的 schema **只在未来某次迁移里
+    才暴露**。这里返回的就是新库实际会用的那份 DDL，单一真源。
+    """
+    for stmt in all_statements():
+        head = stmt.lstrip().upper()
+        if not head.startswith("CREATE TABLE"):
+            continue
+        # "CREATE TABLE IF NOT EXISTS <name>" 或 "CREATE TABLE <name>"
+        rest = stmt.strip()[len("CREATE TABLE"):].strip()
+        for prefix in ("IF NOT EXISTS ", ""):
+            if rest.upper().startswith(prefix):
+                rest = rest[len(prefix):]
+                break
+        name = rest.split("(", 1)[0].strip().strip('"')
+        if name == table:
+            return stmt
+    return None
+
+
 _ALL_DDL: tuple[tuple[str, ...], ...] = (
     DDL_SCHEMA_META,
     DDL_USERS,

@@ -27,7 +27,12 @@ from pa_agent.storage.schema import (  # noqa: E501
     MIGRATIONS as schema_migrations,
     SCHEMA_VERSION,
     all_statements,
+    create_table_ddl,
 )
+
+#: MIGRATIONS 里的哨兵语句 —— 它不是 SQL，而是「重建该表，去掉 user_id 的
+#: DEFAULT 'default'」的指令。SQLite 没有「删掉列默认值」这种语句。
+_DROP_DEFAULT_USER_ID = "drop_default_user_id"
 
 logger = logging.getLogger("pa_agent.storage")
 
@@ -152,7 +157,10 @@ class _ConnectionHub:
                 # 不靠版本号分支，保持迁移可重入。
                 for _table, stmt in schema_migrations:
                     try:
-                        conn.execute(stmt)
+                        if stmt == _DROP_DEFAULT_USER_ID:
+                            self._rebuild_without_default_user_id(conn, _table)
+                        else:
+                            conn.execute(stmt)
                     except sqlite3.OperationalError as exc:
                         if "duplicate column" not in str(exc).lower():
                             raise
@@ -164,6 +172,56 @@ class _ConnectionHub:
         except sqlite3.Error as exc:
             self._disable(f"migrate failed: {exc}")
             return False
+        return True
+
+    @staticmethod
+    def _rebuild_without_default_user_id(conn, table: str) -> bool:
+        """重建 ``table``，去掉 user_id 列上的 ``DEFAULT 'default'``。
+
+        那 7 张表的 user_id 曾是 ``TEXT NOT NULL DEFAULT 'default'``，而
+        ``users`` 表里只有 ``admin`` —— ``default`` 是个**不存在的用户**。
+        写进去不报错，按 user_id 过滤时却永远查不到。
+
+        重建会丢掉该表上所有**显式索引**（``sqlite_autoindex_*`` 由 CREATE
+        TABLE 自动重建，但 ``ix_rec_lookup`` / ``ix_exp_browse`` /
+        ``ix_sessions_expiry`` 这类必须补回，漏一个的代价是查询退化成全表扫）。
+        所以索引 DDL 从 ``sqlite_master`` **动态抓取**，不硬编码：新增表或索引
+        时不必同步改这里，漏了只会在重建后表现为「莫名其妙慢了 100 倍」。
+
+        存量行的 ``user_id`` 原值**不**改写：把 ``'default'`` 就地改名成
+        ``'admin'`` 等于把「身份未知」的记录谎报成管理员；而按用户过滤时这种行
+        本来就查不到，改写反而制造出「查得到但归属错误」的数据。
+        """
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        if not rows:
+            return False
+        cols = [r[1] for r in rows]
+        if "user_id" not in cols:
+            return False
+        if next((r[4] for r in rows if r[1] == "user_id"), None) is None:
+            return False  # 已无默认值 ⇒ 无需重建（幂等）
+
+        idx = [
+            r[0] for r in conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? "
+                "AND sql IS NOT NULL", (table,)).fetchall()
+        ]
+        ddl = create_table_ddl(table)
+        if ddl is None:
+            return False
+        tmp = f"{table}__new"
+        conn.execute(f"DROP TABLE IF EXISTS {tmp}")
+        # DDL 里的表名是硬编码字面量，必须换成临时表名 —— 否则建出来的还是原表，
+        # 紧接着 DROP TABLE {table} 会把刚建的那张一起删掉（实测报
+        # "no such table: sessions__new"）。用前缀精确匹配，避免误伤
+        # 列名/索引名里恰好含同名字符串的地方。
+        conn.execute(ddl.replace(table, tmp, 1))
+        col_list = ", ".join(cols)
+        conn.execute(f"INSERT INTO {tmp} ({col_list}) SELECT {col_list} FROM {table}")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {tmp} RENAME TO {table}")
+        for stmt in idx:
+            conn.execute(stmt)
         return True
 
     def schema_version(self) -> int:

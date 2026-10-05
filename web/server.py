@@ -314,7 +314,7 @@ async def session_lifecycle_middleware(request: Request, call_next):
     """刷新会话空闲计时 + 限流续期 ``sessions`` 快照（详见函数 docstring）。
 
     没有它，``expires_at`` 的唯一续期点是 ``POST /api/subscribe``，而前端 boot
-    从不调它 —— 表现为「订阅后一直挂着不动，30 分钟后 F5 游标回到出厂种子」。
+    从不调它 —— 表现为「订阅后一直挂着不动，快照过期后 F5 游标回到出厂种子」。
     """
     from web.api.session_ctx import session_lifecycle_middleware as _impl
 

@@ -62,6 +62,7 @@ const PA_CHANNEL_NAME = 'pa_agent_session_v1';
 // ── 模块级状态 ──────────────────────────────────────────────────────────────
 let _paSessionId = null;      // 身份（最终值；握手期间是候选值）
 let _paInstanceId = null;     // 标签页实例：每次页面加载重新生成，仅内存
+let _paBornAt = null;         // 本代起始时刻：ack 的仲裁基准（见下方注释）
 let _paMemoryId = null;       // sessionStorage 不可用时的纯内存 id
 let _paReadySettled = false;
 let _paReadyResolve = null;
@@ -83,6 +84,7 @@ function _paRandomHex(n) {
 // 一次页面加载内的稳定随机值（16 字符，base36 ⊂ 允许字符集）。
 function pageNonce() {
   if (!_paInstanceId) _paInstanceId = _paRandomHex(16);
+  if (!_paBornAt) _paBornAt = Date.now();
   return _paInstanceId;
 }
 
@@ -164,11 +166,11 @@ function _startCloneDetection() {
         sessionStorage.setItem(SESSION_ID_KEY, fresh);
       } catch (_) { /* 纯内存模式，写不进去无所谓 */ }
       // 主动宣告新身份：万一撞上极小概率碰撞，对方能立刻发现并各走各的。
-      try { ch.postMessage({ type: 'claim', id: fresh, from: _paInstanceId }); } catch (_) {}
+      try { ch.postMessage({ type: 'claim', id: fresh, from: _paInstanceId, bornAt: _paBornAt }); } catch (_) {}
     };
 
     const reply = (id) => {
-      try { ch.postMessage({ type: 'ack', id, from: _paInstanceId }); } catch (_) {}
+      try { ch.postMessage({ type: 'ack', id, from: _paInstanceId, bornAt: _paBornAt }); } catch (_) {}
     };
 
     ch.onmessage = (ev) => {
@@ -182,7 +184,7 @@ function _startCloneDetection() {
       }
     };
 
-    try { ch.postMessage({ type: 'claim', id: initial, from: _paInstanceId }); } catch (_) {}
+    try { ch.postMessage({ type: 'claim', id: initial, from: _paInstanceId, bornAt: _paBornAt }); } catch (_) {}
 
     setTimeout(() => {
       // 超时 = 没人跟我抢这个 id（首个标签页必然如此）⇒ 放行，**不卡住**。
@@ -191,7 +193,20 @@ function _startCloneDetection() {
       ch.onmessage = (ev) => {
         const m = ev && ev.data;
         if (!m || typeof m.id !== 'string' || m.from === _paInstanceId) return;
-        if (m.type === 'claim' && m.id === _paSessionId) reply(m.id);
+        if (m.type === 'claim') {
+          if (m.id === _paSessionId) reply(m.id);
+          return;
+        }
+        // **窗口外仍要认 ack**。原实现把 onmessage 整个换成只处理 claim 的版本，
+        // 于是 ack 被丢弃：克隆页若在窗口外才启动，就收不到「别人也持有这个 id」
+        // 的信号，两边顶着同一个 id 各看各的 —— 隔离失效且毫无报错。
+        if (m.type === 'ack' && m.id === _paSessionId) {
+          // bornAt 仲裁：只认「我这一代」之后的宣战。上一代残留的 ack 到达时
+          // 我已经轮换过 id，上面那行 m.id !== _paSessionId 自然挡住；这里再挡
+          // 一次是为了「我轮换后又被切回旧 id」这种极端时序。
+          if (typeof m.bornAt === 'number' && m.bornAt < _paBornAt) return;
+          rotate();
+        }
       };
       resolve(_paSessionId);
     }, CLONE_HANDSHAKE_MS);

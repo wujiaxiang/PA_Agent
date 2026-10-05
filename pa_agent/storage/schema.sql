@@ -144,6 +144,13 @@ CREATE INDEX IF NOT EXISTS ix_sessions_expiry ON sessions (expires_at);
 -- ALTER 时立刻报 duplicate column —— 手工重建直接失败。
 --
 -- [users] ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';
+-- [sessions] drop_default_user_id;
+-- [chat_turns] drop_default_user_id;
+-- [user_prefs] drop_default_user_id;
+-- [analysis_records] drop_default_user_id;
+-- [experience_entries] drop_default_user_id;
+-- [trade_records] drop_default_user_id;
+-- [experience_reviews] drop_default_user_id;
 
 -- schema 版本: 1
 -- 表: users, global_config, user_prefs, analysis_records, experience_entries, experience_reviews, trade_records, chat_turns, sessions

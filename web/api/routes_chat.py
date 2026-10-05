@@ -57,7 +57,7 @@ B tab 的上下文里，互相污染。
    而 ``lastRecord`` 每次页面加载重置为 ``null`` —— 实测同一 session 刷新前后
    三个键互不相同（``…|NVDA_15m_2026-10-05T10:31:02|NVDA|15m|k`` /
    ``…|chat_1791212104|…`` / ``…|chat_1791212855|…``），于是 ``FreeChatSession``
-   在 30 分钟 TTL 内也**永远命中不了**。修法：前端**不再拼** ``record_id``，
+   在内存 TTL 内也**永远命中不了**。修法：前端**不再拼** ``record_id``，
    record 段一律由服务端从锚点记录推导（:func:`_resolve_thread_key`）。
 2. **有写无读**：``chat_repo.list_turns`` 此前只有 tests 调用，没有 HTTP 端点，
    ``#chat-messages`` 又是空 div —— 刷新后聊天框 100% 为空。
@@ -95,6 +95,17 @@ _executor = ThreadPoolExecutor(max_workers=2)
 # "last_touch": ts, "lock": asyncio.Lock}
 # 通过 TTL 机制（默认 30 分钟无活动）自动清理，避免内存泄漏
 _CHAT_SESSION_TTL_SEC = 30 * 60
+
+#: ``_chat_sessions`` 的**条目数**上限。此前它只有 TTL、没有容量上限，
+#: 而 TTL 是「空闲多久」不是「总共多少」—— 键是 ``sid|record|k/n``，于是
+#: 单个 tab 只要不断改 ``record_id``（每次分析换一个）就能在 TTL 内堆出
+#: 任意多条：实测 300 次约 3.6MB，且**没有任何地方会报错**。
+#:
+#: 淘汰的是最久没碰的那一条；仍挂着的 SSE 流由 ``event_generator`` 的
+#: ``finally`` 释放锁，不受这里影响。**不收编进 SessionRegistry 的 LRU** ——
+#: 那边的 TTL（12h）是为了「切标签页过会儿回来」，与追问分桶的 30 分钟语义
+#: 不同，混用会让「活跃但会话旧」的分桶被提前回收。
+_CHAT_MAX_SESSIONS = 128
 #: Per-request SSE queue depth (see routes_bars_stream for the same reasoning).
 _CHAT_QUEUE_MAXSIZE = 256
 _chat_sessions: dict[str, dict] = {}
@@ -176,6 +187,27 @@ def _respawn_chat_cleanup(task) -> None:
     _chat_cleanup_task.add_done_callback(_respawn_chat_cleanup)
 
 
+def _evict_chat_sessions_if_needed() -> int:
+    """条目数超上限时回收最久没碰的那些。返回回收条数。
+
+    与 ``_chat_cleanup_loop`` 的 TTL 清理是两件事：那个按**空闲时长**清，
+    这个按**总条数**收。缺了后者，一个不停换 record_id 的 tab 就能在 TTL
+    窗口内把内存撑起来 —— 键基数是 tab x 记录，TTL 根本管不住。
+    """
+    overflow = len(_chat_sessions) - _CHAT_MAX_SESSIONS
+    if overflow <= 0:
+        return 0
+    victims = sorted(_chat_sessions.items(), key=lambda kv: kv[1].get("last_touch", 0))
+    removed = 0
+    for key, entry in victims[:overflow]:
+        entry_lock = entry.get("lock") if isinstance(entry, dict) else None
+        if isinstance(entry_lock, asyncio.Lock) and entry_lock.locked():
+            continue  # 正在追问：宁可留到下一轮
+        if _chat_sessions.pop(key, None) is not None:
+            removed += 1
+    return removed
+
+
 def _touch_session(key: str, session: FreeChatSession, lock=None) -> None:
     """写入/覆盖分桶条目。
 
@@ -191,6 +223,10 @@ def _touch_session(key: str, session: FreeChatSession, lock=None) -> None:
         # serialises them.
         "lock": lock if lock is not None else asyncio.Lock(),
     }
+    # 写入即收：只在**新键**时可能超限，覆盖已有键不会。先 insert 再收是
+    # 必须的 —— 反过来会把刚写入的这一条当成最久没碰的收掉。
+    if len(_chat_sessions) > _CHAT_MAX_SESSIONS:
+        _evict_chat_sessions_if_needed()
 
 
 def _get_session(key: str) -> FreeChatSession | None:

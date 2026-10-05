@@ -255,7 +255,8 @@ CREATE INDEX ix_sessions_expiry ON sessions(expires_at);
 
 ### 6.6 内存边界
 
-- `max_sessions=64`，超出按 LRU 踢
+- `max_sessions=128`，超出按 LRU 踢（被踢的会话连带丢追问历史与 last_record，
+  所以上限调的是内存与用户可见数据损失的取舍，不是纯性能参数）
 - 每 session 的 `sse_queue` 有界 256，沿用 `SUBSCRIBER_QUEUE_MAXSIZE` 的「丢最旧」策略
 - `chat` 对象带 TTL，沿用 `_CHAT_SESSION_TTL_SEC`
 - `stats()` 暴露给 `/api/health`，让泄漏**可观测**而非等它炸（对应 AGENTS.md 遗留需求 3「SSE 长连接内存泄漏排查」）
