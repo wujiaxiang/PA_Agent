@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import time
 import asyncio
 
@@ -15,6 +16,8 @@ from fastapi.responses import JSONResponse
 from pa_agent.config.paths import SETTINGS_JSON_PATH
 from pa_agent.config.settings import load_settings, save_settings
 from pa_agent.util.logging import register_settings_secrets
+
+logger = logging.getLogger("pa_agent.web.settings")
 
 router = APIRouter(tags=["settings"])
 
@@ -113,6 +116,19 @@ async def put_settings(request: Request, body: dict):
                             masked_key_dropped = True
                             continue
                         setattr(target, k, v)
+    # 落盘两份：① 用户自己的配置区（稀疏覆盖，日后此处才是该用户的真源）
+    # ② settings.json 作为灾备/遗留副本 —— DB 损坏时仍能凭它启动。
+    # 系统兜底区**不被用户改动触碰**：它是所有用户的只读默认值。
+    try:
+        from pa_agent.storage.settings_store import apply_user_change
+        from pa_agent.storage.users import default_user_id
+
+        await asyncio.to_thread(
+            apply_user_change, current.model_dump(), default_user_id()
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("save settings to user overrides failed: %s", exc)
+
     await asyncio.to_thread(save_settings, current, SETTINGS_JSON_PATH)
 
     from pa_agent.util.logging import register_settings_secrets, update_api_key

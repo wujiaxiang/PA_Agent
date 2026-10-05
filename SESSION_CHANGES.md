@@ -30,7 +30,7 @@
 
 ### 2026-10-05 · 多 Session 存储层会话（存储层 + 会话身份 + 跨品种历史）
 
-**状态**：已完工（**未提交**，改动仍在工作区）
+**状态**：已完工（首部分已提交 `c4b0f1e`；admin 用户 + 双写部分待提交）
 
 > **⚠️ 异常说明（务必先读）**：本条目原为「进行中」，其列出的实现文件在接手时
 > **并不存在于磁盘** —— 规划留下了，实现未落盘。接手会话重新实现了同一范围。
@@ -76,6 +76,13 @@
 | `web/api/session_ctx.py` | **新增** 会话身份解析 + 视图解析 |
 | `docs/SESSION_STORAGE_DESIGN.md` | **新增** 完整设计文档 |
 | `tests/unit/test_storage_layer.py` | **新增** 43 项存储层测试 |
+| `tests/unit/test_storage_dualwrite.py` | **新增** 13 项双写测试 |
+| `tests/unit/test_settings_cascade.py` | **新增** 19 项配置级联测试 |
+| `pa_agent/storage/users.py` | **新增** admin 用户播种与默认用户解析 |
+| `pa_agent/storage/experience_repo.py` | **新增** 经验库仓储 |
+| `pa_agent/storage/settings_store.py` | **新增** 系统兜底 ← 用户覆盖 级联与差异计算 |
+| `pa_agent/config/settings.py` | `load_settings` 改为级联解析（DB 优先、文件播种与灾备兜底） |
+| `web/api/routes_settings.py` | PUT 额外写入用户覆盖区（稀疏），系统兜底不被触碰 |
 | `tests/unit/test_session_ctx.py` | **新增** 19 项会话身份测试 |
 | `web/server.py` | lifespan 初始化存储层 + 启动导入；`/api/health` 暴露存储状态 |
 | `web/api/routes_analyze.py` | 增量锚点按会话游标取（**修跨标的串味 bug**） |

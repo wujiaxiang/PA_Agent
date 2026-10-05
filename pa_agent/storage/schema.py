@@ -192,8 +192,26 @@ DDL_SCHEMA_META = (
     """,
 )
 
+# ── 用户 ──────────────────────────────────────────────────────────────────────
+# 单机部署下恒为 1 行（admin）。建表是为了让「多用户」不是一次性大改：
+# L2/L3 表的 user_id 已是外键语义，今天恒等于 admin。UI 暂不做登录，
+# 解析时统一取默认用户即可（见 users.default_user_id()）。
+DDL_USERS = (
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        user_id      TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL DEFAULT '',
+        role         TEXT NOT NULL DEFAULT 'admin',
+        is_default   INTEGER NOT NULL DEFAULT 0,
+        created_at   REAL NOT NULL,
+        last_seen    REAL NOT NULL
+    )
+    """,
+)
+
 _ALL_DDL: tuple[tuple[str, ...], ...] = (
     DDL_SCHEMA_META,
+    DDL_USERS,
     DDL_GLOBAL_CONFIG,
     DDL_USER_PREFS,
     DDL_ANALYSIS_RECORDS,
@@ -217,6 +235,6 @@ def all_statements() -> tuple[str, ...]:
 def tables() -> tuple[str, ...]:
     """Table names only — 供迁移器与诊断使用。"""
     return (
-        "global_config", "user_prefs", "analysis_records",
+        "users", "global_config", "user_prefs", "analysis_records",
         "experience_entries", "trade_records", "chat_turns", "sessions",
     )

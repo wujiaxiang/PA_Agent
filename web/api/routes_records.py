@@ -170,8 +170,25 @@ def _browse_filtered(
             timeframe=timeframe,
             limit=limit,
         )
-        paths = [Path(r["file_path"]) for r in rows if r.get("file_path")]
-        paths = [p for p in paths if p.is_file()]
+        # 必须同时校验「文件存在」**且「位于 RECORDS_DIR 内」**：
+        # DB 里的 file_path 可能是历史残留或已被移动的路径，而本函数的契约是
+        # 只返回 RECORDS_DIR 下的记录（RECORDS_DIR 可被 monkeypatch）。
+        # 少了后一个校验，DB 结果会盖过调用方指定的目录 —— 实测会让
+        # 「跨品种浏览」返回真实库里的记录而非夹具目录的记录。
+        root = RECORDS_DIR.resolve()
+        paths: list[Path] = []
+        for r in rows:
+            fp = r.get("file_path")
+            if not fp:
+                continue
+            p = Path(fp)
+            if not p.is_file():
+                continue
+            try:
+                p.resolve().relative_to(root)
+            except ValueError:
+                continue
+            paths.append(p)
         if paths:
             return paths
     except Exception:  # noqa: BLE001

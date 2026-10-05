@@ -281,10 +281,59 @@ def load_settings(path: Path | None = None) -> "Settings":
     """Load settings from *path* (default: SETTINGS_JSON_PATH).
 
     Returns default Settings and writes them to disk if the file is absent.
+
+    **真源在 DB（用户级 admin）**，本函数是 DB 优先、文件回退的入口：
+
+    - DB 有配置 → 用它（用户在 UI 里的修改优先于文件）
+    - DB 无配置但文件有 → 用文件，并**首次**把内容导入 DB（迁移）
+    - DB 不可用/损坏 → 纯文件（降级路径）
+
+    只对默认路径启用 DB 层：``path != SETTINGS_JSON_PATH`` 说明调用方要的是
+    隔离的文件（测试用临时路径），此时不得碰真实 DB，否则测试会互相污染。
     """
     from pa_agent.config.paths import SETTINGS_JSON_PATH
 
+    using_real = path is None or path == SETTINGS_JSON_PATH
     path = path or SETTINGS_JSON_PATH
+
+    if using_real:
+        override = _try_load_from_db()
+        if override is not None:
+            return override
+
+    return _load_settings_from_file(path)
+
+
+def _try_load_from_db() -> "Settings | None":
+    """按级联解析有效配置：系统兜底 ← 用户覆盖（文件仅作首次播种与灾备兜底）。
+
+    返回 None 表示 DB 与文件都没有配置，调用方回退纯文件逻辑。
+    任何异常都吞掉并返回 None —— 索引层故障绝不能阻断启动。
+    """
+    try:
+        from pa_agent.config.paths import SETTINGS_JSON_PATH
+        from pa_agent.storage.settings_store import resolve
+        from pa_agent.storage.users import default_user_id
+
+        file_fallback = None
+        try:
+            if SETTINGS_JSON_PATH.exists():
+                raw = json.loads(SETTINGS_JSON_PATH.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    file_fallback = raw
+        except (json.JSONDecodeError, OSError):
+            file_fallback = None
+
+        data = resolve(default_user_id(), file_fallback)
+        if data is None:
+            return None
+        return Settings.model_validate(data)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("DB-backed settings load failed, using file: %s", exc)
+        return None
+
+
+def _load_settings_from_file(path: Path) -> "Settings":
 
     if not path.exists():
         defaults = Settings()

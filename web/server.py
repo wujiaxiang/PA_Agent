@@ -82,6 +82,7 @@ async def lifespan(app: FastAPI):
         from pa_agent.storage.db import get_hub
         from pa_agent.storage.ephemeral import get_registry
         from pa_agent.storage.importer import import_all
+        from pa_agent.storage.users import ensure_admin_user
 
         hub = get_hub()
         logger.info("SQLite storage: %s", hub.stats())
@@ -91,6 +92,8 @@ async def lifespan(app: FastAPI):
                 hub.stats()["disabled_reason"],
             )
         else:
+            # 单机部署恒为 admin；UI 暂不做登录。将来接鉴权只改 default_user_id()
+            logger.info("Default user ready: %s", ensure_admin_user())
             reg = get_registry()
             logger.info("Session registry ready (max=%d)", len(reg.all_sessions()))
             stats = await asyncio.to_thread(import_all)
@@ -255,8 +258,14 @@ async def health():
     try:
         from pa_agent.storage.db import get_hub
         from pa_agent.storage.ephemeral import get_registry
+        from pa_agent.storage.users import default_user_id, list_users
 
-        storage = {"db": get_hub().stats(), "sessions": len(get_registry().all_sessions())}
+        storage = {
+            "db": get_hub().stats(),
+            "sessions": len(get_registry().all_sessions()),
+            "default_user": default_user_id(),
+            "users": [u["user_id"] for u in list_users()],
+        }
     except Exception as exc:  # noqa: BLE001
         storage = {"error": str(exc)}
     if report is None:
