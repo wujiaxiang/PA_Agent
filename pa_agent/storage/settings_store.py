@@ -225,3 +225,47 @@ def apply_user_change(new_settings: dict[str, Any], user_id: str) -> bool:
 def reset_to_system_defaults(user_id: str) -> bool:
     """丢弃该用户的全部覆盖，回到纯系统配置（「恢复默认」）。"""
     return clear_overrides(user_id)
+
+def promote_to_baseline(current: dict[str, Any]) -> bool:
+    """把 *current* 提升为系统出厂默认，并同步播种源 ``settings.json``。
+
+    与 :func:`apply_user_change` 的区别是**层级**：后者写用户覆盖区（只影响本人），
+    本函数写 ``baseline``（所有用户继承的默认值）。
+
+    两步都要做，缺一不可：
+    - 只写 baseline → 空库重播种时拿不到，仍会是旧的出厂配置
+    - 只写 settings.json → 当前进程读的是 DB，用户看到的仍是旧基线
+
+    同时**清掉本用户覆盖区**：已成出厂默认的字段留在覆盖区里会永久遮蔽后续的
+    系统更新（用户再也不会收到默认值变更）。函数接受任意 current，但调用方
+    约定传「已合并覆盖后的生效配置」。
+    """
+    hub = get_hub()
+    if hub.read_failed:
+        logger.error("拒绝提升出厂默认：DB 读取失败（%s）", hub.read_error)
+        return False
+
+    if not save_baseline(current):
+        logger.error("promote_to_baseline: 写 baseline 失败")
+        return False
+
+    # 播种源：让全新空库能长出同一份配置。失败不阻断 —— baseline 已落库，
+    # 当前进程可用；只是「清库后拿不回这份配置」，属可接受降级。
+    try:
+        from pathlib import Path
+
+        from pa_agent.config.paths import SETTINGS_JSON_PATH
+
+        Path(SETTINGS_JSON_PATH).write_text(
+            json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "promote_to_baseline: 播种源写入失败（baseline 已落库，清库后无法"
+            "自动恢复这份配置）：%s", exc,
+        )
+
+    from pa_agent.storage.users import default_user_id
+
+    clear_overrides(default_user_id())
+    return True

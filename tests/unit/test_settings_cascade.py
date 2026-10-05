@@ -321,3 +321,68 @@ def test_persist_patch_refuses_when_db_read_failed(db):
     seed_from_file(BASE)
     db._disable("simulated")
     assert persist_patch({"provider": {"model": "should-not-stick"}}) is False
+
+# ── 出厂默认的显式提升（settings.json 不再随保存漂移）─────────────────────────
+
+
+def test_put_settings_does_not_write_back_settings_json(db, monkeypatch):
+    """保存设置**不得**回写 settings.json。
+
+    回写会让「出厂配置」这个文件跟着用户修改漂移；DB 一旦清空，baseline 重新从
+    它播种，用户的历史修改就被当成出厂默认固化成所有用户继承的基线。
+    """
+    import asyncio
+
+    import web.api.routes_settings as rs
+
+    monkeypatch.setattr(rs, "save_settings", lambda *a, **k: pytest.fail(
+        "put_settings 仍在回写 settings.json"
+    ))
+    assert hasattr(rs, "promote_settings_to_default"), "缺少显式提升入口"
+
+
+def test_promote_requires_explicit_confirmation():
+    """这是全局动作，必须显式确认 —— 误触就把个人设置变成了所有人的默认。"""
+    import inspect
+
+    import web.api.routes_settings as rs
+
+    src = inspect.getsource(rs.promote_settings_to_default)
+    assert "confirm" in src, "提升出厂默认未要求确认"
+
+
+def test_promote_writes_baseline_and_clears_overrides(db):
+    """提升后：baseline = 当前配置，本用户覆盖被清空。
+
+    覆盖必须清 —— 已成出厂默认的字段若留在覆盖区，会永久遮蔽后续系统更新。
+    """
+    from pa_agent.config.settings import Settings
+    from pa_agent.storage.settings_store import (
+        apply_user_change, load_baseline, load_overrides, promote_to_baseline,
+        resolve, save_baseline, save_overrides,
+    )
+
+    save_baseline({"general": {"analysis_bar_count": 321}})
+    save_overrides({"general": {"analysis_bar_count": 250}}, "admin")
+    assert load_overrides("admin") == {"general": {"analysis_bar_count": 250}}
+
+    current = Settings.model_validate({
+        **Settings().model_dump(),
+        "general": {**Settings().general.model_dump(), "analysis_bar_count": 250},
+    }).model_dump(mode="json")
+
+    assert promote_to_baseline(current) is True
+    assert load_baseline()["general"]["analysis_bar_count"] == 250
+    assert load_overrides("admin") == {}, "提升后覆盖区未清空，会遮蔽后续系统更新"
+    assert resolve("admin")["general"]["analysis_bar_count"] == 250
+
+
+def test_promote_rejected_when_db_read_failed(db):
+    """读失败时拒绝提升 —— 否则会把不确定的数据固化成所有人的出厂默认。"""
+    from pa_agent.storage.db import get_hub
+    from pa_agent.storage.settings_store import promote_to_baseline, save_baseline
+
+    save_baseline({"general": {"analysis_bar_count": 321}})
+    # read_failed 是**线程局部**的（跨线程污染会让降级失效），必须设在线程局部上
+    get_hub()._local.read_error = "no such table: global_config"
+    assert promote_to_baseline({"general": {"analysis_bar_count": 999}}) is False

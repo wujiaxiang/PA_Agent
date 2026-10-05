@@ -109,6 +109,9 @@ def test_put_settings_merges_sections(client):
     real = Settings()
     client.app.state.ctx.settings = real
 
+    # save_settings 不再被调用：settings.json 是「出厂配置 / 播种源 / 灾备兜底」，
+    # 不是当前状态。每次保存都回写会让它随用户修改漂移，清库后用户的历史修改会被
+    # 当成出厂默认固化成所有人的基线。想改出厂默认请显式调 promote-default。
     with patch("web.api.routes_settings.save_settings") as mock_save, \
          patch("pa_agent.util.logging.update_api_key"), \
          patch("pa_agent.ai.client_factory.create_ai_client") as mock_create:
@@ -120,7 +123,8 @@ def test_put_settings_merges_sections(client):
     assert resp.json()["status"] == "saved"
     assert real.provider.model == "gpt-4o"
     assert real.feishu.enabled is False
-    mock_save.assert_called_once()
+    # 不再回写 settings.json（出厂配置不该跟着用户修改漂移）
+    mock_save.assert_not_called()
     mock_create.assert_called_once()
     # ctx.client 应被重建
     assert client.app.state.ctx.client is mock_create.return_value

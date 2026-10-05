@@ -204,16 +204,18 @@ async def put_settings(request: Request, body: dict):
     for target, key, _original, _value, section in staged:
         patch.setdefault(section, {})[key] = getattr(target, key)
 
-    # 落库失败不冒泡（persist_patch 自己吞异常并返回 False）：文件那份还得写，
-    # 否则 DB 故障时用户连灾备副本都没有。失败通过 db_persisted 如实回传。
+    # 落库失败不冒泡（persist_patch 自己吞异常并返回 False）。**不再顺手回写
+    # settings.json** —— 见 promote_to_baseline 的说明：那个文件是「出厂配置 /
+    # 播种源 / 灾备兜底」，不是当前状态。每次保存都回写会让它跟着用户修改漂移，
+    # 一旦 DB 被清空、baseline 重新从它播种，用户的历史修改就被当成出厂默认
+    # 固化成所有用户继承的基线。想把当前配置定为新出厂默认，请显式调
+    # POST /api/settings/promote-default。
     db_persisted = await asyncio.to_thread(persist_patch, patch)
     if not db_persisted:
         logger.error(
-            "settings 未进入用户配置区（只落了 settings.json 灾备副本）：%s",
+            "settings 未进入用户配置区（仅存于进程内存，重启会丢）：%s",
             ",".join(sorted(patch)) or "<no change>",
         )
-
-    await asyncio.to_thread(save_settings, current, SETTINGS_JSON_PATH)
 
     from pa_agent.util.logging import register_settings_secrets, update_api_key
     update_api_key(current.provider.api_key)
@@ -290,3 +292,57 @@ async def feishu_test(request: Request, body: dict):
     if hint:
         msg += f"（{hint}）"
     raise HTTPException(status_code=502, detail=msg)
+
+
+@router.post("/settings/promote-default")
+async def promote_settings_to_default(request: Request, body: dict | None = None):
+    """把**当前生效配置**显式提升为系统出厂默认（baseline + 播种源）。
+
+    ## 为什么需要显式动作
+
+    ``settings.json`` 的职责只有三件，且都是「出厂」语义：
+    首次播种源、灾备兜底、以及出厂配置的落盘。它**不是当前状态**。
+
+    过去 ``PUT /api/settings`` 每次保存都顺手回写它，于是文件跟着用户修改漂移。
+    后果很隐蔽：DB 一旦被清空，baseline 从这个文件重新播种，用户的历史修改就被
+    当成出厂默认**固化成所有用户继承的基线** —— 谁改过什么、再也分不清。
+
+    ## 行为
+
+    1. 当前生效配置（用户覆盖已合并）写入 ``global_config.settings.baseline``
+    2. 同步写 ``settings.json``，使**全新空库**能播种出同一份配置
+    3. **清掉本用户的覆盖区** —— 已成出厂默认，留着只会遮蔽后续的系统更新
+
+    ## 影响面
+
+    这是**全局**动作：之后所有用户继承这份配置。body 必须显式带
+    ``{"confirm": true}``，避免误触。
+    """
+    ctx = request.app.state.ctx
+    if not (body or {}).get("confirm"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "该操作会把当前配置设为所有用户的出厂默认，并清除你的个人覆盖。"
+                "确认请提交 {\"confirm\": true}。"
+            ),
+        )
+
+    current = ctx.settings.model_dump(mode="json")
+
+    from pa_agent.storage.settings_store import promote_to_baseline
+
+    try:
+        promoted = await asyncio.to_thread(promote_to_baseline, current)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("promote_to_baseline failed")
+        raise HTTPException(status_code=500, detail=f"提升失败：{exc}") from exc
+
+    if not promoted:
+        raise HTTPException(status_code=503, detail="存储层不可用，未能写入系统默认")
+
+    return {
+        "status": "promoted",
+        "settings_json_updated": True,
+        "note": "当前配置已成为系统出厂默认，你的个人覆盖已清除",
+    }
