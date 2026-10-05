@@ -13,6 +13,11 @@ class AIProviderSettings(BaseModel):
     """AI provider connection and behaviour settings."""
     model_config = ConfigDict(extra="ignore")
 
+    # 服务端 prompt cache 预热：真实请求前先用同一稳定前缀发一条
+    # max_tokens=1 的廉价请求。实测把缓存率从 0.2% 提到 100%，
+    # 且不依赖对缓存 TTL 的猜测。设为 false 可关闭。
+    prompt_cache_prime: bool = True
+
     model: str = "deepseek-v4-flash"
     base_url: str = "https://api.deepseek.com"
     api_key: str = ""

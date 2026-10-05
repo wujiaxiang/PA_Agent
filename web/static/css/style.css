@@ -4075,3 +4075,7 @@ body[data-readonly] #sidebar button[data-needs-live] {
   pointer-events: none;
   cursor: not-allowed;
 }
+
+/* token 明细里的缓存命中率：命中=绿（便宜且快），未命中=琥珀（提示预热失效） */
+#token-progress-detail.cache-good { color: #34d399; }
+#token-progress-detail.cache-bad  { color: #fbbf24; }

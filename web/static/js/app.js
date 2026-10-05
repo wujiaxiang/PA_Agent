@@ -3827,8 +3827,19 @@ function updateTokenProgress(usage) {
   const pct = contextWindow > 0 ? Math.min(100, (totalTokens / contextWindow) * 100) : 0;
   $('#token-progress-fill').style.width = pct.toFixed(1) + '%';
   $('#token-progress-pct').textContent = pct.toFixed(1) + '%';
+  // 缓存命中率：服务端对逐字相同的前缀按缓存价计费且 prefill 更快。
+  // 不显示就看不出预热是否真的生效，所以直接摊在 token 明细里。
+  const cached = usage.cached_prompt_tokens
+    || (usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens)
+    || 0;
+  const hitPct = promptTokens > 0 ? (cached / promptTokens) * 100 : 0;
+  const cacheTxt = cached > 0
+    ? `, 缓存命中 ${cached} (${hitPct.toFixed(0)}%)`
+    : ', 缓存未命中';
   $('#token-progress-detail').textContent =
-    `used=${totalTokens} / window=${contextWindow} (prompt=${promptTokens}, completion=${completionTokens})`;
+    `used=${totalTokens} / window=${contextWindow} (prompt=${promptTokens}, completion=${completionTokens}${cacheTxt})`;
+  $('#token-progress-detail').classList.toggle('cache-good', hitPct >= 50);
+  $('#token-progress-detail').classList.toggle('cache-bad', promptTokens > 0 && cached === 0);
 
   wrap.classList.remove('hidden', 'warn', 'danger');
   if (pct >= dangerPct) wrap.classList.add('danger');
@@ -3851,7 +3862,12 @@ function updateTokenProgress(usage) {
 
 function renderTokenUsage(usage) {
   if (!usage) return;
-  $('#stream-usage').textContent = `Token: prompt=${usage.prompt_tokens || 0} completion=${usage.completion_tokens || 0} total=${usage.total_tokens || 0}`;
+  const cached = usage.cached_prompt_tokens
+    || (usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens) || 0;
+  const pct = usage.prompt_tokens > 0 ? (100 * cached / usage.prompt_tokens).toFixed(0) : '0';
+  $('#stream-usage').textContent =
+    `Token: prompt=${usage.prompt_tokens || 0} completion=${usage.completion_tokens || 0}`
+    + ` total=${usage.total_tokens || 0} | 缓存 ${cached} (${pct}%)`;
 }
 
 // ── 未来走势预期面板 ──────────────────────────────────────────────────
