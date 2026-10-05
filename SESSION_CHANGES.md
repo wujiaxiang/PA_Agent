@@ -24,8 +24,6 @@
 
 > **当前状态：无进行中条目。** 下方最近一条已完工。
 
----
-
 ## ✅ 已提交（本条改动待 commit；条目已不再占用写入范围）
 
 ### 2026-10-05 · 多 Session 存储层会话（存储层 + 会话身份 + 跨品种历史）
@@ -127,6 +125,55 @@
 ---
 
 ## ✅ 已提交
+
+### 2026-10-05 · 配置级联事故处置会话（当前）
+
+**状态**：已提交 `2563bb8`
+
+#### 需求
+用户指出「已经做了重大多用户配置的改造」。重新读代码与文档后确认新架构：
+**DB（SQLite，用户级 admin）为真源**，`settings.json` 降级为「首次播种源 +
+灾备兜底」。据此处置一起线上事故。
+
+#### 方案
+发现两处叠加问题：
+1. `config/settings.json` 于 05:04 被写成**代码默认值**
+   （`base_url` 退回 `api.deepseek.com`、`api_key` 清空），
+   容器内构造 OpenAI 客户端直接失败 → **分析功能不可用**
+2. DB 侧 `settings.baseline` 为 **NULL**、overrides 为空 ——
+   系统兜底**从未播种**
+
+处置顺序（不能反：文件先修好再播种，否则会把损坏的文件升格为兜底）：
+1. 留存损坏快照 `config/settings.json.corrupt-20261005-061855`
+2. **合并**而非整体替换 `provider` 段 —— 整体替换会把已新增的
+   `prompt_cache_prime` 一并弄丢（踩过一次）
+3. 用项目自带的 `settings_store.seed_from_file()` 播种，不手写 SQL
+4. 部署含新架构的镜像并验证
+
+#### 改动文件（写入范围）
+
+| 文件 | 改动 |
+|---|---|
+| `config/settings.json` | 恢复 `provider` 凭证段（运行时数据，非代码） |
+| `config/settings.json.corrupt-20261005-061855` | 新增：损坏快照留证 |
+| DB `global_config.settings.baseline` | 播种系统兜底 |
+| `SESSION_CHANGES.md` | 本条目 |
+| `CHANGELOG.md` / `AGENTS.md` | 同步新配置架构约定 |
+
+#### 接口变更
+无（只处置运行时数据，未改代码）。
+
+#### 冲突风险
+- **`config/settings.json` 是跨会话共享的运行时数据**，两个会话都可能写它。
+  新架构下用户改动应走 `apply_user_change()` 进 DB，而非 `save_settings()`
+  整份写文件 —— 后者绕过级联，且若传入默认值构造的对象会直接摧毁配置。
+  该调用点（`routes_data.py` subscribe 处理器）属多 Session 会话范围，**本会话未改**
+- 本次部署把另一会话**已提交但未上线**的 `pa_agent/storage/`、
+  `web/api/session_ctx.py`、`routes_settings.py` 一并上线了 ——
+  属「部署即包含已提交代码」的正常结果，非越权修改
+- `test_routes_records.py` 既有 2 项不稳定失败仍在，与本次无关
+
+---
 
 ### 2026-10-05 · 协作工具会话（当前）
 
@@ -244,7 +291,7 @@ git 配置 `core.hooksPath=.githooks`（已在本仓库启用）。
 ```markdown
 ### YYYY-MM-DD · <会话/主题简称>
 
-**状态**：进行中
+**状态**：已提交 `（本提交）`
 
 #### 需求
 一句话写清用户要什么 / 解决什么问题。

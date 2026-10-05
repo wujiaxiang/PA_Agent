@@ -296,6 +296,25 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **触发**：手动点击「增量」按钮或「持续分析」在 bar_close 事件触发
 - **机制**：重用之前的 Stage1 上下文（system+user+assistant），仅发送新的 bars
 
+### 配置真源在 DB（2026-10-05 重大改造）
+
+- **`pa_agent.storage.settings_store` 的级联是唯一权威**：
+  `baseline`（系统兜底，SQLite）← `overrides`（用户级 admin）。
+  `config/settings.json` 已**降级**为「首次播种源 + 灾备兜底」，不再是运行时真源
+- **`load_settings()` 走 DB 优先、文件回退**；文件回退时会把内容
+  **首次**升格为 baseline（`seed_from_file()`）
+- **用户改动必须走 `apply_user_change()`**，它只把**差异**存进用户配置区。
+  禁止用 `save_settings()` 整份写文件 —— 绕过级联，且若传入默认值构造的对象会
+  直接摧毁配置（2026-10-05 实际发生：base_url 被重置为 api.deepseek.com、
+  api_key 清空，容器内 OpenAI 客户端构造失败，分析功能整体不可用）
+- **字段归级见 `docs/SESSION_STORAGE_DESIGN.md` §5**：游标（symbol/timeframe/
+  exchange/data_mode/keep_analysis/wait_close）属 L3 会话级；凭证属 L1 勿动；
+  `experience_verify_mode` / `experience_max_wait_s` 判定正确，保持 L1
+- **播种顺序不能反**：先把 `settings.json` 修对，再 `seed_from_file()`。
+  反过来会把损坏的文件升格成系统兜底，污染所有用户
+- **改 `settings.json` 用「合并」而非整体替换某个段**：整体替换会连带弄掉
+  该段里其他会话新增的字段（曾把 `prompt_cache_prime` 一并弄丢）
+
 ### 三层配置覆盖
 - **优先级**：shell 环境变量 > .env > settings.json
 - **说明**：`.env` 为可选，文件不存在时 `env_loader` 不执行操作

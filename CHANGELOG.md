@@ -46,6 +46,23 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 26. 处置配置级联事故：settings.json 被写成默认值 → 分析功能整体不可用
+
+用户指出另一会话已完成「重大多用户配置改造」。重新读代码与文档后确认新架构：**DB（SQLite，用户级 admin）为真源**，`settings.json` 降级为「首次播种源 + 灾备兜底」。
+
+- **两处叠加问题**
+  1. `config/settings.json` 于 05:04 被写成**代码默认值**（`base_url` 退回 `api.deepseek.com`、`api_key` 清空）→ 容器内构造 OpenAI 客户端直接失败 → **分析功能整体不可用**，`/api/health` 报 `degraded`
+  2. DB 侧 `settings.baseline` 为 **NULL**、overrides 为空 —— 系统兜底**从未播种**
+- **处置（顺序不能反）**
+  1. 留存损坏快照 `config/settings.json.corrupt-20261005-061855`
+  2. **合并**而非整体替换 `provider` 段 —— 整体替换会连带弄掉该段里其他会话新增的字段（本次先把 `prompt_cache_prime` 弄丢了一次，改用「以损坏快照为基底 + 从备份补凭证」重做）
+  3. 用项目自带的 `settings_store.seed_from_file()` 播种 DB 兜底，不手写 SQL
+  4. 部署含新架构的镜像并端到端验证
+- **验证**：容器内 `load_settings()` 经级联取到 `base_url=http://192.168.2.128:8087/v1` / `model=stealth/space-bunny-alpha` / `prompt_cache_prime=True`，OpenAI 客户端构造成功，`/api/health` 回到 `ok`
+- **回归**：`tests/unit` FAILED=31 / ERROR=30，与本会话基线一致，新增失败 0；新架构的 `test_settings_cascade.py` 19 项全过
+- **未改动**：可疑调用点 `web/api/routes_data.py` 的 subscribe 处理器仍用 `save_settings()` 整份写文件（绕过级联），属多 Session 会话的写入范围，本会话未越界修改，已在 `SESSION_CHANGES.md` 的冲突风险中登记
+- **文件**：`config/settings.json`、`SESSION_CHANGES.md`、`AGENTS.md`、`CHANGELOG.md`
+
 ### 25. 新增多会话协作规范与 SESSION_CHANGES.md 改动记录
 
 用户反馈另一个 Agent 会话正在做多 Session 改造，需要一份规范让并行会话知道别人改了什么、避免写冲突。
