@@ -188,6 +188,10 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 
 - `replayRecord()` 除重渲染侧边栏外，**必须**调用 `applyReplayChart(record)`：切订阅 → `loadBars()` → `clearOverlays` → `setDecisionOverlays` + `setDirectionMarker` + `_renderTradeLegend`
 - **判断是否切换订阅不得依赖工具栏标签**：标签与后端订阅可能不一致（别处直接调过 `/api/subscribe`），按标签判断会跳过切换导致图上是错误品种。回看一律**无条件按记录对齐**
+- **方向箭头必须用显式锚点**：`setDirectionMarker(series, decision, anchorTimeSec)`。不传参时回退到最新一根 bar（实时/demo 正确），但历史回看**必须**传「该记录分析当时那根 bar」的时间，否则箭头会画在今天的 K 线上
+- **「没传」与「明确不画」必须区分**：用 `anchorTimeSec === undefined` 判断是否显式传入，**不能用 `!= null`** —— 回看在锚点落到数据范围外时会传 `null` 表示不要画，`null != null` 为 false 会掉进回退分支，恰好复现要修的 bug
+- **锚点按 `closed` 标志找，不要硬编码 `kline_data[1]`**：`bars[0]` 并不总是 forming bar（休市或快照未带时它本身就是已收盘的），index 1 会指向倒数第二根。用 `two_stage._pick_last_closed_bar()`
+- **历史记录的锚点在读取时修正，不改写磁盘**：`_derive_anchor_bar_ts_ms()` 从记录自身 `kline_data` 现算权威锚点（kline_data 不可变，不会漂移），修复早期记录 JSON 里烙错的值
 - **视窗锚点可能在数据范围外**：老记录（如回看 8 月 ETH 而当前只有 10 月数据）硬对齐会被钳到序列边界、视窗退化成两三根超宽 K 线。锚点落在 `[首根, 末根]` 之外时改为回退到近期窗口
 - 「返回实时」必须恢复回看前订阅（取 `settings.general` 真实状态，非标签）并 `clearOverlays`
 - 回看期间应取消「持续分析」勾选，避免复盘时误触发新一轮分析

@@ -19,6 +19,24 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 21. 修复：历史回看的方向箭头指向错误的 K 线（两个叠加缺陷）
+
+用户实机报告「BTC 1h 选历史后，箭头指向不是当时的 K 线」。查出**两个独立缺陷叠加**，缺一都不会出现该现象。
+
+- **缺陷一（前端）**：箭头锚点用的是「最新一根」而非「当时那一根」。`setDirectionMarker()` 硬取 `window.__PA_LAST_BAR_TIME__`（刚加载数据的最后一根）；回看时视窗已对齐到记录的分析时刻，箭头却画在**今天**的 K 线上 —— 图看着对，语义完全错
+  - 改为 `setDirectionMarker(series, decision, anchorTimeSec)`；`applyReplayChart()` 先解析「当时那根 bar」再传给它
+  - 锚点落在数据范围外时**显式传 `null` 表示「不要画」** —— 画在不相关的 bar 上比不画更有害
+  - ⚠️ 必须用 `=== undefined` 判断是否显式传入，不能用 `!= null`：回看传 `null` 时 `null != null` 为 false，会掉进「回退到最新一根」分支，恰好复现要修的 bug。demo / 实时分析不传参，行为不变
+- **缺陷二（后端）**：`two_stage.py` 与 `routes_records.py` 都**硬取 `kline_data[1]`**，假设 `bars[0]` 恒为未收盘 forming bar。但休市、或快照未带 forming bar 时 `bars[0]` 本身就是已收盘的，此时 index 1 指向**倒数第二根**。实测该记录：分析时刻 17:55:13Z，`kd[0].closed=True ts=16:00Z`（真锚点），代码却取 `kd[1]` = 15:00Z
+- **修复方式**：新记录修正写入，旧记录在**读取时**修正
+  - 抽出 `two_stage._pick_last_closed_bar()`：按 `closed` 标志找第一根已收盘，无标志时退回旧启发式（可单测而不必跑整条流水线）
+  - `routes_records._derive_anchor_bar_ts_ms()`：从记录自身 `kline_data` 现算权威锚点，作为 `anchor_bar_ts_ms` 暴露。kline_data 不可变，据此推导不会漂移；旧记录 JSON 里烙着的错值在读取时被修正，**不必也不应改写磁盘上的历史**
+  - 前端优先用 `anchor_bar_ts_ms`，回退 `last_close_bar_iso`
+- **测试**：新增 `tests/unit/test_last_close_bar_anchor.py`(7) —— 有/无 forming bar、连续多根未收盘、无 closed 标志、单根、空输入
+- **验证**：旧记录 2026-10-04_17-10-13（分析 17:55:13Z）存储值 15:00Z(错) → 推导值 16:00Z(对)；新记录 2026-10-05_02-10-38（分析 02:46:38Z）存储值与推导值一致（01:00Z），证明写入端修复生效；前端实测方向箭头 time 与记录锚点逐秒相等
+- **文件**：`pa_agent/orchestrator/two_stage.py`、`web/api/routes_records.py`、`web/static/{js/app.js,js/chart.js,index.html}`
+- **版本**：app.js?v=52→54、chart.js?v=7→8；全量 `tests/unit` 对基线新增失败 0
+
 ### 20. 后台定时结算 + 定时/手工模式开关 + 每条记录独立 LLM 复盘
 
 - **后台定时结算** `web/api/experience_scheduler.py`：此前待验证记录只能靠用户点「验证」才结算，不点就永远停在 pending，两阶段设计等于白做
