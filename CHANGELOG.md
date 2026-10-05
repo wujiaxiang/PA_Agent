@@ -19,6 +19,21 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 22. K线联动全面审计：修 3 个真 bug + 品种器聚焦体验 + 全控件走查
+
+按「上一轮锚点 bug 的模式」逐条审计 K 线联动链路（硬编码下标 / 用「最新」代替「锚点」/ ms-s 单位 / 逻辑索引代替时间戳），发现并修复 3 个真 bug。
+
+- **`closedBarTs()` 在休市模式下哨兵错位（影响持续分析）**：硬编码 `sorted.length - 2`，假定末位恒为 forming bar。但**休市模式下全部 bar 都已收盘**（数据快照契约：bars[0].seq=1, closed=True），此时「刚收盘」就是最后一根，offset=2 返回的是两根之前的 ts。影响：bar_close 哨兵错位 → 重新开盘后可能误判「这根已处理过」而漏触发，或对同一根重复触发持续分析。修复：按 `closed` 标志倒序查找，无标志时退回 offset 启发式。回归证据：休市数据下旧实现返回 2000、正确值 3000。新增 6 条 Node 断言
+- **SSE bar_update 同步 `lastBars` 用了错误下标（`lastBars` 永不更新）**：`/api/bars` 返回 newest-first（bars[0]=forming），`loadBars` 休市检测读的正是 `lastBars[0]`；而 SSE 合并处取 `lastBars[lastBars.length - 1]`（**最老**的一根）去比 ts_open，永远匹配不上。后果：forming bar 的 OHLC 在 lastBars 里一直是旧值，而 `lastBars` 被 `closedBarTs()` / `setSeqMarkers()` / `applyReplayChart` 视窗计算共同依赖。修复：按 ts_open 定位，不依赖数组方向
+- **`clearOverlays()` 不清经验回放图例**：`clearExperienceReplay()` 定义并导出了但**从未被调用**。点过经验条目后再切记录/开始分析，价格线与 marker 被清、图例却留着 → 图上出现无对应线条的陈旧说明。修复：`clearOverlays()` 一并清 `#experience-legend`；同时移除 `clearExperienceReplay` 里的 `series.setMarkers([])`（会连 seq 标记一起抹掉）
+- **品种选择器聚焦即浏览**：聚焦时把输入框现有值（当前品种）拿去搜，只返回寥寥几条，而「常用 + 分类」清单只能靠点「清空」够得着 —— 用户看到 4 条会以为坏了。修复：聚焦一律展示浏览清单，输入才切到在线搜索
+- **`setExperienceReplay` 入场 marker 未校验 bar 是否存在**：LWC 的 marker 时间必须落在真实 bar 上否则被静默丢弃。老案例入场 bar 不在当前窗口时改为不画并在图例注明，而非无声消失
+- **子 tab 处理器加防御**：程序化点击隐藏面板里的子 tab 会留下两个 `.active` 面板（用户点不到，但已实测出该路径）
+- **走查结果**（Playwright 全控件点击，**30/30 通过，无 JS 错误**）：6 个顶层 tab + 5 个子 tab 任何时刻恰好一个面板可见；追问真实发送收到 user+assistant 两条消息；历史回看/返回实时订阅与周期正确恢复（回看记录是「不下单」，不画叠加层属正确行为，已核对 `decision_overlay`）；品种器聚焦浏览 30 项/2 分组、在线搜 ETH→ETHUSDT、点选、应用订阅；周期切 15m 图例与指标正常重算；三个复选框、经验库刷新/验证、指标图例均正常
+- **审计中确认正确**的部分：ms/s 单位换算一致；主副图用 `setVisibleRange` 时间同步且有 `syncing` 防回环；`fitView` 的逻辑范围是有意为之；`setSeqMarkers` 跳过 `seq<=0` 不假设位置；`loadBars` 的 `lastBars[0]` 休市检测正确
+- **文件**：`web/static/js/{continuous_gate.js,continuous_gate.test.js,app.js,chart.js}`、`web/static/index.html`
+- **版本**：app.js?v=54→56、chart.js?v=8→9、continuous_gate.js?v=1→2；全量 `tests/unit` 对基线新增失败 0
+
 ### 21. 修复：历史回看的方向箭头指向错误的 K 线（两个叠加缺陷）
 
 用户实机报告「BTC 1h 选历史后，箭头指向不是当时的 K 线」。查出**两个独立缺陷叠加**，缺一都不会出现该现象。

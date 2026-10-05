@@ -106,7 +106,9 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **持续分析联动规则**：开启时强制勾选并禁用「实时」+「等待收盘」（依赖 SSE bar_close 事件）；关闭时恢复可编辑
 - **哨兵去重**：`keepAnalysisLastClosedTs` 变量，bar_close 事件仅在 `ts_open` 变化时触发分析
 - **持续分析触发时禁止再次等待收盘**：`startAnalysis` / `startIncrementalAnalysis` 必须接受 `triggerSource`（`'user'` / `'continuous'`），由 `web/static/js/continuous_gate.js::shouldWaitForClose` 判定。`'continuous'` 表示本次调用本身就是被 `bar_close` 触发的，此时 bar 刚刚收盘，**再等一根必然出错**——与「持续分析强制勾选等待收盘」的联动规则叠加后会形成自等待，被下一次 `bar_close` 内的 `stopWaitCloseCountdown()` 取消成 `resolve(false)`，表现为持续分析整周期延迟或时灵时不灵。新增触发路径时必须透传 `'continuous'`
-- **纯逻辑抽到 `continuous_gate.js`**：「刚收盘 bar 的 ts_open」与「是否需要等待收盘」是无 DOM 依赖的纯逻辑，禁止再内联回 `app.js`。三处哨兵计算曾重复三份且必须永远一致，抽成唯一实现由 Node 单测 `continuous_gate.test.js` 守护
+- **`closedBarTs()` 必须按 `closed` 标志查找**：硬编码 offset=2 假定末位恒为 forming bar；休市模式下全部 bar 已收盘，此时「刚收盘」就是最后一根，offset 会返回两根之前的 ts → bar_close 哨兵错位（重新开盘后漏触发或重复触发持续分析）
+- **`lastBars` 是 newest-first**：`/api/bars` 返回 bars[0]=forming bar（数据快照契约）。按 ts_open 定位元素，**不要**用 `lastBars[length-1]` 当最新根 —— 那是**最老**的一根
+- **品种选择器：聚焦 = 浏览，输入 = 搜索**：聚焦时展示「常用 + 分类」清单；拿输入框里已有的当前品种去搜只返回寥寥几条，看起来像功能坏了：「刚收盘 bar 的 ts_open」与「是否需要等待收盘」是无 DOM 依赖的纯逻辑，禁止再内联回 `app.js`。三处哨兵计算曾重复三份且必须永远一致，抽成唯一实现由 Node 单测 `continuous_gate.test.js` 守护
 - **取消「等待收盘」勾选必须调用 `stopWaitCloseCountdown()`**：只停显示定时器不够。`refreshAnalyzeButtonWaitingState()` 会把按钮置回 `idle`，而 `updateSSEStatusWithExpiry` 中 `if (btn.dataset.state !== 'waiting') return` 会提前返回，导致 pending resolver 无人 resolve，`startAnalysis` 永久 await
 - **图表暂停**：分析期间暂停 `bar_update` 的 K线渲染（仍更新 next_close_ts 和状态栏），完成后调用 `loadBars()` 刷新
 - **倒计时统一 HMS 格式**：所有倒计时使用 `formatCountdownHMS()` 函数显示 `HH:MM:SS`
@@ -170,6 +172,8 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 
 - **顶层只有 6 个 tab**：分析 / 预测 / 决策树 / 决策 / 追问 / 经验库（顺序固定，不可随意调换）
 - **两组通过面板内子 tab 合并**：「分析」= 流式分析(`stream`) + 原始数据(`raw`) + 文件与经验(`debug`)；「决策树」= 问答回放(`tree`) + 流程图(`tree-viz`)
+- **清理函数要清干净所有派生 UI**：`clearOverlays()` 必须一并清 `#experience-legend` —— 价格线被清了、图例留着就成了无对应线条的陈旧说明。派生**图例/标记**的函数若定义了就要有人调用，否则就是死代码
+- **LWC marker 的时间必须落在真实 bar 上**：不存在的时间点会被静默丢弃。老案例的入场 bar 不在当前窗口时应不画并在图例注明，而不是无声消失
 - **可被 innerHTML 重写的容器不能包固定子节点**：`#chart-legend` 每次刷新指标图例都会被 indicators.js 整体重写，任何常驻子节点（如 `#experience-legend`）必须放在**兄弟**位置，否则会被静默抹掉
 - **写文件前先断言**：本轮三次出现「后续 assert 失败导致 `open(p,'w')` 未执行」，改动静默丢失、部署的是旧模板 —— 有一次 `order_followup` 的整段替换因此没落地，容器里跑的还是旧调用却毫无察觉。编辑脚本必须把断言放在写入之前，并在写入后回读校验关键符号
 - **只有单视图的面板不要画子 tab 条**：单项子 tab 是纯噪音（如「追问」）
