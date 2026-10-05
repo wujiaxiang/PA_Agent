@@ -141,11 +141,13 @@ DDL_EXPERIENCE_REVIEWS = (
     """,
     # 一条经验只要「最新一版复盘」是热路径；同一条的历史版本很少被读。
     """
-    -- 列序对齐 ``program_review`` / ``latest_llm_review`` 的 ORDER BY，
-    -- 否则每查一次复盘都要临时 B-tree 排序。复盘条数通常 1–3 条，代价可忽略，
-    -- 但同一笔交易反复复盘几十次时这就是第一个该优化的地方。
+    -- 试过把列序改成对齐 ``program_review`` / ``latest_llm_review`` 的
+    -- ORDER BY（(…, source, verdict, created_at DESC)），实测**并没有**消除
+    -- 临时 B-tree：ORDER BY 末尾的 ``review_id DESC`` 本身就无法被索引覆盖，
+    -- 去掉它才能 TEMP=False，而去掉就放弃了同毫秒并列时的确定性仲裁。
+    -- 每条经验只有 1–3 条复盘，这个排序代价可忽略，故保持原样。
     CREATE INDEX IF NOT EXISTS ix_review_entry
-        ON experience_reviews (user_id, entry_id, source, verdict, created_at DESC)
+        ON experience_reviews (user_id, entry_id, created_at DESC)
     """,
 )
 

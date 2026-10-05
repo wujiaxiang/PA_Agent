@@ -119,7 +119,10 @@ def test_failed_run_writes_nothing(entry_id, monkeypatch):
     class _Ctx:
         settings = type("S", (), {"provider": type("P", (), {"model": "m"})()})()
 
-    mod._persist_review(entry_id, "admin", _Boom(), _Ctx())
+    from pa_agent.storage.experience_repo import get_entry
+
+    mod._persist_review(entry_id, "admin", _Boom(), _Ctx(),
+                        get_entry(entry_id, user_id="admin") or {})
     assert latest_review(entry_id) is None, "失败不得落库"
 
 
@@ -135,7 +138,10 @@ def test_empty_content_is_not_persisted(entry_id):
     class _Ctx:
         settings = type("S", (), {"provider": type("P", (), {"model": "m"})()})()
 
-    mod._persist_review(entry_id, "admin", _Empty(), _Ctx())
+    from pa_agent.storage.experience_repo import get_entry
+
+    mod._persist_review(entry_id, "admin", _Empty(), _Ctx(),
+                        get_entry(entry_id, user_id="admin") or {})
     assert latest_review(entry_id) is None
 
 
@@ -175,7 +181,7 @@ def test_review_reaches_the_prompt(entry_id):
         content = (
             "## 结论\n判断成立但运气不佳\n\n## 归因\n- 对的部分: 形态正确\n"
             "- 错的部分: 止损太紧\n\n## 当时能否预见\n- 动能衰减\n\n"
-            "## 改进建议\n- 止损放到结构位\n\n## 下次同类 setup 的判据\n顺大周期方向，等回踩不追高"
+            "## 改进建议\n- 止损放到结构位\n\n## 下次同类 setup 的判据\nSTOP_TOO_TIGHT"
         )
         reasoning_content = "r"
 
@@ -192,7 +198,7 @@ def test_review_reaches_the_prompt(entry_id):
                                               patterns=["均线多头排列"])
     out = PromptAssembler._render_experience(hits, max_chars_per_entry=400)
 
-    assert "顺大周期方向" in out, "复盘判据必须出现在提示词里"
+    assert "止损设在" in out, "复盘判据必须出现在提示词里"
     assert "判断成立但运气不佳" in out
     assert len(out) < 900, "复盘不得把提示词撑爆"
 
@@ -233,14 +239,17 @@ def test_successful_review_is_persisted_by_the_route(entry_id):
         content = (
             "## 结论\n判断成立但运气不佳\n\n## 归因\n- 对的部分: a\n- 错的部分: b\n\n"
             "## 当时能否预见\n- c\n\n## 改进建议\n- d\n\n"
-            "## 下次同类 setup 的判据\n顺大周期方向"
+            "## 下次同类 setup 的判据\nTP_TOO_WIDE"
         )
         reasoning_content = "推理过程"
 
     class _Ctx:
         settings = type("S", (), {"provider": type("P", (), {"model": "m-x"})()})()
 
-    mod._persist_review(entry_id, "admin", _Reply(), _Ctx())
+    from pa_agent.storage.experience_repo import get_entry
+
+    mod._persist_review(entry_id, "admin", _Reply(), _Ctx(),
+                        get_entry(entry_id, user_id="admin") or {})
 
     # 取用走 latest_llm_review：解析失败（verdict 为空）的版本刻意**不可取用**，
     # 它会把该有的确定性事实整个顶掉。
@@ -248,6 +257,6 @@ def test_successful_review_is_persisted_by_the_route(entry_id):
 
     got = latest_llm_review(entry_id, user_id="admin")
     assert got is not None, "正常复盘必须落库且可取用"
-    assert "顺大周期方向" in got["payload"]["content"]
+    assert "TP_TOO_WIDE" in got["payload"]["content"]
     assert got["payload"]["reasoning"] == "推理过程"
     assert got["model"] == "m-x", "必须记下当时用的模型，否则复盘不可追溯"

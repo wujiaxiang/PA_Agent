@@ -14,6 +14,7 @@ reasoning/content into the same bubble component the 追问 tab already uses.
 """
 from __future__ import annotations
 
+from pa_agent.records.review_insights import INSIGHT_CODES as _INSIGHT_CODES, render_insights
 from pa_agent.records.review_spec import parse_review, spec_hint
 
 import asyncio
@@ -57,7 +58,16 @@ _SYSTEM = """你是一位交易复盘分析师。你会拿到一条交易计划�
 每条都要能落到「下次遇到同类 setup 时怎么判」。
 
 ## 下次同类 setup 的判据
-用两三行总结一个可复用的判断标准。
+**只能从下面这份清单里选 1-3 项，逐字写出枚举码，不要写句子**：
+
+{TP_TOO_WIDE} {TP_TOO_CLOSE} {STOP_TOO_TIGHT} {STOP_TOO_WIDE}
+{ENTRY_TOO_LATE} {ENTRY_TOO_EARLY} {COUNTER_CYCLE} {PATTERN_UNCONFIRMED}
+{NO_VALIDATION} {EXPIRED}
+
+若都不适用，写 NONE。
+
+注意：判据由系统用该笔交易的实际数值生成，你只负责选。
+所以**不要在这一节写任何解释性文字或句子** —— 那部分不会被使用。
 
 注意：
 - 不要事后诸葛亮。复盘的价值在于指出**当时**可观察的信号，而不是用结果倒推理由。
@@ -66,6 +76,7 @@ _SYSTEM = """你是一位交易复盘分析师。你会拿到一条交易计划�
 - 不要给出投资建议，只做推理质量评估。"""
 
 _SYSTEM += spec_hint()
+_SYSTEM += "\n\n## 可选判据枚举码\n\n" + " ".join(_INSIGHT_CODES)
 
 
 def _find_entry(record_id: str, *, user_id: str) -> dict[str, Any]:
@@ -172,15 +183,58 @@ def _request_user(request: Request) -> str:
         return DEFAULT_USER_ID
 
 
+def _extract_codes(raw: str) -> list[str]:
+    """从模型输出里取枚举码。
+
+    只认**逐字出现**的枚举码 —— 不做模糊匹配、不从自然语言里推断语义。
+    任何"聪明的"解析都会变成给模型开后门：它能让一段自由文本被当成若干条
+    有效枚举。
+    """
+    from pa_agent.records.review_insights import INSIGHT_CODES
+
+    upper = (raw or "").upper()
+    found = [c for c in INSIGHT_CODES if c in upper]
+    return found
+
+
+def _facts_for(entry: dict[str, Any]) -> dict[str, Any]:
+    """本笔交易的确定性数值（供枚举模板填槽）。取不到就用程序层那份。"""
+    from pa_agent.storage.experience_repo import program_review
+
+    try:
+        row = program_review(str(entry.get("entry_id") or ""), user_id=str(
+            entry.get("user_id") or ""))
+        if isinstance(row, dict) and isinstance(row.get("payload"), dict):
+            return row["payload"]
+    except Exception:  # noqa: BLE001
+        logger.warning("cannot load program facts for insight rendering", exc_info=True)
+    entry_px = float(entry.get("entry_price") or 0.0)
+    sl = float(entry.get("stop_loss_price") or 0.0)
+    tp = float(entry.get("take_profit_price") or 0.0)
+    return {
+        "risk_pct": abs(entry_px - sl) / entry_px * 100.0 if entry_px and sl else 0.0,
+        "reward_pct": abs(tp - entry_px) / entry_px * 100.0 if entry_px and tp else 0.0,
+        "bars_to_exit": entry.get("bars_seen"),
+    }
+
+
 def _persist_review(
-    record_id: str, user_id: str, reply: Any, ctx: Any
+    record_id: str, user_id: str, reply: Any, ctx: Any, entry: dict[str, Any] | None = None
 ) -> None:
     """把复盘结论写进 ``experience_reviews``。
 
     独立表 → 可以重跑并留历史，且**不改**经验条目本身的状态与时序。
     失败只记 warning：复盘是附加产物，丢一次不该让用户看到报错。
     """
-    content = str(getattr(reply, "content", None) or "")
+    # **只接受受控枚举**：模型做选择题，句子由 review_insights 用本笔数值生成。
+    # 自由文本（content）仍入库、仍给人看，但**永不进提示词** —— 净化器实测
+    # 26 个绕过放行 19 个（黑名单挡不住「非命令句的权威断言」）。
+    raw = str(getattr(reply, "content", None) or "")
+    codes = _extract_codes(raw)
+    entry = entry or {}
+    facts = _facts_for(entry)
+    criteria = render_insights(codes, entry, facts)
+    content = raw
     if not content.strip():
         logger.warning("experience review produced empty content; not persisted (%s)", record_id)
         return
@@ -205,7 +259,7 @@ def _persist_review(
              "reasoning": str(getattr(reply, "reasoning_content", "") or "")},
             model=str(getattr(ctx.settings.provider, "model", "") or ""),
             verdict=spec["verdict"],
-            reusable_criteria=spec["reusable_criteria"],
+            reusable_criteria=criteria,
             source="llm",
             user_id=user_id,
         )
@@ -258,7 +312,7 @@ async def experience_review_stream(
             )
             # 落盘必须在 done **之前**、且由后端做：SSE 一断前端就没了，
             # 依赖前端回报等于「用户关页面即丢失这次复盘」。
-            _persist_review(record_id, uid, reply, ctx)
+            _persist_review(record_id, uid, reply, ctx, entry)
             loop.call_soon_threadsafe(
                 queue.put_nowait, {"event": "done", "data": ""})
             _ = reply

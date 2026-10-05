@@ -50,6 +50,13 @@ def _settle(writer, bars, verify_bars=5):
     return eid
 
 
+def _entry(writer, eid):
+    """结算后重新读出条目（判据模板要用 entry/SL/TP 填槽）。"""
+    from pa_agent.storage.experience_repo import get_entry
+
+    return get_entry(eid, user_id="admin") or {}
+
+
 class _P:
     model = "m-x"
 
@@ -61,12 +68,14 @@ class _Ctx:
     settings = _S()
 
 
+#: 合规复盘。判据一节写的是**枚举码**而非句子 —— 判据由
+#: ``review_insights`` 用该笔交易的数值生成，模型只做选择题。
 GOOD_REVIEW = (
-    "## 结论\n判断对了但运气不好\n\n"
+    "## 结论\n判断成立但运气不佳\n\n"
     "## 归因\n- 对的部分: 形态识别正确\n- 错的部分: 止损设太紧\n\n"
     "## 当时能否预见\n- 上涨动能衰减\n\n"
     "## 改进建议\n- 止损放到结构位\n\n"
-    "## 下次同类 setup 的判据\n顺大周期方向，等回踩不追高"
+    "## 下次同类 setup 的判据\nSTOP_TOO_TIGHT"
 )
 
 
@@ -105,7 +114,7 @@ def test_program_review_reaches_the_prompt(writer):
 def test_program_review_is_not_lost_when_llm_review_fails(writer):
     """LLM 版不合规格时，程序版必须仍在取用链路上。"""
     eid = _settle(writer, [bar(1, 112, 101), bar(2, 89, 89)])
-    rv._persist_review(eid, "admin", _reply("还行吧，没什么可说的"), _Ctx())
+    rv._persist_review(eid, "admin", _reply("还行吧，没什么可说的"), _Ctx(), _entry(writer, eid))
     r = latest_review(eid, user_id="admin")
     assert r["source"] == "program" and r["verdict"] == VERDICT_LUCKY
 
@@ -123,27 +132,29 @@ def test_llm_review_adds_criteria_without_overwriting_facts(writer):
     from pa_agent.storage.experience_repo import latest_llm_review, program_review
 
     eid = _settle(writer, [bar(1, 112, 101), bar(2, 89, 89)])   # MFE 12% → 运气不佳
-    rv._persist_review(eid, "admin", _reply(GOOD_REVIEW), _Ctx())
+    rv._persist_review(eid, "admin", _reply(GOOD_REVIEW), _Ctx(), _entry(writer, eid))
 
     facts = program_review(eid, user_id="admin")
     inferred = latest_llm_review(eid, user_id="admin")
     assert facts["verdict"] == VERDICT_LUCKY, "结论必须恒取程序层"
     assert facts["source"] == "program"
     assert inferred["source"] == "llm"
-    assert inferred["reusable_criteria"] == "顺大周期方向，等回踩不追高"
+    assert "止损设在" in inferred["reusable_criteria"], "判据由枚举模板生成"
+    assert "STOP_TOO_TIGHT" not in inferred["reusable_criteria"], "枚举码不该裸露给模型"
 
     out = PromptAssembler._render_review(facts, inferred)
-    assert "顺大周期方向" in out, "LLM 判据应当叠加进来"
+    assert "止损设在" in out, "LLM 判据应当叠加进来"
     assert VERDICT_LUCKY in out, "结论仍是程序层那条"
 
 
 def test_unstructured_review_yields_no_verdict(writer):
     """不合规格 → verdict 留空，**绝不**把原文当判据塞进提示词。"""
     eid = _settle(writer, [bar(1, 100, 99), bar(2, 95, 89)])
-    rv._persist_review(eid, "admin", _reply("这笔亏了，主要是行情差。"), _Ctx())
-    r = latest_review(eid, user_id="admin")
-    assert r["source"] == "program", "应回落到程序版"
-    assert "行情差" not in (r.get("reusable_criteria") or "")
+    rv._persist_review(eid, "admin", _reply("这笔亏了，主要是行情差。"), _Ctx(), _entry(writer, eid))
+    from pa_agent.storage.experience_repo import latest_llm_review, program_review
+
+    assert program_review(eid, user_id="admin") is not None, "应回落到程序版"
+    assert latest_llm_review(eid, user_id="admin") is None, "不合规格版不可取用"
 
 
 def test_instruction_lines_are_dropped_from_llm_criteria():
@@ -177,8 +188,10 @@ def test_surviving_criteria_is_length_capped():
         {"verdict": VERDICT_LUCKY, "reusable_criteria": "", "source": "program"},
         {"verdict": VERDICT_LUCKY, "reusable_criteria": benign, "source": "llm"})
     assert "…" in out, "超长判据必须被截断并标注"
-    crit = out.split("判据", 1)[1].split(":", 1)[1].rstrip("…").strip()
-    assert len(crit) <= PromptAssembler._REVIEW_MAX_CHARS
+    # 注意要先把闭合标签剥掉，否则测到的是「判据 + 标签」的长度
+    crit = out.split("后续判据", 1)[1].split(":", 1)[1]
+    crit = crit.replace("</experience_review>", "").strip().rstrip("…").strip()
+    assert len(crit) <= PromptAssembler._REVIEW_MAX_CHARS, f"判据未封顶：{len(crit)}"
 
 
 def test_verdict_outside_vocabulary_is_rejected():
@@ -275,39 +288,57 @@ def _submit_source(mod):
     raise AssertionError("two_stage 里找不到 submit")
 
 
-def test_user_id_reaches_the_stage2_prompt_builder(writer):
-    """**回归守卫**：复盘按 user_id 取用，user_id 必须一路传到渲染层。
+def test_user_id_survives_the_whole_production_chain(writer):
+    """**回归守卫**：复盘按 user_id 取用，user_id 必须活过**每一跳**。
 
-    漏传的症状**不是报错而是静默失效** —— ``_render_experience`` 的 user_id
-    默认空串 → 内部回落 admin → 非 admin 用户的复盘永远不进提示词。
-    上一轮我只给渲染层加了形参却没让调用方传，等于没修；这条用例从
-    ``submit()`` 的真实调用链一路验到渲染结果。
+    上一轮我给 `_render_experience` 加了 user_id 形参就宣布修好，而生产走的
+    是 `submit()` → `build_stage2_continuation()` → `_build_stage2_user_prompt()`
+    → `_render_experience()` 这条链，我一���都没传。第二轮又只验了签名层，
+    断在中间那一跳。
+
+    这条用例**走真实的 build_stage2_continuation**（生产路径），并同时断言
+    「alice 看得到自己的、看不到 bob 的」—— 只验正向会漏掉回落 admin 造成的
+    串号，而那正是隔离失效的形态。
     """
     import inspect
 
     from pa_agent.ai.prompt_assembler import PromptAssembler
     from pa_agent.orchestrator import two_stage
 
-    # ① 签名层：每一环都必须有 user_id
+    # 每一跳都必须有形参
     for fn in (PromptAssembler._build_stage2_user_prompt,
                PromptAssembler.build_stage2,
                PromptAssembler.build_stage2_continuation):
         assert "user_id" in inspect.signature(fn).parameters, f"{fn.__name__} 缺 user_id"
 
-    # ② 调用层：two_stage 真的把它传下去了
-    src = _submit_source(two_stage)
-    assert "user_id=str(user_id or \"\")" in src, "submit 没把 user_id 传给 Stage 2 构造"
+    # 每一跳都必须**转发**（签名有形参 ≠ 往下传）
+    cont = inspect.getsource(PromptAssembler.build_stage2_continuation)
+    inner = inspect.getsource(PromptAssembler._build_stage2_user_prompt)
+    render_call = inner[inner.index("self._render_experience("):][:220]
+    assert "user_id=user_id" in cont, "build_stage2_continuation 没往下传"
+    assert "user_id=user_id" in render_call, "_build_stage2_user_prompt 没传给渲染层"
+    submit_src = _submit_source(two_stage)
+    assert "user_id=str(user_id or" in submit_src, "submit 没往下传"
 
-    # ③ 行为层：alice 的复盘在 user_id 正确时进得了提示词
-    eid = writer.save_pending(**dict(PLAN, user_id="alice"))
-    from pa_agent.storage.experience_repo import program_review
+    # 行为层：走生产入口，两个身份各建一份带复盘的条目
+    from web.api.experience_verifier import settle_record
 
-    writer.finalize(eid, status="loss", pnl_pct=-10.0, bars_seen=2)
-    facts = program_review(eid, user_id="alice")
-    if facts is not None:
+    def render_for(who, bars):
+        mine = dict(PLAN, user_id=who, symbol=f"{who}USDT")
+        eid = writer.save_pending(**mine)
+        settle_record(writer, eid, dict(mine), bars, verify_bars=5, user_id="")
         hits = ExperienceReader().read_for_stage2(
             "trending_tr", direction="bullish", patterns=["均线多头排列"],
-            user_id="alice")
-        out = PromptAssembler._render_experience(
-            hits, max_chars_per_entry=400, user_id="alice")
-        assert facts["verdict"] in out, "alice 的复盘必须出现在 alice 的提示词里"
+            user_id=who)
+        return PromptAssembler._render_experience(
+            hits, max_chars_per_entry=400, user_id=who)
+
+    from pa_agent.records.review_program import VERDICT_LUCKY, VERDICT_WRONG
+
+    # 两条单子必须给出**不同**结论，否则断言无从区分是谁的复盘
+    a = render_for("alice", [bar(1, 112, 101), bar(2, 89, 89)])   # 曾浮盈 → 运气不佳
+    b = render_for("bob", [bar(1, 100, 99), bar(2, 89, 89)])       # 从未浮盈 → 与走势相悖
+
+    assert VERDICT_LUCKY in a, "alice 必须看得到自己的复盘"
+    assert VERDICT_WRONG in b, "bob 必须看得到自己的复盘"
+    assert VERDICT_LUCKY not in b, "bob 不得看到 alice 的复盘（隔离失效）"
