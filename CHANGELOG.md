@@ -19,6 +19,29 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 25. 新增多会话协作规范与 SESSION_CHANGES.md 改动记录
+
+用户反馈另一个 Agent 会话正在做多 Session 改造，需要一份规范让并行会话知道别人改了什么、避免写冲突。
+
+- **新增 [SESSION_CHANGES.md](SESSION_CHANGES.md)**：与 CHANGELOG 分工明确
+  - **CHANGELOG.md** — 记录*行为*变了什么（面向读者/用户），事后补写，允许合并同类项
+  - **SESSION_CHANGES.md** — 记录*谁在改哪个文件*（面向并行会话），开工前必查、完工前必写，禁止合并与省略
+  - 分区：🔴 进行中（有人此刻正在写这些文件） / ✅ 已提交
+  - 每条含：需求 / 方案 / 改动文件清单 / **接口变更** / **冲突风险**，另附可复制模板
+- **AGENTS.md 新增「多会话协作规范」小节**（置于「何时更新 CHANGELOG.md」之后，保证开工前就能读到）：
+  - 开工前必查「进行中」区，有则先沟通或避开
+  - **开工时立刻占坑** —— 晚写等于没写，别人改完了你才登记，冲突照样发生
+  - 完工时状态改 `已提交 <commit>`，核对改动文件清单（开工列的和实际有出入的以实际为准）
+  - **被否决的方案也要写进「方案」** —— 后来人不知道你为什么没走那条路，很可能重复踩
+  - **既有失败/不稳定测试写进「冲突风险」** —— 否则别人会把自己没改坏的东西算到自己头上
+  - 发现别人留下未提交的改动时**不要顺手清理**，只把自己明确认领过的文件纳入提交
+- **已登记另一会话的在途工作**：`pa_agent/storage/`、`web/api/session_ctx.py`、
+  `docs/SESSION_STORAGE_DESIGN.md`、`tests/unit/test_storage_layer.py`（均未跟踪）
+  以及 `routes_analyze.py` / `routes_data.py` / `routes_records.py` / `web/server.py` /
+  `test_routes_records.py` 的未提交修改 —— 明确标注 **不要动**，并记下
+  `test_routes_records.py` 本就有 2 项既不稳定失败，避免误判
+- **文件**：`SESSION_CHANGES.md`（新增）、`AGENTS.md`、`CHANGELOG.md`
+
 ### 24. 分析前主动预热 prompt cache —— 缓存率 0.2% → 100%
 
 用户提出「尽量走增量加速推理，前提是推测服务端还有缓存」。先验证这个前提，结果比预期糟：**缓存机制完好，但我们的 prompt 布局让缓存几乎永远落空。**
