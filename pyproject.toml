@@ -24,6 +24,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 开发/测试依赖。此前 CI 写的是 `pip install -e ".[dev]"` 但**这个 extra
+# 从未定义** —— pip 只 warning 后继续，于是 test job「装好了」却没装到
+# pytest，CI 显示绿灯而一条测试都没跑（见 CHANGELOG #29）。
+dev = [
+  "pytest>=8.0",
+  "pytest-qt>=4.4",          # qtbot fixture：GUI 相关单测的收集前提
+  "pytest-asyncio>=0.23",
+  "playwright>=1.44",        # tests/e2e
+]
 gui = [
     "PyQt6>=6.6",
     "pyqtgraph>=0.13",

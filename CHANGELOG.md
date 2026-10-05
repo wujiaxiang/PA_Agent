@@ -147,6 +147,25 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 29. CI 的 test job 从「假绿灯」改为真跑单元测试
+
+用户要求 CI 只跑单元测试。动手前先查现状，发现一个必须先说的问题。
+
+- **原 `test` job 一条测试都没跑**：只做 `pip install -e ".[dev]"` + `import pa_agent`，名字叫 test 但不 test
+- **而且 `.[dev]` extra 从未在 `pyproject.toml` 里定义过** —— pip 只 warning 后继续，于是「装好了」却没装到 pytest。**这是「CI 显示绿灯却毫无防护」的根因**
+- **不能直接加一句 `pytest tests/unit`**：本地 `FAILED=78 ERROR=30`。直接接上去 CI 会**永久红** → 所有人开始忽略 CI → 等于没有 CI
+  - 其中 30 个 ERROR 全是缺 `pytest-qt`（纯环境问题）
+  - 78 个 FAILED 主体是经验库 / 存储层 / 多会话上下文的重构中代码，属其他会话写入范围，本会话未改其代码
+- **改动**
+  1. `pyproject.toml` 补 `[dev]` extra（pytest / pytest-qt / pytest-asyncio / playwright）
+  2. `test` job 真跑 `pytest tests/unit`；runner 由 `windows-latest` → **ubuntu-latest**（实际部署是 Docker/Linux，且 `MetaTrader5` 是 win32 专属）
+  3. 新增 `tools/ci_diff_baseline.py` + `tests/ci/baseline_failures.txt`（102 项存量失败）：**存量降级为警告，新增失败必红**
+  4. 补 GitHub 惯例：`concurrency`（取消过期 run）、`timeout-minutes`、`cache: pip`、`permissions: contents: read`、失败时上传 pytest 日志
+  5. e2e job 依赖修正：`pip install -e .` → `".[web,dev]"`（fastapi / uvicorn / sse-starlette 都在 `[web]` 里，原写法装不上、服务起不来）
+- **脚本做了三场景反向验证**：现状 exit 0 / 注入基线外失败 exit 1 且打印用例名 / 某项被修好时提示清理基线
+- **基线的性质**：只是当时快照，**不替代修测试**。取舍理由：不设基线则 CI 永久红（等于关掉），不报则就是本次修掉的假绿灯，设基线才能「新增回归必拦」
+- **文件**：`pyproject.toml`、`.github/workflows/ci.yml`、`tools/ci_diff_baseline.py`（新增）、`tests/ci/baseline_failures.txt`（新增）
+
 ### 28. 端到端测试接入 CI + E2E 专用播种端点
 
 上一条把 `tests/e2e/test_modes_e2e.py` 建好后，只在本地跑 —— `ci.yml` 中 0 处引用。**测试写了但不接流水线等于没写**：下次谁改了模式切换，CI 不会报警。这与「此前没做端到端」是同一类问题，只是换了个位置。

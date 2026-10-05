@@ -158,6 +158,15 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **渲染函数必须能接受空记录**：`renderDecision` / `renderFuturePanel` / `renderDecisionTree` 直接访问 `record.stage2_decision`，传 null 会抛 TypeError；`renderStreamFromRecord(null)` / `renderTokenUsage(null)` 静默 return，同样不清内容。新增/修改任何「渲染某条记录」的函数都要显式处理 `!record`
 - **可选链只对「已声明为 undefined」生效**：写成 `updateFlowBarIdle?.()` 而该函数根本不存在时，仍会抛 ReferenceError。函数是否存在要用 `typeof x === 'function'` 判断，不要靠加 `?.` 蒙混
 - **端到端测试必须断言「内容」而非「状态位」**：面板可见 / dataset 值 / classList / 消息条数只能证明**机制触发**，不能证明**结果正确**。断言要看面板当前显示的内容是否属于当前模式，并把多个操作串成一条**状态迁移链**逐段验证（`replay → 返回实时` 必须是一次连续走查，不能拆成两个独立步骤）
+- **CI 的绿灯必须对应真的跑了测试**：`test` job 曾只做 `pip install` + `import pa_agent` 就算过，且 `pip install -e ".[dev]"` 里的 **`[dev]` extra 从未定义** —— pip 只 warning 后继续，pytest 根本没装上。**加 CI 前先确认被装的 extra 真的存在**，否则是「假绿灯」，比没有 CI 更危险
+- **存量测试失败会让 CI 永久红，必须用基线**：`tools/ci_diff_baseline.py` 比对
+  `tests/ci/baseline_failures.txt`，**存量失败降级为警告、新增失败才红**。不设基线
+  → CI 永远红 → 没人再看 CI；不报 → 就是假绿灯。基线是快照，**不替代修测试**；
+  存量修好后 CI 会提示哪些项可从基线移除
+- **`pip install -e .` 装不上 Web 依赖**：fastapi / uvicorn / sse-starlette 都在
+  `[web]` extra 里，不是核心依赖。CI 里起服务必须 `".[web,dev]"`
+- **runner 要贴近生产**：单测跑 `windows-latest` 但部署是 Docker/Linux，
+  且 `MetaTrader5` 是 win32 专属 —— Linux 上行为不同，等于测了个非生产环境
 - **测试必须接进 CI 才算数**：只写在仓库里、本地手动跑一遍，等于没写 —— 下次改动照样没人被拦。`tests/e2e` 由独立的 `e2e` job 承载（起真实服务 + Playwright）
 - **E2E 播种必须由服务端做**：CI 是空库，核心用例会静默 `skip`（全绿但什么都没测）。但**绝不能让测试进程自己写文件/写库** —— 宿主机与容器是两套文件系统视图（`/root/.../records/pending` vs `/app/records/pending`，同一 inode、不同挂载点），`_db_candidates` 的 `f.resolve().relative_to(RECORDS_DIR)` 必然失败，表现为「文件在、库里有、API 就是查不到」。正确做法是请求仅在 `PA_AGENT_E2E=1` 时注册的服务端播种端点，由它用自己的 `RECORDS_DIR` 与 `upsert_record`
 - **播种后要用服务端同一套 schema 自检**：不通过就 500。列表接口会**静默过滤**校验不过的记录，CI 上表现为「播种成功但测试没测到」，极难定位
