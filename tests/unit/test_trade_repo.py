@@ -438,6 +438,74 @@ def test_trade_dir_is_project_root_based_not_cwd_relative():
     assert paths.TRADE_RECORDS_DIR.parent == paths.PROJECT_ROOT
 
 
+def test_continuity_reads_trade_dir_from_project_root_not_cwd():
+    """``decision_continuity`` 是**读端**，与 trade_logger 同源才有意义。
+
+    它在 ``build_continuity_context`` 里读「上一轮 CSV 方案」来决定连续性判定
+    （是否反手 / 是否已失效）。用 CWD 相对的 ``Path("trade_records")`` 时，
+    换个工作目录启动就永远读不到刚写出的 CSV —— 表现为「上一轮方案凭空消失」，
+    而 prompt 里不打任何折扣：模型会以为这是首单，于是无冷却地反手。
+    """
+    from pa_agent.config import paths
+
+    import pa_agent.ai.decision_continuity as dc
+
+    assert dc._TRADE_RECORDS_DIR == paths.TRADE_RECORDS_DIR, (
+        "连续性读端与交易写入端不是同一个目录基准"
+    )
+    assert dc._TRADE_RECORDS_DIR.is_absolute(), "CWD 相对路径：换目录启动即失效"
+
+
+def test_continuity_keeps_private_attr_name():
+    """私有名**不许改名**：``web/api/order_followup.py``、``gui/main_window.py``
+    与多处单测按模块属性引用它（含 monkeypatch）。改名的成本远大于改值。
+
+    写法必须与 ``records/trade_logger.py`` 同款（``from ... import`` 统一常量
+    + ``_私有名 = 统一常量``）：两个模块各留一个可 monkeypatch 的私有名，
+    测试才能把各自的读/写基准都指到 tmp_path。
+    """
+    import pa_agent.ai.decision_continuity as dc
+    import pa_agent.records.trade_logger as tl
+
+    assert hasattr(dc, "_TRADE_RECORDS_DIR"), "私有名被改名了：外部引用会断裂"
+    assert dc._TRADE_RECORDS_DIR == tl._TRADE_RECORDS_DIR, (
+        "两个模块的路径基准必须同源，否则又是「写 A 读 B」"
+    )
+    # 必须是「函数读的那个名字」：monkeypatch 私属性能改到读端
+    # （功能层面由 test_continuity_reads_csv_from_the_unified_dir 验证），
+    # 这里只守住名字没被改成公有名 —— 测试里的 monkeypatch 目标会静默失效，
+    # 而 monkeypatch 一个不存在的属性**不报错**，只会让测试空过。
+    assert "_TRADE_RECORDS_DIR" in dir(dc)
+
+
+def test_continuity_reads_csv_from_the_unified_dir(tmp_path, monkeypatch):
+    """功能验证：monkeypatch 私有属性后确实读得到那一行。
+
+    只断言常量相等是不够的 —— 常量对了而函数仍从别处取文件的情形完全可能
+    （例如函数内部重新拼了相对路径）。这里让它真读一次。
+    """
+    import pa_agent.ai.decision_continuity as dc
+
+    _write_csv(tmp_path, [
+        {
+            "record_time": "2026-10-05 06:29:01", "symbol": "BTCUSDT",
+            "timeframe": "1h", "order_direction": "做多", "order_type": "限价单",
+            "entry_price": "100", "stop_loss_price": "90", "take_profit_price": "110",
+        },
+        {
+            "record_time": "2026-10-05 07:00:00", "symbol": "BTCUSDT",
+            "timeframe": "1h", "order_direction": "做空", "order_type": "限价单",
+            "entry_price": "200", "stop_loss_price": "210", "take_profit_price": "190",
+        },
+    ])
+
+    monkeypatch.setattr(dc, "_TRADE_RECORDS_DIR", tmp_path)
+    row = dc.load_last_trade_csv_row("BTCUSDT", "1h")
+    assert row is not None, "读不到刚写出的 CSV：连续性判定会误以为是首单"
+    assert row["order_direction"] == "做空", "必须取**最后一行**"
+    assert dc.load_last_trade_csv_row("NOPE", "1h") is None
+
+
 # ── 7. 删除：只删索引，CSV 留给人决定 ────────────────────────────────────────
 
 def test_delete_trade_only_touches_db(db, tmp_path):

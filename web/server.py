@@ -232,6 +232,61 @@ async def trace_id_middleware(request: Request, call_next):
     response.headers["X-Trace-Id"] = get_trace_id()
     return response
 
+
+@app.middleware("http")
+async def bind_user_settings_middleware(request: Request, call_next):
+    """按请求身份绑定生效配置 —— **「每个路由手写一遍解析」由此消失的唯一原因**。
+
+    每个请求进来时解析一次 ``current_user_id(request)`` 对应的配置，绑进
+    :mod:`contextvars`；路由与下游服务照旧读 ``ctx.settings``，读到的却是
+    **本请求用户**的那一份。请求结束（无论成功还是抛异常）立即还原，
+    不跨请求残留。
+
+    为什么用中间件而不是在各路由里解析：
+
+    * ``ctx.settings`` 有 135 处读取点，分散在分析主流程、结算、图表取数里。
+      逐个改成 ``resolve_request_settings(request)`` 是���次横跨半个仓库的重构，
+      且**漏一处就静默串用户** —— 漏改的代码会继续用全局配置，不报错。
+    * 中间件是**唯一**需要知道「这次请求是谁」的地方。新增路由自动按用户解析，
+      零心智负担。
+
+    线程切换用 ``asyncio.to_thread``：解析命中缓存时是纯内存操作，但未命中要读
+    SQLite，放进线程池可保证**事件循环永远不被 DB IO 阻塞**（``/api/bars`` 与
+    追问 SSE 共用同一个循环）。
+
+    **只对 ``/api`` 生效**：静态资源（``/``、``/js/*``、``/css/*``）由浏览器频繁
+    拉取且不读配置，给它们也解析一次纯属浪费；更重要的是，配置层降级时
+    ``_load_settings_from_file`` 可能在判定文件「脏」时**回写 settings.json** ——
+    不该由一次 CSS 请求触发播种源改写。
+    """
+    from pa_agent.app_context import bind_request_settings, reset_request_settings
+    from pa_agent.config.paths import SETTINGS_JSON_PATH
+    from pa_agent.config.settings import resolve_effective_settings
+    from web.api.auth_ctx import current_user_id
+
+    if not request.url.path.startswith("/api"):
+        return await call_next(request)
+
+    try:
+        user_id = current_user_id(request)
+    except Exception:  # noqa: BLE001 - 身份判定失败不该让接口 500
+        user_id = ""
+    try:
+        settings = await asyncio.to_thread(resolve_effective_settings, user_id)
+    except Exception as exc:  # noqa: BLE001 - 配置层故障不阻断请求，退回 ctx 默认值
+        logger.warning("按用户解析配置失败，本次请求用启动默认配置: %s", exc)
+        settings = None
+
+    token = bind_request_settings(settings) if settings is not None else None
+    try:
+        return await call_next(request)
+    finally:
+        # 必须还原，否则同一个 worker Task 上后续请求会继承上一次的绑定。
+        # 未绑定（解析失败）时保持 ContextVar 为 None，:attr:`AppContext.settings`
+        # 自然退回启动默认配置。
+        if token is not None:
+            reset_request_settings(token)
+
 from web.api.routes_settings import router as settings_router
 from web.api.routes_data import router as data_router
 from web.api.routes_analyze import router as analyze_router

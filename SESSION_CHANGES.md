@@ -22,6 +22,243 @@
 
 ## 🔴 进行中（有人正在改这些文件，不要动）
 
+### 2026-10-05 · 三路并行收尾：LLM 开关 UI / 配置按请求解析 / 三个缺口
+
+**状态**：已完工（待本次统一提交）
+
+#### 需求
+补齐三块：LLM 配置开关的前端、配置按请求解析（多用户前置）、
+DELETE 删库行 / 追问落库 / 路径统一。
+
+#### 改动文件（三路写集两两不相交）
+| 范围 | 文件 |
+|---|---|
+| 前端开关 | `web/static/js/app.js`、`web/static/index.html`、`web/static/css/style.css` |
+| 按请求解析 | `pa_agent/storage/settings_store.py`、`pa_agent/config/settings.py`、`pa_agent/app_context.py`、`web/api/auth_ctx.py`、`web/api/routes_settings.py`、`web/server.py` |
+| 三个缺口 | `web/api/routes_records.py`、`web/api/routes_chat.py`、`pa_agent/storage/chat_repo.py`(新)、`pa_agent/storage/sessions.py`、`pa_agent/ai/decision_continuity.py` |
+| 新测试 | `tests/unit/test_chat_repo.py`(新)、`tests/unit/test_record_delete_db_row.py`(新)、`tests/unit/test_trade_repo.py` |
+
+#### 关键决策
+- **`ctx.settings` 由 dataclass 字段改成 property**，读请求内按用户解析、请求外回落启动默认；
+  靠 **FastAPI 中间件**绑定而非逐个路由改 —— 全仓 135 处读取一行未改即自动按用户取对值
+- **缓存 dict 而非 Settings 实例**：PUT 是就地 setattr，共享实例必然「A 改完 B 跟着变」。
+  失效用**代数计数器**而非 TTL，写配置后下一次请求立即生效
+- **DELETE 先删文件后删库行**：要让「索引指向真实存在的文件」在任何失败点成立。
+  **键必须是 `target.stem`**（upsert 用 Path.stem 作主键），用 URL 里的 record_id 会静默删不掉
+- **chat_turns 内存热态 / DB 持久态，DB 优先**；DB 不得成为写盘前置条件
+
+#### 接口变更 ⚠️
+- `provider.use_custom`（默认 False）：为假时用户对 provider 的覆盖**整段作废**
+- `POST /api/settings/promote-default`：显式提升为出厂默认，需 `{"confirm": true}`
+- `DELETE /api/records/{id}` 响应新增 `db_deleted: bool`（向后兼容）
+- `AppContext.__init__` 的 `settings=` 关键字改为 `_default_settings=`（property 占用该名）
+- 前端 `app.js?v=66`、`style.css?v=41`
+
+#### 冲突风险
+- **本轮发生过生产事故**：子代理的验证脚本调了 `promote-default`，把 `config/settings.json`
+  写成了代码默认值（api_key 空、base_url 冲成 api.deepseek.com）。已用 DB baseline
+  合并恢复并校验一致。教训：`PA_AGENT_DB_PATH` **只隔离 DB，不隔离 settings.json**
+- 既有失败基线 **31 failed / 30 errors**（30 个 error 全是缺 pytest-qt 的 qtbot fixture）
+- `test_experience_two_stage` / `test_experience_library_loop` 有跨文件 flaky，单独跑通过
+- **另有两个并发会话**在改经验库读端（`experience_reader/writer/repo`、`two_stage.py`、
+  `docs/EXPERIENCE_READ_CUTOVER.md`）与 E2E 接入 —— 提交时务必用显式文件列表，别捎走
+
+
+### 2026-10-05 · 配置按请求解析（多用户前置）
+
+**状态**：已完工（未 commit，按要求不提交）
+
+#### 需求
+让配置**按请求**解析。级联本身早已支持多用户（`resolve(userA)=250` /
+`resolve(userB)=999`），但 `app_context.py` 只在启动时解析一次存进全局
+`ctx.settings`，所有请求共用一份 —— 两个用户登录后看到同一份配置。
+
+#### 方案
+**把「请求内 / 请求外」的差别收敛到一个 ContextVar**，而不是让每个路由各自解析。
+
+- `pa_agent/app_context.py`：`settings` 由 dataclass 字段改为 **property**，
+  读 → 请求内返回本请求用户的配置，请求外返回启动默认解析；
+  写 → 请求内只改本请求副本（否则 A 读一次设置页就把全局默认换成 A 的）。
+- `web/server.py`：中间件每个请求解析一次并绑定，请求结束还原。
+- 读取侧**一行未改**：135 处 `ctx.settings`（分析主流程 / 结算 / 取数）自动按用户取对值。
+
+**为什么不逐个路由改**：那是一次横跨半个仓库的重构，且**漏一处就静默串用户**
+（漏改的代码继续用全局配置，不报错）。中间件是唯一需要知道「这次是谁」的地方。
+
+**性能**：首版实测比改造前**更慢**（0.107ms vs 0.051ms）—— `apply_env_overrides`
+41µs/次（每次都重读 `.env`）。改为把 .env 覆盖**烘进缓存**，热路径回到 0.041ms、
+**0 次 DB 读 + 0 次文件读**。缓存的是 dict 不是 `Settings`：后者会被
+`PUT /api/settings` 的就地 `setattr` 改到，共享实例必然「A 改完 B 跟着变」。
+
+**失效**：代数计数器（`save_baseline` / `save_overrides` / `clear_overrides` 自增）
+→ 写配置后**下一次请求立即生效**，不等 TTL；30s TTL 只兜「绕过本模块直接改
+SQLite / 另一个进程改同一文件」。写配置是人工点击级低频，全量作废可忽略，
+且**结构性杜绝**跨用户陈旧读。
+
+#### 改动文件（写入范围）
+
+| 文件 | 改动 |
+|---|---|
+| `pa_agent/storage/settings_store.py` | 代数计数器 + 按用户解析缓存 + `resolve_cached`；三个写入口自增代数；`promote_to_baseline` 增 `user_id` |
+| `pa_agent/config/settings.py` | `load_settings(user_id=)`；播种源改**惰性**读（命中缓存时零文件 IO）；新增 `resolve_effective_settings`（含 .env 覆盖的生效配置缓存） |
+| `pa_agent/app_context.py` | `settings` 改 property + ContextVar 绑定/还原 |
+| `web/api/auth_ctx.py` | 新增 `resolve_request_settings(request)` |
+| `web/server.py` | 新增 `bind_user_settings_middleware` |
+| `web/api/routes_settings.py` | GET 按 `current_user_id` 解析；PUT 写**发起者**的覆盖区；promote 传发起者 |
+| `web/api/session_ctx.py` | **未改动**（列入写集但无需改：`resolve_view` 读 `ctx.settings` 已自动按用户） |
+
+#### 接口变更
+- `AppContext.__init__` 的 `settings=` 关键字改为 `_default_settings=`。
+  **读写真接口 `ctx.settings` 不变**；全仓仅 `bootstrap()` 用过该关键字。
+- `promote_to_baseline(current, user_id=None)`：新增可选第二参（默认行为不变）。
+  传发起者后清的是**他的**覆盖区 —— 单机下 admin 与发起者恒等，多用户下否则
+  发起者的覆盖会继续遮蔽新出厂默认。
+- 无新增 API / 请求头 / 配置项。
+
+#### 验证
+- 必跑集 137 项全绿
+- `tests/unit tests/property`：以**同一工作树、仅回退本会话 7 个文件**为基线
+  （38 failed）对比 → 见下「冲突风险」
+- 真实库未被污染：`stat -c "%Y:%s"` 前后一致（`1791203390:16035840`）
+
+#### 冲突风险 ⚠️
+- **`test_chat_repo.py` 3 项「新增失败」不属本会话**：`pa_agent/storage/chat_repo.py`
+  与 `tests/unit/test_chat_repo.py` 都是**未跟踪新文件**，mtime 在本会话执行期间
+  仍在变（12:30 / 12:34）；单跑 13 passed（顺序依赖 flaky）。二者与本会话 7 个文件
+  **零耦合**（不 import settings / config / app_context / auth_ctx）。
+- `web/api/routes_records.py`、`web/api/routes_data.py` 在本会话期间被其它会话改动，
+  一度处于**无法 import**（缺 `import os` / IndentationError）状态，
+  `web.server` 因此暂时无法导入。基线与对比均加 `--ignore=tests/unit/test_routes_records.py`
+- **本会话的验证脚本曾误写生产 `config/settings.json`**：`promote-default` 走
+  `promote_to_baseline`，它写的是 `SETTINGS_JSON_PATH`，而临时 `PA_AGENT_DB_PATH`
+  **只隔离 DB、不隔离该文件**。教训见 CHANGELOG。
+  当前 `settings.json` 的 `provider.api_key` 为空、`base_url` 与 `analysis_bar_count`
+  已与 DB baseline 不符（并发会话亦在写该文件）。**运行期不受影响**（真源是
+  `global_config.settings.baseline`，实测完好：api_key 有效、base_url 正确）；
+  仅播种源/灾备副本失真。修复 = 用 DB baseline 覆盖写回该文件，**未擅自执行**。
+
+---
+
+### 2026-10-05 · E2E 接入 CI（当前）
+
+**状态**：进行中
+
+#### 方案（施工中发现的硬约束）
+
+自播种原本写成「测试进程直接写文件 + `upsert_record()` 写 DB」，本地能跑通，
+但**在容器化部署下必然错位**，连续踩了三个坑：
+
+1. `experience_loaded` 写成 `False`，schema 要求 `list` → 记录被列表接口静默过滤
+2. 只写文件不写 DB → API 查不到。`routes_records._list_records()` 明确
+   「**数据库是唯一真源**，磁盘文件只是补种来源」
+3. 补上 `upsert_record()` 仍查不到 → DB 校验 `f.resolve().relative_to(RECORDS_DIR)`
+   失败。**根因是宿主机与容器是两套文件系统视图**：
+   宿主 `/root/shared-workspace/PA_Agent/records/pending`
+   vs 容器 `/app/records/pending`（同一目录、不同挂载点）
+   同一 inode，但 `relative_to` 必然失败
+
+**结论**：任何「测试进程自己写库」的方案在容器下都不成立。必须让**服务端自己
+播种** —— 由服务端进程写盘、用它自己的 `RECORDS_DIR`、走它自己的 `upsert_record`。
+因此新增一个**默认关闭、仅显式开启时可用**的 E2E 播种端点。
+
+
+#### 需求
+用户批准把 `tests/e2e/` 接入 CI。此前 E2E 只在本地跑，`ci.yml` 中 0 处引用 ——
+测试写了但不接流水线，等于没写。
+
+#### 方案
+（施工中）
+
+#### 改动文件（写入范围）
+
+| 文件 | 改动 |
+|---|---|
+| `tests/e2e/test_modes_e2e.py` | BASE_URL 走环境变量；空库时请求服务端播种 |
+| `web/api/routes_records.py` | **新增** E2E 播种端点（默认关闭，需环境变量开启） |
+| `tests/e2e/conftest.py` | 新增：服务就绪等待 |
+| `.github/workflows/ci.yml` | 新增 `e2e` job |
+| `SESSION_CHANGES.md` / `CHANGELOG.md` / `AGENTS.md` | 记录 |
+
+#### 接口变更
+新增端点 `POST /api/records/__e2e_seed__`，**仅在 `PA_AGENT_E2E=1` 时注册**
+（默认不注册，生产环境不存在该路由）。
+新增环境变量：`PA_AGENT_E2E_BASE_URL`（E2E 目标地址）、`PA_AGENT_E2E=1`（服务端开关）。
+
+#### 冲突风险
+- `.github/workflows/ci.yml` 是共享基础设施，开工前已确认「进行中」区无占用
+- 关键风险：CI 是**空库**，`_records()` 返回空会让核心测试**静默 skip**，
+  CI 全绿但什么都没测。必须让 E2E 在无历史记录时自播种
+
+
+### 2026-10-05 · 经验库读端切库（P-1 → P4）
+
+**状态**：P-1 / P-2 / P0 / P1 / P2 **已完工**（待 commit）；P3 复盘回写、P4 字段感知渲染**未做**
+
+#### 需求
+身份/鉴权层已由 `650fc8f` 落地（`storage/auth.py` + `web/api/auth_ctx.py`），但经验库
+**读端一行未动**：三条读路径（提示词注入 / 浏览 API / 复盘取档）全在文件系统。
+`experience_repo.list_entries`/`get_entry`/`count_by_status` 除测试外零生产调用者，
+`current_user_id` 零调用者 —— `experience_entries` 表自建起是死索引，`user_id` 列从未生效。
+用户要求：做计划 → 评审 → 再并线开发。
+
+#### 方案
+照搬 `docs/SESSION_STORAGE_DESIGN.md` §7 的 **C 阶段切读**（SQLite 读，miss 回退文件），
+不做 D 阶段（SQLite only，风险高收益零）。分 P-1…P4，见方案文档。
+
+**v1 经两轮独立评审后被推翻**，5 处错误（详见方案 §7），关键三条：
+- **`hub.read_failed` 是进程级共享标志**（`_read_error` 非 thread-local，且成功读会清它），
+  v1 的降级契约在并发下是死代码 → 已实测复现，提为 P-1
+- **漏了 reader 异常会连同已付费的 Stage 1 一起毁掉整次分析**
+  （`two_stage.py:678` 无 try/except，下一次落盘在 703）→ P-1
+- **P1 伪代码绕过 `read_top5()`**，会**静默废掉 12 个 Mock 测试点**（不红，只是没测）
+
+**被否决的方案**：
+- **不做「顺手补写」** —— 读路径不写。会顶住 `max_workers=2` 的分析池
+  （`busy_timeout=5000`），且破坏 AGENTS「写入方唯一入口」；回填交给 importer
+- **DB 优先逻辑放进 `read_top5()` 内部**，不改 `read_for_stage2` —— 保住 14 个测试点
+- **`entry_id` 改取值而非改主键** —— SQLite 不能 ALTER 主键，改取值零迁移成本
+- **复盘回写进条目文件，不新增只存 DB 的表** —— 保住「文件是权威副本」与可追溯性，
+  且免 schema 迁移（`db.migrate()` 每次启动无条件跑 `all_statements()`）
+- **不上 PostgreSQL** —— `db.py:20` 是 `sqlite3`，依赖 `ON CONFLICT`/`AUTOINCREMENT`/
+  `threading.local`
+- **打分逻辑不搬 SQL** —— `_score` 只有方向 +2、形态交集两项，数据量百级，留在 Python
+
+#### 改动文件（写入范围）
+
+| 文件 | 改动 |
+|---|---|
+| `docs/EXPERIENCE_READ_CUTOVER.md` | 新增（方案文档，含评审推翻记录） |
+| `pa_agent/storage/db.py` | **P-1** `_read_error` 移入 `threading.local` |
+| `pa_agent/storage/experience_repo.py` | **P-1** 查询显式回传失败标志；**P-2** 增 `statuses`、`entry_id` 按 user 分区 |
+| `pa_agent/orchestrator/two_stage.py` | **P-1** reader 包 try/except + `save_partial` 前移 |
+| `web/api/session_ctx.py` | **P0** `bind_session` 改走 `current_user_id(request)` |
+| `pa_agent/records/schema.py` | **P0** `RecordMeta` 增 `user_id` |
+| `pa_agent/records/experience_writer.py` | **P0** 全链透传 `user_id`（含 `save()` 补镜像）；**P3** `attach_review()` |
+| `pa_agent/records/experience_reader.py` | **P1** DB 优先（塞进 `read_top5`）+ 文件回落 + direction 枚举修复 + 死参数清理 |
+| `web/api/routes_data.py` | **P2** 浏览 API 切读 repo |
+| `web/api/routes_experience_review.py` | **P3** `_find_entry` 切 `get_entry`；复盘结果回写 |
+| `web/api/order_followup.py` | **P0** 派发线程时透传 `user_id` |
+| `web/api/experience_verifier.py` | **P0** 结算用记录自身的 `user_id` |
+| `pa_agent/ai/prompt_assembler.py` | **P4** `_render_experience` 字段感知渲染 |
+| `tests/unit/test_storage_*.py`、`test_experience_*.py`、`tests/integration/`、`tests/e2e/` | 新增/调整测试 |
+| `SESSION_CHANGES.md`、`CHANGELOG.md`、`AGENTS.md` | 记录 |
+
+#### 接口变更
+- **P0**：`/api/records` 响应中 legacy 记录的 `meta.user_id` 为 `""`（多一个 key）
+- **P-2**：`experience_repo.list_entries` 增 `statuses: list[str] | None`（`status` 保留兼容）
+- **P-1**：`hub.read_failed` 语义改为线程局部（调用方行为不变，但并发下不再互相清标志）
+- 其余待实施后补
+
+#### 冲突风险
+- `web/api/routes_data.py` 近期被其它会话改过（mtime 10-05 10:13），但其改动
+  不在经验库段内；提交时按 AGENTS「`git commit -- <显式文件列表>`」避免捎走他人改动
+- 既有失败/不稳定测试：**无**。开工前基线
+  `test_experience_library_loop / two_stage / watch_integrity / storage_dualwrite /
+  session_ctx / auth_placeholder` = **107 passed, 1 skipped**
+- **已知既有缺陷（本次只登记不修）**：`spawn_post_order_followup` 每次分析新建线程，
+  经双写链每次 +1 条永不关闭的 SQLite 连接（实测 20 线程 → 21 连接）。P1 放大泄漏面
+- 本机 8000 端口是 **docker-proxy**（非本仓库进程），404；最终验收需另行起 uvicorn
+
 ## ✅ 已提交（本条改动待 commit；条目已不再占用写入范围）
 ### 2026-10-05 · 多会话推理收尾（P1 SSE下线 / P2a 追问隔离 / P3 交易域 / P4 配置层）
 

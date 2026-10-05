@@ -2020,6 +2020,12 @@ button.danger:disabled { background: var(--bg-input); border-color: var(--border
   font-size: 13px;
 }
 #settings-form label input[type="checkbox"] { width: auto; }
+/* radio 同理：否则继承上面 label input 的 280px，被拉成一个巨型控件 */
+#settings-form label input[type="radio"] { width: auto; }
+
+/* LLM 来源总开关（#s-llm-source-hint） */
+.llm-source .checkbox-label { margin-bottom: 6px; }
+.llm-source-hint { margin: 0 0 6px; font-size: 11px; }
 
 /* Phase I Task 19: 设置弹窗分组 fieldset 样式 */
 .settings-fieldset {

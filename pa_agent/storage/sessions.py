@@ -171,7 +171,15 @@ def drop_session(session_id: str) -> bool:
 
 
 def purge_expired() -> int:
-    """删除已过期快照，返回删除行数。由 housekeeping 周期调用。"""
+    """删除已过期快照（**只删 ``sessions`` 表**），返回删除行数。
+
+    由 housekeeping 周期调用。
+
+    **它不删 ``chat_turns``。** 这一点被反复搞错：``chat_turns`` 里存着追问
+    历史（``pa_agent.storage.chat_repo`` 写入），而 ``session_id`` 一列正是
+    本表的主键 —— 删掉 ``sessions`` 行正是让那些追问**变成孤儿**的动作。
+    清孤儿由 :func:`purge_for_user_sessions` 负责，两者必须**按序**跑。
+    """
     hub = get_hub()
     ts = now()
     before = hub.query_one("SELECT COUNT(*) AS n FROM sessions")
@@ -183,10 +191,20 @@ def purge_expired() -> int:
 
 
 def purge_for_user_sessions() -> int:
-    """删除孤儿追问记录：其 session_id 已不在 sessions 表中。
+    """删除孤儿追问记录（``chat_turns``）：其 session_id 已不在 sessions 表中。
 
     chat_turns 是 L2 持久数据，但按 session 隔离线程。会话过期后这些行
     不该无限堆积 —— 按 TTL 保留一段时间后再清。
+
+    **必须在 :func:`purge_expired` 之后调用**：本函数的判定是
+    ``session_id NOT IN (SELECT session_id FROM sessions)``，而
+    ``purge_expired`` 才是把过期行从 ``sessions`` 里拿掉的那一步。反过来
+    （先清本函数）时行还在 ``sessions`` 里，永远判不出孤儿。
+
+    **已知缺陷（2026-10-05 核实，本次只登记不修）**：本函数与
+    :func:`purge_expired` 目前**都没有生产调用者**（仅被单测覆盖），
+    整条清理链尚未接入任何调度器。因此 ``chat_turns`` 在调度器补上之前
+    只增不减。补调度点需要改 ``web/server.py``（lifespan），不在本轮写集内。
     """
     hub = get_hub()
     res = hub.execute(

@@ -4,12 +4,21 @@ from __future__ import annotations
 import csv
 import re
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
+from pa_agent.config.paths import TRADE_RECORDS_DIR
 from pa_agent.util.price_tick import infer_price_tick_from_frame
 
-_TRADE_RECORDS_DIR = Path("trade_records")
+# **必须是 PROJECT_ROOT 基准，不能是 CWD 相对的 ``Path("trade_records")``**：
+# 写入端（``records/trade_logger``）用的是绝对路径，换个工作目录启动就会
+# 「写 A 目录、读 B 目录」，历史交易凭空消失且无人报错（见
+# ``pa_agent/config/paths.py`` 的同款告诫）。
+#
+# 保留私有名是刻意的：``web/api/order_followup.py``、``pa_agent/gui/main_window.py``
+# 与若干单测都按模块属性引用 ``_TRADE_RECORDS_DIR``（含 monkeypatch），
+# 改名会一起打断。**要改的是它的值，不是它的名字** —— 与 ``trade_logger``
+# 同款写法。
+_TRADE_RECORDS_DIR = TRADE_RECORDS_DIR
 
 # Default: no opposite-direction plan at the same structure within N closed bars.
 DEFAULT_STRUCTURE_FLIP_COOLDOWN_BARS = 3

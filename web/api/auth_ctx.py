@@ -107,6 +107,32 @@ def current_user_id(request) -> str:
     return current_auth(request).user_id
 
 
+def resolve_request_settings(request) -> "object":
+    """解析**本次请求**该用户生效的配置。
+
+    这是「请求路径拿配置」的唯一入口，与 :func:`current_user_id` 配对使用。
+    **它保证任何情况下都不抛异常**：配置层故障时回落到启动时的默认解析
+    （``load_settings()``），宁可给一份可能不是本用户的配置，也不能让整个
+    接口 500 —— 身份判定失败与配置解析失败是两件事，前者该 401，后者不该。
+
+    普通业务代码**通常不需要直接调它**（见下）。它的用途是「拿不到
+    ``ctx``、但确实需要按用户解析配置」的地方，例如后台任务里要为某个
+    已记录 ``user_id`` 的记录结算。
+    """
+    from pa_agent.config.settings import load_settings, resolve_effective_settings
+
+    try:
+        user_id = current_user_id(request)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("身份判定失败，回落启动默认配置: %s", exc)
+        return load_settings()
+    try:
+        return resolve_effective_settings(user_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("按用户解析配置失败，回落启动默认配置: %s", exc)
+        return load_settings()
+
+
 def require_auth(request) -> AuthContext:
     """强制鉴权入口：未认证抛 401。
 

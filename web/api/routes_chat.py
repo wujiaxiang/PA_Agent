@@ -30,6 +30,24 @@ B tab 的上下文里，互相污染。
   全局 ``ctx.settings``；
 - 断连**只**摘 SSE 队列（``registry.drop_queue``），绝不 ``registry.drop(sid)``：
   浏览器会自动重连，drop 会把追问历史一起清掉。
+
+追问历史的三处落点
+================
+生成成功后**同步写一份** ``chat_turns``（``pa_agent.storage.chat_repo``）。
+此前追问历史只活在内存 ``_chat_sessions`` 与 JSONL sidecar 两处，**都不持久**
+（进程重启即丢；sidecar 随分析记录一起被删）。DB 那一行的定位与权威性
+（内存热态 / DB 持久态 / DB 优先）见 ``chat_repo`` 的模块 docstring，
+这里只强调接线上的三条硬约束：
+
+1. **审计写失败绝不影响追问**。调用点在生成线程里，用户此时已经拿到答案；
+   一条 INSERT 失败不该把整次追问变成 ``error`` 事件。
+2. **先推 ``done`` 再落库**。SQLite 是 ``busy_timeout=5000``，并发写撞锁时
+   会阻塞最多 5 秒；先落库等于让用户在「生成中…」上白等 5 秒，而先推
+   ``done`` 最多丢掉「客户端在同一毫秒内重载历史」这一种可见性。
+3. **轮次号取自内存会话**（``len(history_full) // 2 + 1``），与
+   ``FreeChatSession._turn`` 严格同源。两套计数会让同一段对话在库里出现
+   重复轮次，而 ``ix_chat_thread (user_id, thread_key, turn)`` 不是唯一索引
+   —— 写重了不报错，只在回读时顺序错乱。
 """
 from __future__ import annotations
 
@@ -43,6 +61,7 @@ from fastapi import APIRouter, Query, Request
 from sse_starlette.sse import EventSourceResponse
 
 from pa_agent.orchestrator.free_chat import FreeChatSession
+from pa_agent.storage import chat_repo
 from pa_agent.storage.ephemeral import get_registry
 from pa_agent.util.threading import CancelToken
 
@@ -204,6 +223,60 @@ def _push(loop, queue: asyncio.Queue, payload: dict) -> None:
         pass
 
 
+def _is_cancelled(exc: BaseException) -> bool:
+    """True when *exc* 表示用户取消追问（而非生成失败）。
+
+    ``free_chat.send`` 在取消时抛 ``deepseek_client.CancelledError``，它继承
+    ``Exception``，所以会落进 ``except Exception`` —— 不区分就会把「取消」
+    当成「失败」，库里不留痕。
+
+    刻意用**类名**判定而不是 isinstance：为一个异常分支在模块顶部引入
+    ``deepseek_client`` 的符号并不划算（它虽是 Qt-free 的，但会让「这个模块
+    依赖了哪些包」更难读）。类名判定同样能命中测试里注入的同名桩。
+    """
+    return type(exc).__name__ == "CancelledError"
+
+
+def _persist_turn(
+    *,
+    thread_key: str,
+    turn_number: int,
+    session_id: str,
+    record_id: str,
+    symbol: str,
+    timeframe: str,
+    user_text: str,
+    assistant: str = "",
+    reasoning: str | None = None,
+    usage: dict | None = None,
+    cancelled: bool = False,
+) -> None:
+    """把一轮追问落到 ``chat_turns``。**任何失败只记 warning，绝不冒泡。**
+
+    见模块 docstring 的「追问历史的三处落点」。本函数刻意不返回状态：
+    调用点在 SSE 生成线程里，返回值除了写日志无处可去，做成布尔只会诱导
+    上层以为「可以不落库」。
+    """
+    try:
+        chat_repo.append_turn(
+            thread_key=thread_key,
+            turn=turn_number,
+            user=user_text,
+            assistant=assistant,
+            session_id=session_id,
+            record_id=record_id,
+            symbol=symbol,
+            timeframe=timeframe,
+            reasoning=reasoning,
+            usage=usage,
+            cancelled=cancelled,
+        )
+    except Exception:  # noqa: BLE001
+        # 双保险：append_turn 本身已吞 DB 异常，这里挡的是它**参数构造**
+        # 一侧的任何意外（可序列化失败等），同样不得打断追问。
+        logger.warning("chat turn persistence failed (ignored)", exc_info=True)
+
+
 @router.get("/chat/stream")
 async def chat_stream(
     request: Request,
@@ -284,9 +357,14 @@ async def chat_stream(
         return value.strip() if isinstance(value, str) else ""
 
     # record 三段：保留原语义。扩键而非替换 —— 见模块 docstring 的实测说明。
+    # db_record_id 单独取出来：内存分桶与 chat_turns.record_id 用的是同一个值，
+    # 复制两份表达式迟早会漂移（漂移后库里存的是另一条记录的外键）。
+    db_record_id = (
+        record_id or _key_part(getattr(record, "_basename", "")) or "latest"
+    )
     record_key = "|".join(
         [
-            record_id or _key_part(getattr(record, "_basename", "")) or "latest",
+            db_record_id,
             _key_part(getattr(meta, "symbol", "")),
             _key_part(getattr(meta, "timeframe", "")),
         ]
@@ -333,6 +411,10 @@ async def chat_stream(
         #
         # 移到事件循环侧后：等待发生在事件循环里，不占 worker，永远不会死锁，
         # 同时仍然保证 FreeChatSession 的互斥（send() 无内建锁）。
+        #
+        # 轮次号在 send 之前算：_history_full 初始为空、每轮追加 user+assistant
+        # 两条，故「已完成的轮数」= len // 2，与 _turn（send 内先自增）严格同源。
+        turn_number = len(session.history_full) // 2 + 1
         try:
             cancel_token = CancelToken()
             reply = session.send(text, cancel_token=cancel_token,
@@ -343,7 +425,38 @@ async def chat_stream(
                 "content": reply.content,
                 "reasoning": reply.reasoning_content or "",
             })
+            # 先推 done 再落库（见模块 docstring 的硬约束 2）。
+            _persist_turn(
+                thread_key=session_key,
+                turn_number=turn_number,
+                session_id=sid,
+                record_id=db_record_id,
+                symbol=_key_part(getattr(meta, "symbol", "")),
+                timeframe=_key_part(getattr(meta, "timeframe", "")),
+                user_text=text,
+                assistant=reply.content or "",
+                reasoning=reply.reasoning_content or None,
+                usage={
+                    "prompt_tokens": reply.usage.prompt_tokens,
+                    "cached_prompt_tokens": reply.usage.cached_prompt_tokens,
+                    "completion_tokens": reply.usage.completion_tokens,
+                    "total_tokens": reply.usage.total_tokens,
+                },
+            )
         except Exception as exc:
+            # 取消也是一种「发生了的轮次」：free_chat 已把它写进 JSONL sidecar，
+            # 库里同样留一行，否则「问过但没答」的那次追问在审计里彻底消失。
+            if _is_cancelled(exc):
+                _persist_turn(
+                    thread_key=session_key,
+                    turn_number=turn_number,
+                    session_id=sid,
+                    record_id=db_record_id,
+                    symbol=_key_part(getattr(meta, "symbol", "")),
+                    timeframe=_key_part(getattr(meta, "timeframe", "")),
+                    user_text=text,
+                    cancelled=True,
+                )
             _push(loop, event_queue, {"type": "error", "message": str(exc)})
 
     async def event_generator():

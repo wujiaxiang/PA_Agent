@@ -447,16 +447,53 @@ async function refreshBarsOnly() {
   }
 }
 
+// ── LLM 来源开关（provider.use_custom）──────────────────────────────────
+// 后端语义：use_custom=false 时**整段忽略**用户对 provider 的覆盖，模型来自出厂
+// 配置；true 时用户在设置页填的 model / base_url / api_key 才生效。
+// 因此界面必须做到两件事，二选一开关本身就是二者的总闸。
+const LLM_SOURCE_SYSTEM = '#s-llm-source-system';
+const LLM_SOURCE_CUSTOM = '#s-llm-source-custom';
+const LLM_CUSTOM_FIELDS = '#s-llm-custom-fields';
+
+// 切换开关并同步 LLM 配置项的可见性。
+// **只切 hidden，绝不清空输入框的值**：用户填到一半的 model/api_key 必须在
+// 切到「系统默认」再切回来时仍在；掩码值（abcd****wxyz）也原样保留，
+// 提交路径的掩码保护（后端 _should_keep_existing）继续生效。
+function setLlmSourceMode(useCustom) {
+  const custom = useCustom === true;
+  const sysRadio = $(LLM_SOURCE_SYSTEM);
+  const customRadio = $(LLM_SOURCE_CUSTOM);
+  if (sysRadio) sysRadio.checked = !custom;
+  if (customRadio) customRadio.checked = custom;
+  // 隐藏而非 disabled：这些字段此刻完全不参与计算，不该出现在界面上
+  $(LLM_CUSTOM_FIELDS)?.classList.toggle('hidden', !custom);
+  const hint = $('#s-llm-source-hint');
+  if (hint) {
+    hint.textContent = custom
+      ? '将使用你在下面填写的模型配置，忽略系统出厂默认值。'
+      : '模型与接口全部来自系统出厂配置，下面的配置项不会生效。';
+  }
+  return custom;
+}
+
+// 读开关当前状态（保存时用）。缺省 false：后端默认也是 false。
+function isLlmCustomSelected() {
+  return $(LLM_SOURCE_CUSTOM)?.checked === true;
+}
+
 async function loadSettings() {
   try {
     const s = await API.get('/api/settings');
     currentSettings = s;
+    // 先填值再切可见性：隐藏状态下值照样留在 DOM 里，切回「自带模型」时即可见。
     $('#s-base-url').value = s.provider?.base_url || '';
     $('#s-model').value = s.provider?.model || '';
     $('#s-api-key').value = s.provider?.api_key || '';
     $('#s-reasoning-effort').value = s.provider?.reasoning_effort || 'high';
     $('#s-thinking').checked = s.provider?.thinking !== false;
     $('#s-max-output-tokens').value = s.provider?.max_output_tokens || 0;
+    // use_custom 缺省 false（跟随系统）—— 与后端 AIProviderSettings 默认值一致。
+    setLlmSourceMode(s.provider?.use_custom === true);
     $('#s-refresh-ms').value = s.general?.refresh_interval_ms || 1000;
     $('#s-decision-stance').value = s.general?.decision_stance || 'balanced';
     $('#s-ctx-warn').value = s.general?.context_warning_threshold_pct || 80;
@@ -958,6 +995,13 @@ function bindEvents() {
     await saveSettingsHandler();
   });
 
+  // 模型来源二选一：切到「系统默认」即隐藏整块自定义配置，切回时原值仍在。
+  // 读的是**自定义那个 radio** 的状态，不能读事件目标自己的 checked ——
+  // 选中「系统默认」时事件目标恰好是 checked=true，直接用它会把语义整个反过来。
+  [LLM_SOURCE_SYSTEM, LLM_SOURCE_CUSTOM].forEach((sel) => {
+    $(sel)?.addEventListener('change', () => setLlmSourceMode(isLlmCustomSelected()));
+  });
+
   // 飞书测试发送按钮
   $('#btn-feishu-test').addEventListener('click', feishuTestHandler);
 
@@ -1179,6 +1223,9 @@ function bindEvents() {
       $('#stab-s-provider')?.classList.add('active');
       const apiKeyInput = $('#s-api-key');
       if (apiKeyInput) {
+        // 跟随系统时整块自定义配置是隐藏的，直接 focus 会聚焦到一个
+        // display:none 的输入框（无处可输入）。先翻到「使用我自己的模型」。
+        if (!isLlmCustomSelected()) setLlmSourceMode(true);
         apiKeyInput.focus();
         apiKeyInput.select();
       }
@@ -1235,17 +1282,29 @@ function bindEvents() {
 async function saveSettingsHandler() {
   try {
     const newTz = ($('#s-display-timezone')?.value || '').trim() || 'Asia/Shanghai';
+    // provider 段：跟随系统时**只提交开关本身**。
+    //
+    // 为什么不能无条件带上 model/base_url/api_key：`PUT /api/settings` 落库时
+    // 「只提交 body 里真正声明过的键」（见 routes_settings.put_settings），
+    // 把隐藏字段一并提交，就会把用户从没填过（或早已废弃）的旧值写进用户覆盖区。
+    // resolve 时它们会被 use_custom 门控丢弃，但覆盖区里留着一堆无效数据，
+    // 且用户切回「自带模型」时会冒出自己从没填过的值。
+    const useCustomLlm = isLlmCustomSelected();
+    const providerPatch = { use_custom: useCustomLlm };
+    if (useCustomLlm) {
+      providerPatch.base_url = $('#s-base-url').value;
+      providerPatch.model = $('#s-model').value;
+      // 掩码值（abcd****wxyz）照常回传：后端 _should_keep_existing 会识别并丢弃它，
+      // 真实凭据不被覆盖 —— 该保护机制不在这里也不该被绕过。
+      providerPatch.api_key = $('#s-api-key').value;
+      providerPatch.reasoning_effort = $('#s-reasoning-effort').value;
+      providerPatch.thinking = $('#s-thinking').checked;
+      providerPatch.max_output_tokens = parseInt($('#s-max-output-tokens').value) || 0;
+      // Phase I Task 19: context_window 在 AIProviderSettings
+      providerPatch.context_window = parseInt($('#s-context-window').value) || 2000000;
+    }
     await API.put('/api/settings', {
-      provider: {
-        base_url: $('#s-base-url').value,
-        model: $('#s-model').value,
-        api_key: $('#s-api-key').value,
-        reasoning_effort: $('#s-reasoning-effort').value,
-        thinking: $('#s-thinking').checked,
-        max_output_tokens: parseInt($('#s-max-output-tokens').value) || 0,
-        // Phase I Task 19: context_window 在 AIProviderSettings
-        context_window: parseInt($('#s-context-window').value) || 2000000,
-      },
+      provider: providerPatch,
       general: {
         refresh_interval_ms: parseInt($('#s-refresh-ms').value) || 1000,
         decision_stance: $('#s-decision-stance').value,

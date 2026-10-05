@@ -1,16 +1,67 @@
-"""Application context wiring shared resources without global singletons."""
+"""Application context wiring shared resources without global singletons.
+
+## ``ctx.settings`` 是「按请求解析」的，读写方式不变
+
+配置已按用户分层（系统兜底 ← 用户覆盖），但把它接进请求路径时有个硬约束：
+``ctx.settings`` 被**分析主流程、后台调度器、经验库结算**等大量**没有 request**
+的代码读取。若改成「路由里各自解析」，那些非请求路径就断了；若废掉
+``ctx.settings``，改动面会横跨半个仓库。
+
+因此本模块把「请求内 / 请求外」的差别**收敛到一个 ContextVar**：
+
+* :attr:`AppContext.settings` 读 → 请求内返回**本请求用户**解析出的配置；
+  请求外（后台线程、调度器、启动）返回**启动时的默认解析**。
+* 赋值 → 请求内只改本请求的副本（绝不污染全局默认，否则用户 A 读一次
+  ``GET /api/settings`` 就会把全局配置换成他自己的）；请求外改全局默认。
+
+**调用方一行都不用改**：135 处 ``ctx.settings`` 全部自动按用户取对值，
+也不需要每个路由手写一遍解析。绑定动作由 ``web/server.py`` 的中间件统一完成。
+
+ContextVar ��� :obj:`threading.local` 的区别在 asyncio 下是关键：每个请求
+是一个独立的 Task，ContextVar 随 Task 复制，**天然不会串**。
+"""
 from __future__ import annotations
 
 import logging
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Any
+
+#: 当前请求生效的配置。``None`` = 不在任何请求上下文中（后台线程/调度器/启动），
+#: 此时 :attr:`AppContext.settings` 退回启动时的默认解析。
+_request_settings: ContextVar[Any] = ContextVar("pa_agent_request_settings", default=None)
+
+
+def bind_request_settings(settings: Any) -> Token:
+    """把 *settings* 绑定为「当前请求生效配置」，返回用于还原的 Token。
+
+    由 Web 中间件在每个请求入口调用一次。返回 Token 而非无参还原，
+    是为了支持嵌套绑定（内层还原不会误伤外层）。
+    """
+    return _request_settings.set(settings)
+
+
+def reset_request_settings(token: Token) -> None:
+    """还原上一个绑定值。请求结束时必须调用，否则值会随 Task 泄漏。"""
+    try:
+        _request_settings.reset(token)
+    except ValueError:  # pragma: no cover - 跨 Context 还原（如在线程里 reset）
+        _request_settings.set(None)
+
+
+def current_request_settings() -> Any:
+    """当前请求生效的配置；不在请求上下文中时返回 ``None``。"""
+    return _request_settings.get()
 
 
 @dataclass(slots=True)
 class AppContext:
     """Carries shared resources to GUI widgets and orchestrators."""
 
-    settings: Any = None
+    #: 启动时的默认解析结果（无请求上下文时 ``settings`` 返回的就是它）。
+    #: **不是** ``settings`` 字段本身 —— 那个名字让给了下面的 property，
+    #: 否则 dataclass 生成的 ``__init__`` 会用字段覆盖掉 property。
+    _default_settings: Any = None
     logger: logging.Logger = field(default_factory=lambda: logging.getLogger("pa_agent"))
     event_bus: Any = None
 
@@ -28,6 +79,26 @@ class AppContext:
 
     # Web route shared state
     _last_record: Any = None      # Last completed AnalysisRecord (for chat followup)
+
+    @property
+    def settings(self) -> Any:
+        """生效配置。请求内按用户解析，请求外回落启动默认值。
+
+        读端语义见模块 docstring。**不要**把它改回普通字段 —— 那是本次改造
+        之前「所有用户共用一份配置」的根因。
+        """
+        scoped = _request_settings.get()
+        return scoped if scoped is not None else self._default_settings
+
+    @settings.setter
+    def settings(self, value: Any) -> None:
+        if _request_settings.get() is not None:
+            # 请求内：只换本请求的副本。写全局默认会造成**跨用户串配置** ——
+            # 用户 A 打开一次设置页，后台调度器就改用 A 的配置去跑结算。
+            _request_settings.set(value)
+        else:
+            self._default_settings = value
+
 
     @classmethod
     def bootstrap(cls) -> "AppContext":
@@ -52,6 +123,9 @@ class AppContext:
         from pa_agent.records.experience_reader import ExperienceReader
 
         # ── Settings ──────────────────────────────────────────────────────────
+        # 解析的是**启动时的默认用户**（``load_settings(user_id=None)``）。这是
+        # 非请求上下文（后台调度器 / 经验库结算 / 启动）唯一的配置来源；
+        # 请求路径由 Web 中间件按 ``current_user_id(request)`` 另行绑定。
         settings = load_settings(SETTINGS_JSON_PATH)
         from pa_agent.ai.qclaw_connector import sync_qclaw_agent_provider_on_load
         from pa_agent.ai.workbuddy_connector import sync_workbuddy_provider_on_load
@@ -145,7 +219,7 @@ class AppContext:
         )
 
         return cls(
-            settings=settings,
+            _default_settings=settings,
             logger=app_logger,
             event_bus=event_bus,
             data_source=data_source,

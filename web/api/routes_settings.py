@@ -98,12 +98,23 @@ def _apply_session_cursor(payload: dict, ctx, request: Request) -> None:
 async def get_settings(request: Request):
     """Return current settings with every credential masked.
 
+    ## 按请求返回
+
+    传入 ``user_id=current_user_id(request)``，因此每个登录用户看到的是
+    **自己**那份（系统兜底 ← 本人覆盖）。绝不能把 A 的覆盖回显给 B：
+    那等于把 A 的 base_url / 通知凭证发到 B 的浏览器。
+
     ``general`` 段的游标字段（symbol/timeframe/exchange）返回的是**本会话游标**
     而非全局值，见 :func:`_apply_session_cursor`。
     """
     ctx = request.app.state.ctx
-    settings = await asyncio.to_thread(load_settings, SETTINGS_JSON_PATH)
-    ctx.settings = settings  # sync live reference
+    from web.api.auth_ctx import current_user_id
+
+    user_id = current_user_id(request)
+    settings = await asyncio.to_thread(load_settings, SETTINGS_JSON_PATH, user_id=user_id)
+    # 同步本请求的活引用：``ctx.settings`` 是 property，赋值只换**本请求**那份
+    # （见 AppContext.settings 的 setter），不会把全局默认换成当前用户的配置。
+    ctx.settings = settings
     # 每次载入都刷新脱敏注册表：换密钥后旧值失效、新值生效，
     # 否则新密钥会以明文写进 records/pending/*.json。
     register_settings_secrets(settings)
@@ -156,6 +167,11 @@ async def put_settings(request: Request, body: dict):
     **读不到那份文件**，用户会看到「保存成功」然后配置回到旧值。
     """
     ctx = request.app.state.ctx
+    from web.api.auth_ctx import current_user_id
+
+    # 写进**本请求用户**的覆盖区。不传 user_id 会落到 default_user_id()（admin），
+    # 于是 B 的保存会写进 A 的配置区 —— 多用户下这是最典型的静默串号。
+    user_id = current_user_id(request)
     current = ctx.settings
     masked_key_dropped = False
     # 先快照原值再统一提交：整段赋值是一体的，某个字段校验失败时无法只回滚
@@ -210,7 +226,7 @@ async def put_settings(request: Request, body: dict):
     # 一旦 DB 被清空、baseline 重新从它播种，用户的历史修改就被当成出厂默认
     # 固化成所有用户继承的基线。想把当前配置定为新出厂默认，请显式调
     # POST /api/settings/promote-default。
-    db_persisted = await asyncio.to_thread(persist_patch, patch)
+    db_persisted = await asyncio.to_thread(persist_patch, patch, user_id=user_id)
     if not db_persisted:
         logger.error(
             "settings 未进入用户配置区（仅存于进程内存，重启会丢）：%s",
@@ -331,9 +347,14 @@ async def promote_settings_to_default(request: Request, body: dict | None = None
     current = ctx.settings.model_dump(mode="json")
 
     from pa_agent.storage.settings_store import promote_to_baseline
+    from web.api.auth_ctx import current_user_id
+
+    # 传实际发起者：清的是「本次操作者」的覆盖区。传空会退化成清 admin 的 ——
+    # 单机下两者恒等，多用户下会让发起者自己的覆盖继续遮蔽新的出厂默认。
+    user_id = current_user_id(request)
 
     try:
-        promoted = await asyncio.to_thread(promote_to_baseline, current)
+        promoted = await asyncio.to_thread(promote_to_baseline, current, user_id)
     except Exception as exc:  # noqa: BLE001
         logger.exception("promote_to_baseline failed")
         raise HTTPException(status_code=500, detail=f"提升失败：{exc}") from exc

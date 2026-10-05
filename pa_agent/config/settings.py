@@ -251,7 +251,10 @@ def provider_api_key_configured(settings: Settings | None) -> bool:
 import json
 import logging
 import os
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -347,7 +350,7 @@ def _repair_file_side(raw: dict, path: Path) -> bool:
     return dirty
 
 
-def load_settings(path: Path | None = None) -> "Settings":
+def load_settings(path: Path | None = None, *, user_id: str | None = None) -> "Settings":
     """Load settings from *path* (default: SETTINGS_JSON_PATH).
 
     Returns default Settings and writes them to disk if the file is absent.
@@ -360,6 +363,13 @@ def load_settings(path: Path | None = None) -> "Settings":
 
     只对默认路径启用 DB 层：``path != SETTINGS_JSON_PATH`` 说明调用方要的是
     隔离的文件（测试用临时路径），此时不得碰真实 DB，否则测试会互相污染。
+
+    ## ``user_id``：按请求解析
+
+    ``user_id=None`` 保留原语义 —— 走 :func:`~pa_agent.storage.users.default_user_id`
+    （启动时的默认解析），供**无请求上下文**的后台线程 / 调度器 / CLI 使用。
+    请求路径必须显式传入 :func:`web.api.auth_ctx.current_user_id` 的结果，
+    否则所有登录用户会共用同一份配置（这正是本参数存在的原因）。
     """
     from pa_agent.config.paths import SETTINGS_JSON_PATH
 
@@ -367,47 +377,163 @@ def load_settings(path: Path | None = None) -> "Settings":
     path = path or SETTINGS_JSON_PATH
 
     if using_real:
-        override = _try_load_from_db()
+        override = _try_load_from_db(user_id=user_id)
         if override is not None:
             return override
 
     return _load_settings_from_file(path)
 
 
-def _try_load_from_db() -> "Settings | None":
+def _try_load_from_db(user_id: str | None = None) -> "Settings | None":
     """按级联解析有效配置：系统兜底 ← 用户覆盖（文件仅作首次播种与灾备兜底）。
 
     返回 None 表示 DB 与文件都没有配置，调用方回退纯文件逻辑。
     任何异常都吞掉并返回 None —— 索引层故障绝不能阻断启动。
+
+    走 :func:`~pa_agent.storage.settings_store.resolve_cached` 而非裸
+    ``resolve()``：请求路径每个 HTTP 请求都会调到这里，裸 resolve 的两次 DB 读
+    加上 settings.json 的文件读会让 5 秒一次的 ``/api/bars`` 轮询明显变慢。
     """
     try:
         from pa_agent.config.paths import SETTINGS_JSON_PATH
-        from pa_agent.storage.settings_store import resolve
+        from pa_agent.storage.settings_store import resolve_cached
         from pa_agent.storage.users import default_user_id
 
-        file_fallback = None
-        try:
-            if SETTINGS_JSON_PATH.exists():
-                raw = json.loads(SETTINGS_JSON_PATH.read_text(encoding="utf-8"))
-                if isinstance(raw, dict):
-                    # **legacy 迁移必须先于播种**（B2）。曾把 raw 原样交给 resolve()
-                    # → save_baseline()，旧字段名被直接固化成系统兜底，且此后
-                    # 每次启动都读它 —— 迁移段被完整绕过。
-                    file_fallback = normalize_raw(raw)
-                    _repair_file_side(file_fallback, SETTINGS_JSON_PATH)
-        except (json.JSONDecodeError, OSError):
-            file_fallback = None
-        except Exception as exc:  # noqa: BLE001 - 迁移失败退回纯文件路径，不阻断启动
-            logger.warning("settings.json legacy 迁移失败，退回纯文件路径: %s", exc)
-            file_fallback = None
+        uid = user_id or default_user_id()
 
-        data = resolve(default_user_id(), file_fallback)
+        def _file_fallback() -> dict | None:
+            """惰性读播种源 —— 缓存命中时**一次文件 IO 都不发生**。"""
+            try:
+                if not SETTINGS_JSON_PATH.exists():
+                    return None
+                raw = json.loads(SETTINGS_JSON_PATH.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    return None
+                # **legacy 迁移必须先于播种**（B2）。曾把 raw 原样交给 resolve()
+                # → save_baseline()，旧字段名被直接固化成系统兜底，且此后
+                # 每次启动都读它 —— 迁移段被完整绕过。
+                out = normalize_raw(raw)
+                _repair_file_side(out, SETTINGS_JSON_PATH)
+                return out
+            except (json.JSONDecodeError, OSError):
+                return None
+            except Exception as exc:  # noqa: BLE001 - 迁移失败退回纯文件路径，不阻断启动
+                logger.warning("settings.json legacy 迁移失败，退回纯文件路径: %s", exc)
+                return None
+
+        data = resolve_cached(uid, _file_fallback)
         if data is None:
             return None
         return Settings.model_validate(data)
     except Exception as exc:  # noqa: BLE001
         logger.warning("DB-backed settings load failed, using file: %s", exc)
         return None
+
+
+#: user_id -> (代数, 时刻, **已盖过 .env** 的配置 dict)
+#:
+#: 为什么要单独一层：``apply_env_overrides`` 实测 ~41µs/次（15 个字段的 setattr
+#: 加上每次都重新 stat/读 ``.env``），比 ``Settings.model_validate`` 还贵。把它留在
+#: 每请求路径上会让「按请求解析」比改造前的 ``load_settings()`` **更慢**（实测
+#: 0.107ms vs 0.051ms）—— 配置变按请求解析是**性能倒退**。
+#:
+#: 环境变量在进程生命周期内是常量，因此「盖一次、缓存结果」与「每次盖一遍」
+#: 语义完全等价，却把热路径压回 ~32µs（低于改造前）。
+#:
+#: 缓存的仍是 dict 而非 ``Settings``：``PUT /api/settings`` 会就地 ``setattr``
+#: 改字段，共享实例必然导致「A 改完 B 跟着变」。每次 ``model_validate`` 出一份
+#: 独立实例，别名问题从根上不存在。
+_EFFECTIVE_CACHE: dict[str, tuple[int, str, float, dict[str, Any]]] = {}
+_EFFECTIVE_LOCK = threading.Lock()
+
+
+def _effective_cache_get(user_id: str) -> dict[str, Any] | None:
+    """命中返回「已盖 .env 的配置 dict」；代数/库/TTL 任一不符即重算。
+
+    返回 None 永远是「正常未命中」，**不是错误**。注意本函数**绝不抛异常**：
+    缓存是纯优化，它坏掉只能让请求变慢，绝不能变成 500。
+    """
+    try:
+        from pa_agent.storage.settings_store import (
+            _CACHE_TTL_S,
+            hub_token,
+            settings_generation,
+        )
+
+        token = hub_token()
+        with _EFFECTIVE_LOCK:
+            entry = _EFFECTIVE_CACHE.get(user_id)
+            if entry is None:
+                return None
+            generation, hub, stamp, data = entry
+            if generation != settings_generation() or hub != token:
+                _EFFECTIVE_CACHE.clear()   # 代数推进或换了库：整份作废
+                return None
+            if (time.monotonic() - stamp) > _CACHE_TTL_S:
+                _EFFECTIVE_CACHE.clear()
+                return None
+            return data
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("生效配置缓存读取失败，本次按未命中处理: %s", exc)
+        return None
+
+
+def _effective_cache_put(user_id: str, data: dict[str, Any]) -> None:
+    try:
+        from pa_agent.storage.settings_store import hub_token, settings_generation
+
+        with _EFFECTIVE_LOCK:
+            _EFFECTIVE_CACHE[user_id] = (
+                settings_generation(), hub_token(), time.monotonic(), data,
+            )
+    except Exception as exc:  # noqa: BLE001
+        # **warning 而非 debug**：本函数静默失败过一次（局部 import 遮蔽了模块
+        # 全局名，NameError 被 try/except 吃掉），表现为「每请求都重算」——
+        # 功能全对、热路径慢 3 倍，且没有任何报错。缓存写失败必须看得见。
+        logger.warning("生效配置写入缓存失败（请求仍正确，但会变慢）: %s", exc)
+
+
+def resolve_effective_settings(user_id: str) -> "Settings":
+    """按 *user_id* 解析**本次请求生效**的完整配置（含 .env 覆盖）。
+
+    这是请求路径上「这个用户此刻该用什么配置」的唯一答案，由
+    ``web/server.py`` 的中间件调用一次并绑定进 ContextVar。相对裸
+    :func:`load_settings` 多做两件事，二者都不可省：
+
+    1. **按 user_id 解析级联**（系统兜底 ← 本人覆盖）—— 否则所有登录用户
+       共用同一份配置。
+    2. **``apply_env_overrides``** —— 启动时 ``AppContext.bootstrap()`` 会对
+       配置就地盖一遍 .env（API_KEY / BASE_URL 等）。若请求路径不盖，
+       默认用户拿得到凭证、其他用户拿到的却是空 api_key，同一份配置出现两种
+       形态。函数幂等（只覆盖「环境变量确实设置了」的字段）。
+
+    **每次返回独立实例**：见 :data:`_EFFECTIVE_CACHE` 的说明。
+
+    解析失败时回落到纯文件 / 代码默认值，保证配置层故障时请求仍能拿到一份可用
+    配置 —— 与 :func:`resolve` 的降级方向一致。任何异常都不外抛。
+    """
+    from pa_agent.config.env_loader import apply_env_overrides
+    from pa_agent.config.paths import SETTINGS_JSON_PATH
+
+    hit = _effective_cache_get(user_id)
+    if hit is not None:
+        return Settings.model_validate(hit)
+
+    try:
+        settings = _try_load_from_db(user_id=user_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("按用户解析配置失败: %s", exc)
+        settings = None
+    if settings is None:
+        # DB 与播种源都没有配置 → 纯文件 / 代码默认值
+        try:
+            settings = _load_settings_from_file(SETTINGS_JSON_PATH)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("settings.json 回落读取失败，改用代码默认值: %s", exc)
+            settings = Settings()
+    apply_env_overrides(settings)
+    _effective_cache_put(user_id, settings.model_dump())
+    return settings
 
 
 def _load_settings_from_file(path: Path) -> "Settings":

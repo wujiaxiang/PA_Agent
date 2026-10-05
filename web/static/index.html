@@ -9,7 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="/css/style.css?v=39">
+<link rel="stylesheet" href="/css/style.css?v=41">
 </head>
 <body>
 
@@ -528,21 +528,42 @@
     </div>
     <form id="settings-form">
       <div id="stab-s-provider" class="stab-panel active">
-        <label>接口地址（Base URL） <input id="s-base-url" type="text"></label>
-        <label>模型名（Model） <input id="s-model" type="text"></label>
-        <label>API 密钥（API Key） <input id="s-api-key" type="password"></label>
-        <label>思考深度（Reasoning Effort）
-          <select id="s-reasoning-effort">
-            <option value="low">低</option>
-            <option value="medium">中</option>
-            <option value="high" selected>高</option>
-            <option value="max">最高</option>
-          </select>
-        </label>
-        <label class="checkbox-label">
-          <input id="s-thinking" type="checkbox" checked> 扩展思考（Thinking）
-        </label>
-        <label>最大输出 Token 数（Max Output Tokens） <input id="s-max-output-tokens" type="number" min="0" placeholder="0 = 自动"></label>
+        <!-- 模型来源总开关（provider.use_custom）。放在所有 provider 字段**上方**：
+             后端在关闭时整段忽略用户的 provider 覆盖，因此它是下面那组字段的总闸。
+             用 radio 而非 checkbox：二选一语义必须一眼可辨，checkbox 的「勾上=哪个」
+             要靠记忆，且不存在「未表达偏好」的第三态。 -->
+        <fieldset class="settings-fieldset llm-source">
+          <legend>模型来源</legend>
+          <label class="checkbox-label">
+            <input type="radio" name="s-llm-source" id="s-llm-source-system" value="false" checked> 使用系统默认模型
+          </label>
+          <label class="checkbox-label">
+            <input type="radio" name="s-llm-source" id="s-llm-source-custom" value="true"> 使用我自己的模型
+          </label>
+          <p id="s-llm-source-hint" class="muted-text llm-source-hint">模型与接口全部来自系统出厂配置，下面的配置项不会生效。</p>
+        </fieldset>
+        <!-- 跟随系统时整块 hidden（不是 disabled）：不参与计算的字段不必出现在界面上 -->
+        <fieldset id="s-llm-custom-fields" class="settings-fieldset hidden">
+          <legend>自定义模型配置</legend>
+          <label>接口地址（Base URL） <input id="s-base-url" type="text"></label>
+          <label>模型名（Model） <input id="s-model" type="text"></label>
+          <label>API 密钥（API Key） <input id="s-api-key" type="password"></label>
+          <label>思考深度（Reasoning Effort）
+            <select id="s-reasoning-effort">
+              <option value="low">低</option>
+              <option value="medium">中</option>
+              <option value="high" selected>高</option>
+              <option value="max">最高</option>
+            </select>
+          </label>
+          <label class="checkbox-label">
+            <input id="s-thinking" type="checkbox" checked> 扩展思考（Thinking）
+          </label>
+          <label>最大输出 Token 数（Max Output Tokens） <input id="s-max-output-tokens" type="number" min="0" placeholder="0 = 自动"></label>
+          <!-- 原在「通用」tab，但后端归属 provider：跟随系统时会被门控整段丢弃，
+               留在通用组里会让人以为改了却生效。跟随系统时用系统模型的窗口。 -->
+          <label>上下文窗口大小（Context Window） <input id="s-context-window" type="number" min="1000" value="2000000"></label>
+        </fieldset>
         <fieldset class="settings-fieldset">
           <legend>TradingView 凭证（选填）</legend>
           <p class="muted-text" style="font-size:12px;margin:0 0 6px;">
@@ -616,7 +637,6 @@
           <label>实时窗口字号（Stream Font Size, pt） <input id="s-stream-font-size" type="number" min="8" max="28" value="11"></label>
           <label>图表 K 线序号字号（Chart Seq Font Size, pt） <input id="s-chart-seq-font-size" type="number" min="6" max="24" value="11"></label>
           <label>上下文警告阈值（Context Warning Threshold, %） <input id="s-ctx-warn" type="number" value="80"></label>
-          <label>上下文窗口大小（Context Window） <input id="s-context-window" type="number" min="1000" value="2000000"></label>
         </fieldset>
         <!-- 决策树组 -->
         <fieldset class="settings-fieldset">
@@ -696,6 +716,6 @@
 <script src="/js/chart.js?v=9"></script>
 <script src="/js/indicators.js?v=5"></script>
 <script src="/js/continuous_gate.js?v=2"></script>
-<script src="/js/app.js?v=64"></script>
+<script src="/js/app.js?v=66"></script>
 </body>
 </html>

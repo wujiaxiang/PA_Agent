@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+import threading
+import time
+from typing import Any, Callable
 
 from pa_agent.storage.db import get_hub, now
 
@@ -26,6 +28,105 @@ logger = logging.getLogger("pa_agent.storage.settings")
 #: 整份配置在 global_config / user_prefs 里的键名。
 _BASELINE_KEY = "settings.baseline"
 _OVERRIDE_KEY = "settings.overrides"
+
+
+# ── 解析结果缓存（按用户） ───────────────────────────────────────────────────
+#
+# 为什么需要：``resolve()`` 每次要读两次 DB（baseline + 本用户的 overrides）。
+# 配置已「按请求解析」之后，**每个 HTTP 请求都会走一次** —— 而 ``/api/bars`` 是
+# 前端每 5 秒一次的轮询，热路径上多两次 SQLite 往返是不能接受的。
+#
+# 缓存的是 **resolve() 的 dict 结果**，不是 ``Settings`` 对象。原因是
+# ``PUT /api/settings`` 会**就地** ``setattr`` 改 ``ctx.settings`` 的字段；若把
+# ``Settings`` 实例本身缓存下来并共享给多个请求，一次保存就会把改后的值喂给
+# 别的用户（跨用户串配置，且没有任何报错）。缓存 dict、每个请求各自
+# ``model_validate`` 出一份独立实例，既没有别名问题，也足够快（~34µs）。
+#
+# 失效策略见 :data:`_CACHE_TTL_S` 与 :func:`_bump_generation`。
+
+#: 兜底 TTL（秒）。**不是**主失效手段 —— 主手段是 :func:`_bump_generation`
+#: 触发的代数失效（写配置即刻生效，不等 TTL）。TTL 只兜「绕过本模块直接改
+#: SQLite」或「另一个进程改同一个 DB 文件」这两种本进程看不见的写入。
+_CACHE_TTL_S = 30.0
+
+#: user_id -> (代数, 库标识, 写入时刻 monotonic, resolve() 的结果 dict)
+_CACHE: dict[str, tuple[int, str, float, dict[str, Any]]] = {}
+
+#: 任何配置写入都自增；缓存条目代数对不上即视为失效。
+_GENERATION = 0
+
+#: 同时保护 _CACHE 与 _GENERATION。resolve() 可能被 ``asyncio.to_thread``
+#: 的线程池与后台结算线程并发调用，不是假想的竞争。
+_CACHE_LOCK = threading.Lock()
+
+
+def settings_generation() -> int:
+    """当前配置代数。缓存条目与它不一致即失效。"""
+    with _CACHE_LOCK:
+        return _GENERATION
+
+
+def hub_token() -> str:
+    """标识「当前正在读哪个库」。换库 ⇒ 缓存必失效。
+
+    **为什么不能只看代数**：``reset_hub_for_tests()`` 会把 hub 指向另一个 DB 文件，
+    但**不会**碰代数（db 层无从知道配置层有缓存）。于是「上一个测试写进 tmp 库的
+    覆盖」会被下一个测试读到 —— 断言照样绿，验的却不是它声称的东西。这正是
+    经验库切库那轮踩过的测试隔离坑。
+
+    用 ``getattr`` 取私有 ``_path`` 而非 ``stats()``：后者每次会 ``stat()`` 一次
+    文件，放在每请求路径上又变成一次 IO。取不到时退化为空串（此时按失效处理）。
+    """
+    try:
+        return str(getattr(get_hub(), "_path", "") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _bump_generation() -> None:
+    """配置已写入 → 整份缓存作废。
+
+    **整份作废而不是只清目标用户**：一次「保存设置」会同时改动系统兜底与覆盖层，
+    且可能通过 ``promote_to_baseline`` 影响所有人。只清一个 key 必然留下
+    「A 改了出厂默认，B 还在用旧基线」这种陈旧项。配置写入是人工点击级别的低频
+    操作，全量作废的代价可以忽略；而它**结构性地**杜绝了跨用户陈旧读。
+    """
+    global _GENERATION
+    with _CACHE_LOCK:
+        _GENERATION += 1
+        _CACHE.clear()
+
+
+def invalidate_settings_cache() -> None:
+    """强制重新解析（对外暴露，供测试与「配置被外部改动」后主动调用）。"""
+    _bump_generation()
+
+
+def _cache_get(user_id: str) -> dict[str, Any] | None:
+    """命中返回 resolve() 的结果 dict；未命中/过期/代数或库不符返回 None。
+
+    **不缓存 ``None``**：``resolve()`` 返回 None 表示「DB 读失败」或「库里没配置」，
+    那是**瞬时**状态（DB 恢复 / 播种完成后就不成立了）。缓存它会把一次临时故障
+    固化成整个 TTL 的「读不到配置」。
+    """
+    token = hub_token()
+    with _CACHE_LOCK:
+        entry = _CACHE.get(user_id)
+        if entry is None:
+            return None
+        generation, hub, stamp, data = entry
+        if generation != _GENERATION or hub != token:
+            _CACHE.clear()   # 代数推进或换了库：整份作废，顺带回收旧条目
+            return None
+        if (time.monotonic() - stamp) > _CACHE_TTL_S:
+            _CACHE.pop(user_id, None)
+            return None
+        return data
+
+
+def _cache_put(user_id: str, data: dict[str, Any]) -> None:
+    with _CACHE_LOCK:
+        _CACHE[user_id] = (_GENERATION, hub_token(), time.monotonic(), data)
 
 
 def deep_merge(base: dict, patch: dict) -> dict:
@@ -95,7 +196,7 @@ def load_baseline() -> dict[str, Any] | None:
 def save_baseline(data: dict[str, Any]) -> bool:
     if get_hub().disabled:
         return False
-    return get_hub().execute(
+    ok = get_hub().execute(
         """
         INSERT INTO global_config (key, value_json, updated_at) VALUES (?,?,?)
         ON CONFLICT(key) DO UPDATE SET
@@ -103,6 +204,9 @@ def save_baseline(data: dict[str, Any]) -> bool:
         """,
         (_BASELINE_KEY, json.dumps(data, ensure_ascii=False), now()),
     )
+    if ok:
+        _bump_generation()
+    return ok
 
 
 # ── 用户覆盖（user_prefs，稀疏） ────────────────────────────────────────────
@@ -124,6 +228,9 @@ def save_overrides(patch: dict[str, Any], user_id: str) -> bool:
 
     整体替换而非合并：PATCH /api/settings 的语义是「这份 body 就是我想要的
     覆盖层」，合并会让已删除的字段复活。
+
+    写成功后立即作废解析缓存：用户保存配置必须**下一次请求就生效**，
+    不允许等 TTL 过期。
     """
     if get_hub().disabled:
         return False
@@ -137,14 +244,19 @@ def save_overrides(patch: dict[str, Any], user_id: str) -> bool:
     )
     if not ok:
         logger.warning("save settings overrides failed; file copy still holds the value")
+    else:
+        _bump_generation()
     return ok
 
 
 def clear_overrides(user_id: str) -> bool:
     """Reset to pure system defaults. 「恢复默认」按钮的落点。"""
-    return get_hub().execute(
+    ok = get_hub().execute(
         "DELETE FROM user_prefs WHERE user_id = ? AND key = ?", (user_id, _OVERRIDE_KEY)
     )
+    if ok:
+        _bump_generation()
+    return ok
 
 
 def _parse(row) -> dict[str, Any] | None:
@@ -185,6 +297,34 @@ def resolve(user_id: str, file_fallback: dict[str, Any] | None = None) -> dict |
     if baseline is None:
         return None
     return deep_merge(baseline, _apply_llm_source(baseline, load_overrides(user_id)))
+
+
+def resolve_cached(
+    user_id: str,
+    file_fallback: Callable[[], dict[str, Any] | None] | dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """:func:`resolve` 的缓存包装 —— **按用户**解析热路径的入口。
+
+    语义与 :func:`resolve` **逐条相同**（含播种、读失败拒绝播种、``use_custom``
+    门控）；差别只在于结果被缓存到下一次写入为止。
+
+    ``file_fallback`` 可以传**可调用对象**：只有缓存未命中时才会被调用。
+    这不是微优化 —— 命中时读 ``settings.json`` 意味着一次文件读 + JSON 解析 +
+    ``normalize_raw``，那才是热路径上真正贵的一环（``/api/bars`` 每 5 秒一次）。
+    传 dict 则退化为与 :func:`resolve` 相同的立即求值语义。
+
+    返回 None **不进缓存**：那是「读失败 / 库里没配置」的瞬时状态。
+    """
+    hit = _cache_get(user_id)
+    if hit is not None:
+        return hit
+
+    fallback = file_fallback() if callable(file_fallback) else file_fallback
+    data = resolve(user_id, fallback)
+    if data is None:
+        return None
+    _cache_put(user_id, data)
+    return data
 
 
 #: 用户关闭「自带模型」时，其 provider 覆盖里这些键一律作废。
@@ -267,7 +407,7 @@ def reset_to_system_defaults(user_id: str) -> bool:
     """丢弃该用户的全部覆盖，回到纯系统配置（「恢复默认」）。"""
     return clear_overrides(user_id)
 
-def promote_to_baseline(current: dict[str, Any]) -> bool:
+def promote_to_baseline(current: dict[str, Any], user_id: str | None = None) -> bool:
     """把 *current* 提升为系统出厂默认，并同步播种源 ``settings.json``。
 
     与 :func:`apply_user_change` 的区别是**层级**：后者写用户覆盖区（只影响本人），
@@ -277,9 +417,14 @@ def promote_to_baseline(current: dict[str, Any]) -> bool:
     - 只写 baseline → 空库重播种时拿不到，仍会是旧的出厂配置
     - 只写 settings.json → 当前进程读的是 DB，用户看到的仍是旧基线
 
-    同时**清掉本用户覆盖区**：已成出厂默认的字段留在覆盖区里会永久遮蔽后续的
+    同时**清掉本次操作者的覆盖区**：已成出厂默认的字段留在覆盖区里会永久遮蔽后续的
     系统更新（用户再也不会收到默认值变更）。函数接受任意 current，但调用方
     约定传「已合并覆盖后的生效配置」。
+
+    ``user_id`` 默认为 :func:`~pa_agent.storage.users.default_user_id`（保持既有
+    行为不变）。**请求路径必须传实际发起者**：全局只有「本人覆盖 vs admin 覆盖」
+    之分，清错人会让发起者自己的覆盖继续遮蔽新出厂默认 —— 这在单机 admin 时代
+    不显形（两者恒等），多用户下必现。
     """
     hub = get_hub()
     if hub.read_failed:
@@ -308,5 +453,5 @@ def promote_to_baseline(current: dict[str, Any]) -> bool:
 
     from pa_agent.storage.users import default_user_id
 
-    clear_overrides(default_user_id())
+    clear_overrides(user_id or default_user_id())
     return True
