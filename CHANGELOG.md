@@ -4,7 +4,83 @@
 
 ---
 
+## 2026-10-06
+
+### 11. 鉴权从占位变成真能用（登录 / 登出 / 身份 + 强制鉴权开关翻 False）
+
+- **目标**：`ALLOW_ANONYMOUS_ADMIN` 一直是 `True`，且**全仓没有任何代码读它**
+  —— 「翻转即强制鉴权」只是一句 docstring 里的承诺。本轮把承诺兑现：
+  新增 4 个端点 + 一个最外层中间件，并把开关翻成 `False`
+- **改动**：
+  - `web/api/routes_auth.py`（新）：`POST /api/auth/login`（免鉴权）、
+    `POST /api/auth/logout`、`GET /api/auth/me`、
+    `POST /api/auth/password`（改密，需当前口令，新口令 ≥8 位）
+  - `web/api/auth_ctx.py`：`ALLOW_ANONYMOUS_ADMIN` → **`False`**；
+    新增 `PUBLIC_API_PATHS` 免鉴权白名单（**只有两条**，逐条带理由）、
+    `enforce_auth_middleware`、进程内令牌吊销表、`login_token_ttl_s()`
+  - `web/server.py`：挂上鉴权中间件（**注册在最外层**）与 auth 路由；
+    `GET /api/health` 改为**匿名降级**；CORS 中间件挪到**最外层**且
+    `allow_headers` 补上 `Authorization`
+  - `pa_agent/storage/users.py`：`authenticate()` 两处加固（见下）
+  - `tests/unit/test_auth_routes.py`（新，45 条）
+- **根因（顺手修掉的两个真问题）**：
+  1. **`authenticate("", <admin 口令>)` 会登录成功并返回 `admin`** ——
+     `get_user("")` 因 `user_id or ADMIN_USER_ID` 返回 admin 行。前端用户名
+     空着、口令被密码管理器自动填上时，会静默以 admin 身份登进去
+  2. **「抹平时序差异」是一条空承诺** —— 未知用户走
+     `verify_password(pw, "")`，在 `.split("$", 3)` 处就 ValueError 返回
+     False，**一次 PBKDF2 都不跑**。「用户不存在 <1ms」而「口令错 240k 轮」
+     比原文的侧信道更明显，且对**没有账号的人**同样有效。改为对格式完好的
+     诱饵散列跑完整 PBKDF2（进程内懒生成一次）
+- **放行清单（逐条带理由）**：非 `/api` 路径（登录页本身，结构性保证）、
+  OPTIONS 预检（按规范不带 `Authorization`，放行不可能泄露）、
+  `/api/auth/login`（不放行就是死锁）、`/api/health`（探针不带令牌会被编排
+  系统判不健康并反复重启；**放行但降级** —— 匿名时不再返回
+  `storage.default_user` 与 `storage.users`，否则等于白送一个用户名枚举口）
+- **TTL = 7 天**（不用占位层的 30 天）：令牌落 `localStorage`，拿到它等于
+  拿到本机全部权限。`PA_AGENT_TOKEN_TTL_S` 可覆盖，越界即回落默认
+- **已知边界（刻意不做）**：吊销表在进程内，**重启后失效**；改密无法吊销
+  「同一用户的其它令牌」。两者都要持久化存储才能解决，本轮不引入
+- **文件**：`web/api/routes_auth.py`、`web/api/auth_ctx.py`、`web/server.py`、
+  `pa_agent/storage/users.py`、`tests/unit/test_auth_routes.py`
+
+---
+
 ## 2026-10-05
+
+### 10. 复盘改为混合：程序层必做 + LLM 层可选
+
+- **问题**：上一轮声称「复盘结论真正进提示词」—— **实测是错的**。
+  `_persist_review` 从未传 `verdict` / `reusable_criteria`，两列恒为空串，
+  渲染层 `if crit or verdict` 恒为假，**复盘静默地从未进入任何提示词，且无
+  任何报错**。上一轮的测试之所以绿，是因为它直接调 `attach_review(...,
+  verdict=...)` —— 那条分支只有测试会走
+- **根因反思**：把持久化与渲染分开写、各自测，却没有一条**走完整生产链路**
+  的用例。反向验证时删的也是渲染块，验证的是「渲染代码存在」而非「生产会
+  调用它」
+- **改动**：
+  - `review_program.build_program_review()`：结算时自动生成的结构化摘要
+    （MFE / MAE / 触及时机 / 实际盈亏比 / 闭词表 verdict），零成本、不调模型、
+    **可断言**
+  - `writer.resolve_exit()`：从 `evaluate_outcome` 抽出，附带出场点信息。
+    MFE/MAE **只统计到出场那根为止** —— 拿入场后全部 K 线算会把出场后的行情
+    算进这笔单头，运气成分完全失真
+  - `loss 且 MFE>0` 判为「判断成立但运气不佳」：曾浮盈过说明方向未必错，
+    问题在 TP/SL 间距
+  - `review_spec.parse_review()`：LLM 复盘按五小节规格解析，**解析失败显式
+    失败**（verdict 留空 + warning），绝不把自由文本当判据
+  - `experience_reviews` 增 `source` 列（program / llm）；取用排序为
+    「verdict 非空 → llm 优先 → 新的优先」—— 少第一条时，解析失败的 LLM 版
+    会把程序版整个遮住
+  - 渲染改为**只注入结构化字段且逐字段封顶**（verdict 40 / criteria 300），
+    **不注入 content 全文**（那是给人读的 Markdown，含「忽略上述指令」即
+    注入面）
+  - 补 `schema.MIGRATIONS` 的 ALTER：`CREATE TABLE IF NOT EXISTS` 对已存在的
+    表**完全无效**，漏了这条时 INSERT 报 "no column named source" 被
+    `db.execute` 当 transient 吞掉 —— 结算照常成功、复盘一条没写，只留 warning
+- **测试**：新增 `test_review_program.py`（12 例）、`test_review_hybrid.py`
+  （8 例），**全部走生产路径**；逐条反向验证确认能变红
+- **回归**：新增失败 0、新增 error 0（唯一新增项是他人未提交的前端版本号）
 
 ### 9. 分析记录读端只查库 —— 补上一个用户隔离漏洞
 

@@ -105,9 +105,40 @@ pip install openai  # 若报 RuntimeError: openai package is not installed
 python -m uvicorn web.server:app --host 0.0.0.0 --port 8000
 
 # 4. 验证（启动健康检查 + 配置）
-curl http://localhost:8000/api/health/check
-curl http://localhost:8000/api/settings
+# /api/health 与静态资源免鉴权；其余 /api 需先登录换令牌
+curl http://localhost:8000/api/health          # 匿名可访问
+TOKEN=$(curl -s -XPOST http://localhost:8000/api/auth/login \
+          -H 'Content-Type: application/json' \
+          -d '{"user_id":"admin","password":"<你的口令>"}' | jq -r .token)
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/settings
 ```
+
+#### 登录鉴权（Web 后端，2026-10-06 起强制）
+
+- **所有 `/api/**` 都要求** `Authorization: Bearer <token>`，唯二例外是
+  `POST /api/auth/login`（不放行就是死锁）与 `GET /api/health`（liveness 探针
+  默认不带令牌，否则编排系统会判定容器不健康并反复重启；该端点匿名时**降级**，
+  不返回用户名与用户清单）。静态资源与 `/docs` 始终可访问 —— 浏览器得先拿到
+  页面才谈得上渲染登录框。
+- 登录：`POST /api/auth/login`，body `{"user_id": "admin", "password": "..."}`
+  （字段名是 `user_id`，**不是** `username`）。令牌存 `localStorage`。
+- **口令必须先播种**，否则谁都登不进去（启动日志会打一条红色 ERROR 提醒）：
+
+  ```bash
+  .venv/bin/python -c "from pa_agent.storage.db import initialize_storage; \
+    initialize_storage(); from pa_agent.storage.users import set_password; \
+    set_password('admin', '<新口令>')"
+  ```
+
+- 令牌有效期 **7 天**，`PA_AGENT_TOKEN_TTL_S` 可覆盖。过期 / 被登出后前端会
+  收到 401 —— 前端应立刻清掉本地令牌并回登录页，**不要自动重试**。
+- 改密：`POST /api/auth/password`，body
+  `{"current_password": "...", "new_password": "..."}`（新口令 ≥8 位）。
+  ⚠️ **改密不会吊销已签发的其它令牌**，它们在剩余 TTL 内仍有效 —— 改完口令后
+  应把 `PA_AGENT_TOKEN_TTL_S` 调小或等待其到期。
+- 生产部署**务必**用 `PA_AGENT_TOKEN_SECRET` 注入密钥。未设置时密钥落盘到
+  `config/token_secret`，多实例各持不同密钥 ⇒ 一台签发的令牌在另一台上必然
+  校验失败。
 
 环境要求：Python 3.11+；Windows/macOS/Linux。`.env` 模板与三层覆盖优先级说明见 [`.env.example`](.env.example)。
 
