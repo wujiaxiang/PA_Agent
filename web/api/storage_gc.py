@@ -2,7 +2,7 @@
 
 为什么必须有这个模块
 ====================
-四类数据都只增不减，其中三处的清理函数**早就写好、却没有任何生产调用者**：
+五类数据都只增不减，其中四处的清理函数**早就写好、却没有任何生产调用者**：
 
 ===========================  =====================================  ==========
 对象                          清理入口                                接线状态
@@ -11,11 +11,25 @@
 追问会话（内存）                ``routes_chat._chat_sessions``      本模块兜底（见下）
 ``sessions`` 表（DB）          ``sessions.purge_expired()``         本模块首次调用
 孤儿 ``chat_turns``（DB）      ``sessions.purge_for_user_sessions()`` 本模块首次调用
+无身份 ``chat_turns``（DB）    ``sessions.purge_anonymous_chat_turns()`` 本模块新增
 ===========================  =====================================  ==========
 
 「有实现、无调用者」是最坏的一种状态：读代码的人以为它会跑，压测/长期运行时
-数据却持续堆积，直到磁盘满或内存爆。故本模块**不新增任何清理语义**，只做一件事
-——把既有的四处清理接进一个守护线程。
+数据却持续堆积，直到磁盘满或内存爆。故本模块**原则上只做一件事** ——把既有的
+清理接进一个守护线程（第五行是唯一的例外，见下）。
+
+**为什么第五行是新增的清理语义（而不是又一条接线）**
+==================================================
+实测：写入 6 条 30 天前的 ``session_id = ''`` 行，跑完两个 purge 再跑多轮 GC，
+**一行不少**，而 ``sessions_purged`` / ``chat_turns_purged`` 全报 0、
+``errors`` 与 ``skipped`` 全空 —— 不报错、没在清理。根因是
+``purge_for_user_sessions`` 的孤儿判定里有个 ``session_id != ''``：没有会话
+身份的行被排除在孤儿之外，而**无 ``X-Session-Id`` 的调用方（直连 API / 脚本 /
+老客户端）写的恰恰全是这种行**。既有清理语义在这条路径上**根本没有覆盖**，
+只能新加一条**只按时间戳**的 DELETE
+(:func:`pa_agent.storage.sessions.purge_anonymous_chat_turns`)；为什么**不去掉**
+那个 ``AND``（去掉它会让刚落库、还没建会话快照的活跃行立刻变成孤儿，而顺序耦合并
+未解除），见该函数 docstring。
 
 为什么不能放在分析主路径上
 ==========================
@@ -32,10 +46,10 @@
 故沿用 :mod:`web.api.experience_scheduler` 的全部约定：**daemon 线程 + 自己的
 单飞守卫 + ``start``/``stop`` 成对 + 任何异常只记 warning 绝不冒泡**。
 
-本模块**不新增清理语义**的三条硬约束
-====================================
+本模块的硬约束
+==============
 
-1. **顺序敏感**::
+1. **顺序敏感，且只对「判据含子查询」的那一步敏感**::
 
        purge_expired()  →  purge_for_user_sessions()
 
@@ -44,6 +58,15 @@
    ``sessions`` 里，永远判不出任何孤儿 —— 该函数会静默地返回 0，看着像「这轮
    没东西可清」，实际是永远不会发生。故 ``run_once()`` 里这两行必须紧挨着按序
    执行，且中间不得有「DB 不可用就跳过第二段」的分支（那等于把顺序保护丢掉）。
+
+   **上游失败 ⇒ 孤儿步必须跳过并写进 ``skipped``**，而不是照跑。上一步没把过期行
+   拿掉时，孤儿步**必然清不出东西**，而它报 0 与「真的没东西可清」无法区分 ——
+   实测现象正是 ``errors:['sessions.purge_expired: db locked']``、``skipped:[]``、
+   ``chat_turns_purged:0``：一条顺序故障长成了「一切正常」。顺序敏感必须同时体现在
+   「不反序」与「不装作没失败」两处。
+
+   第三步 :func:`pa_agent.storage.sessions.purge_anonymous_chat_turns` **不在这个
+   耦合里**（它不查 ``sessions`` 表），故上一步失败时它照跑。
 
 2. **不绕过注册表自己的淘汰策略**。``SessionRegistry.sweep()`` 里的
    ``_evict_locked()`` 会**跳过仍挂 SSE 队列的会话** —— 被弹掉的会话，其
@@ -56,13 +79,25 @@
    且**绝不碰被占用的条目**（详见 :func:`_sweep_chat_sessions`）—— 跨线程
    ``release()`` 一把 ``asyncio.Lock`` 不是能做的事。
 
+4. **可观测性不许编数字**。DB 两步的「清了多少」是用**前后两次 ``COUNT(*)`` 的
+   差值**量的，而这个量法有一个致命前提：**读必须成功**。``hub.query`` 读失败时
+   返回 ``[]``，与「表里确实是空的」同形；``_count_rows`` 曾把它折成 ``0``，于是
+   ``before - 0`` 报出一个凭空捏造的正数 —— 实测把第二次 COUNT 打成读失败时，
+   ``_purge_orphan_chat_turns()`` 返回 **18**，而 ``errors`` / ``skipped`` 全空、
+   ``chat_turns_purged:18`` 摆在 ``/api/health`` 上，实际删了几行无从得知。R3 的
+   **全部**可观测性挂在这些字段上，恰好在最该报警时它们说「一切正常，清了 18 条」。
+   故 :func:`_count_rows` 的失败语义是 **None（读不出来）而不是 0**；None 时该步
+   **跳过本轮并写进 ``errors``**，**绝不返回差值**（见 :func:`_measured_delta`
+   与 :class:`_Unmeasurable`）。
+
 间隔取值
 ========
-:data:`DEFAULT_INTERVAL_S` = 600s（10 分钟）。清理**不是实时需求**：四类数据的
-TTL 分别是 30 分钟（会话快照 / 内存会话）与 30 分钟（追问内存会话），孤儿追问
-的保留期是 7 天。即最坏情况下的实际回收延迟是「TTL + 一个间隔」（10.5 分钟量级），
-对「会话快照 / 内存会话」这种缓存级数据完全够用；取更短只会白白增加 SQLite 写
-次数，而 ``sessions`` 表带 TTL —— 过早清理会让用户还在用的会话凭空消失。
+:data:`DEFAULT_INTERVAL_S` = 600s（10 分钟）。清理**不是实时需求**：各表与注册表的
+TTL 是 30 分钟（会话快照 / 内存会话 / 内存追问会话），孤儿追问的保留期是 7 天，
+无身份追问的绝对上限是 30 天。即最坏情况下的实际回收延迟是「TTL + 一个间隔」
+（10.5 分钟量级），对「会话快照 / 内存会话」这种缓存级数据完全够用；取更短只会白白
+增加 SQLite 写次数，而 ``sessions`` 表带 TTL —— 过早清理会让用户还在用的会话凭空
+消失。
 """
 from __future__ import annotations
 
@@ -160,6 +195,22 @@ def _sweep_chat_sessions() -> int:
 
     模块不存在 / 属性改名 / 导入失败都返回 0：清理是可选的，**绝不能因为
     ``routes_chat`` 出问题而让整轮 pass 失败**。
+
+    **⚠️ 本清扫救不了权威清理方的两个已知缺陷**（修在
+    ``routes_chat._chat_cleanup_loop``，不在本模块）：
+
+    1. **它裸 ``release()`` 别人正持有的锁**。命中过期后直接
+       ``entry.release()``（``routes_chat._chat_cleanup_loop`` 里那句
+       ``lock.release()``，2026-10-06 实测在 124-128 行），而那把锁此刻正被
+       ``event_generator`` 持着 —— 该流稍后在 ``finally`` 里二次 release 抛
+       ``RuntimeError: Lock is not acquired``，**异常发生在 SSE 响应的 finally
+       里，整条流直接炸掉**。
+    2. **循环体没有 try/except，也没有保活**。一条非 dict 条目就
+       ``AttributeError`` 让 task 当场死亡，而 ``_ensure_chat_cleanup`` 只在
+       router startup 调一次，死掉即静默失效。
+
+    本模块**绕不过**它们：本函数在 task 活着时恒返回 0（不与它抢条目），
+    而这两处缺陷全部发生在它自己的循环体内。
     """
     import asyncio
 
@@ -216,59 +267,141 @@ def _storage_ready() -> bool:
     return bool(stats.get("enabled")) and bool(stats.get("initialized"))
 
 
-def _count_rows(table: str) -> int:
-    """``SELECT COUNT(*)``。读失败返回 0（此时下面的差值也只是 0，不影响正确性）。"""
+def _count_rows(table: str) -> Optional[int]:
+    """``SELECT COUNT(*)``。**读失败返回 None（读不出来），不是 0。**
+
+    「读不出来」与「读出来是 0」必须分开，否则下面 :func:`_measured_delta` 的
+    ``before - after`` 会凭空造出数字：``hub.query()`` 读失败时返回 ``[]``，
+    ``query_one()`` 因此返回 ``None`` —— 与「SELECT 没返回行」同形。曾把它折成
+    ``0``，实测第二次 COUNT 失败时 ``_purge_orphan_chat_turns()`` 返回 **18**，
+    ``errors`` / ``skipped`` 全空，「清了多少」这个字段在真正的故障时刻说了谎。
+
+    任何拿 ``0`` 当「表是空的」去算差值的地方都不合格：宁可报「不知道」。
+    """
     from pa_agent.storage.db import get_hub
 
-    row = get_hub().query_one(f"SELECT COUNT(*) AS n FROM {table}")   # noqa: S608
-    return int(row["n"]) if row else 0
+    hub = get_hub()
+    row = hub.query_one(f"SELECT COUNT(*) AS n FROM {table}")   # noqa: S608
+    if row is None:
+        logger.warning(
+            "storage gc: COUNT(%s) unreadable (read_error=%r) — reporting 'unknown', not 0",
+            table, getattr(hub, "read_error", "") or "no row returned",
+        )
+        return None
+    try:
+        return int(row["n"])
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        logger.warning("storage gc: COUNT(%s) returned malformed row %r: %s",
+                       table, dict(row), exc)
+        return None
+
+
+class _Unmeasurable(Exception):
+    """本步的「清了多少」**不可知** —— 读不出来，不是「清 0 条」。
+
+    由 :func:`_measured_delta` 抛出，被 :func:`_step` 捕获后写进 ``errors``，
+    并让该步的计数变成 ``None``（在 summary 里落成 0 且**没有**任何数字含义）。
+    """
+
+
+def _measured_delta(table: str, purge: Callable[[], Any]) -> int:
+    """``purge()`` 前后各 ``COUNT(*)`` 一次，返回行数差。**读不出来就抛。**
+
+    行数差是「清了多少」的唯一可信来源：``sessions.purge_*`` 的返回值只回答
+    「这次 DELETE 有没有执行成功」（恒为 0/1，删 0 条与删 40 条长得一样）。
+    两次 COUNT 之间除了本函数没有别的删除方，故差值即本轮清出的行数。
+
+    任一次读不出来 ⇒ 抛 :class:`_Unmeasurable`，**绝不返回差值**：
+
+    - ``before`` 读不出来 ⇒ **不执行删除**：无法确认清了什么就动手，是拿数据
+      赌一个数字；本轮跳过，下轮再试。
+    - ``after`` 读不出来 ⇒ 删除**已经发生**，但行数无从得知 ⇒ 同样只报错误，
+      不报数（错误串里会写明「已执行但不可知」）。这不是「清 0 条」。
+    """
+    before = _count_rows(table)
+    if before is None:
+        raise _Unmeasurable(f"COUNT({table}) before purge is unreadable — step skipped")
+    purge()
+    after = _count_rows(table)
+    if after is None:
+        raise _Unmeasurable(
+            f"COUNT({table}) after purge is unreadable — DELETE ran but row count unknown"
+        )
+    return max(0, before - after)
 
 
 def _purge_expired_sessions() -> int:
-    """DB：过期 ``sessions`` 快照行。返回删除行数。**必须在孤儿清理之前跑。**"""
+    """DB：过期 ``sessions`` 快照行。返回删除行数。**必须在孤儿清理之前跑。**
+
+    行数**不取** ``purge_expired()`` 的返回值 —— 它内部也用「两次 COUNT 求差」
+    统计，但那里的失败被折成 ``0``（见 :func:`_count_rows` 的坑）。这里改为**在
+    GC 这一层**用可失败的量法重新统计一次：读不出来就跳过本轮（抛
+    :class:`_Unmeasurable`），而不是继承一个可能编出来的正数。
+    """
     from pa_agent.storage.sessions import purge_expired
 
-    return int(purge_expired() or 0)
+    return _measured_delta("sessions", purge_expired)
 
 
 def _purge_orphan_chat_turns() -> int:
     """DB：孤儿 ``chat_turns`` 行（其 session_id 已不在 ``sessions`` 表中）。
 
     **依赖上一步已经跑过**（见模块 docstring 约束 1）。单独调用它永远判不出孤儿。
-
-    行数是**按表行数差**量的，不是 ``purge_for_user_sessions()`` 的返回值 ——
-    后者只回答「这次 DELETE 有没有执行成功」（恒为 0/1，删掉 0 条与删掉 40 条
-    长得一模一样），当不了「清了多少」的统计。这里刻意**不改**
-    ``sessions.py`` 的语义，只在自己这层换一种量法：两次 ``COUNT(*)`` 之间
-    除了本函数没有别的删除方，故差值即本轮清出的行数。
     """
     from pa_agent.storage.sessions import purge_for_user_sessions
 
-    before = _count_rows("chat_turns")
-    purge_for_user_sessions()
-    return max(0, before - _count_rows("chat_turns"))
+    return _measured_delta("chat_turns", purge_for_user_sessions)
+
+
+def _purge_anonymous_chat_turns() -> int:
+    """DB：**无会话身份**的 ``chat_turns`` 行（``session_id = ''``），只按时间戳。
+
+    与上一步**故意解耦**：它不查 ``sessions`` 表，所以既不依赖
+    ``purge_expired()`` 有没有先跑，也不该因为上一步失败而被跳过。缺了它，
+    「无 ``X-Session-Id`` 的调用方」写下的行**永远不会被清** —— 实测 6 条 30 天前
+    的这类行跑完两个 purge 与多轮 GC 后一行不少，而可观测字段全报 0。
+
+    单独成一个字段（``chat_turns_anonymous_purged``）而不是并进
+    ``chat_turns_purged``：后者衡量的是「孤儿判定清出了什么」，两条判据混在
+    一个数字里就再也分不清是哪个机制在起作用、哪个机制在空转。
+    """
+    from pa_agent.storage.sessions import purge_anonymous_chat_turns
+
+    return _measured_delta("chat_turns", purge_anonymous_chat_turns)
 
 
 # ── 一轮 pass ────────────────────────────────────────────────────────────────
-def _step(errors: list[str], name: str, fn: Callable[[], int]) -> int:
+def _step(errors: list[str], name: str, fn: Callable[[], Any]) -> Optional[int]:
     """跑一个清理步骤，异常只记 warning 并记进 ``errors``，绝不冒泡。
 
-    分步兜底的理由：某一处（DB 锁、某个模块 import 失败）不该让其余三处也不跑。
-    顺序敏感的两步放在同一个 ``_storage_ready()`` 分支里，故上一步失败时下一步
-    仍会跑（只是这一轮孤儿几乎判不出来），**顺序本身永不被破坏**。
+    返回 ``int`` 表示「这一步清了多少」，返回 **None** 表示「**不知道清了多少**」
+    —— 抛了异常（含 :class:`_Unmeasurable`：计数读不出来）时一律 None，错误串
+    已经落进 ``errors``。**None 与 0 必须分开**：0 是「查过了，确实没东西可清」，
+    None 是「没查成」。调用方据此决定后续依赖步骤能不能跑（见 :func:`run_once`
+    的顺序分支）。
+
+    分步兜底的理由：某一处（DB 锁、某个模块 import 失败）不该让其余几处也不跑。
+    顺序敏感的两步放在同一个 ``_storage_ready()`` 分支里，且上游失败时下一步
+    **跳过并标注** —— 顺序保护与「不装作没失败」必须同时成立。
     """
     try:
-        return int(fn() or 0)
+        value = fn()
+        return int(value) if value is not None else None
     except Exception as exc:  # noqa: BLE001 - 后台线程，任何异常只记 warning
         logger.warning("storage gc: step %s failed: %s", name, exc)
         errors.append(f"{name}: {exc}")
-        return 0
+        return None
 
 
-def run_once() -> dict[str, Any] | None:
+def run_once() -> Optional[dict[str, Any]]:
     """跑一轮清理。返回本轮统计，或 None（本轮被单飞守卫跳过）。
 
     **永不抛异常、永不与自身重叠。** 统计 dict 同时进 ``/api/health``。
+
+    **计数为 0 时先看 ``errors`` / ``skipped``**：``0`` 既可能是「查过、确实没东西
+    可清」，也可能是「没查成/没跑」被降级成 0（见 :func:`_step`）。两者只有靠
+    ``errors``（读不出来、步骤抛错）与 ``skipped``（因前置失败或顺序而跳过）才能
+    区分开 —— 这正是「可观测性不许编数字」这条约束的落点。
     """
     if not _guard.try_acquire():
         logger.debug("storage gc: previous pass still running, skipping")
@@ -280,30 +413,50 @@ def run_once() -> dict[str, Any] | None:
         "chat_sessions_evicted": 0,
         "sessions_purged": 0,
         "chat_turns_purged": 0,
+        "chat_turns_anonymous_purged": 0,
         "errors": [],
         "skipped": [],
     }
     try:
         summary["registry_evicted"] = _step(
             summary["errors"], "registry.sweep", _sweep_registry
-        )
+        ) or 0
         summary["chat_sessions_evicted"] = _step(
             summary["errors"], "chat_sessions", _sweep_chat_sessions
-        )
+        ) or 0
         if _step(summary["errors"], "storage_ready", _storage_ready):
-            # ── 顺序敏感：这两行必须按序，且同在一个分支内 ──────────────────
+            # ── 顺序敏感：这两步必须按序，且同在一个分支内 ──────────────────
             # purge_for_user_sessions() 的孤儿判定是
             # ``session_id NOT IN (SELECT session_id FROM sessions)``；
             # 只有 purge_expired() 能把过期行从 sessions 里拿掉。
             # 反序执行会让孤儿永远判不出来 —— 表现为「每轮都清 0 条」。
-            summary["sessions_purged"] = _step(
+            sessions_purged = _step(
                 summary["errors"], "sessions.purge_expired", _purge_expired_sessions
             )
-            summary["chat_turns_purged"] = _step(
+            if sessions_purged is None:
+                summary["sessions_purged"] = 0
+                # 上游没跑成 ⇒ sessions 里的过期行还在 ⇒ 孤儿步**必然**清不出
+                # 东西。照跑只会报出一个无法与「真没孤儿」区分的 0（实测：
+                # errors 只有上游那一条、skipped 为空、chat_turns_purged:0）。
+                # 跳过 + 显式标注，顺序保护与可观测性一起守住。
+                summary["skipped"].append(
+                    "chat_turns.purge_for_user_sessions: skipped — "
+                    "sessions.purge_expired did not complete this round "
+                    "(orphan rows would be undetectable)"
+                )
+            else:
+                summary["sessions_purged"] = sessions_purged
+                summary["chat_turns_purged"] = _step(
+                    summary["errors"],
+                    "chat_turns.purge_for_user_sessions",
+                    _purge_orphan_chat_turns,
+                ) or 0
+            # ── 顺序无关：只按时间戳的无身份行清理，上一步成败都照跑 ────────
+            summary["chat_turns_anonymous_purged"] = _step(
                 summary["errors"],
-                "chat_turns.purge_for_user_sessions",
-                _purge_orphan_chat_turns,
-            )
+                "chat_turns.purge_anonymous",
+                _purge_anonymous_chat_turns,
+            ) or 0
         else:
             summary["skipped"].append("sqlite: storage unavailable or not initialized")
     finally:
@@ -315,6 +468,7 @@ def run_once() -> dict[str, Any] | None:
         + summary["chat_sessions_evicted"]
         + summary["sessions_purged"]
         + summary["chat_turns_purged"]
+        + summary["chat_turns_anonymous_purged"]
     )
     summary["duration_ms"] = round((time.time() - started) * 1000.0, 1)
     _publish(summary)
@@ -400,6 +554,13 @@ def status() -> dict[str, Any]:
 
     清理「有没有在跑」和「跑出了什么」都属于运维面，必须能一眼看出 —— 一个
     静默失效的 GC 与没有 GC 表现完全一样（数据照涨）。
+
+    **怎么读 ``last``**：``*_purged`` 是「上一轮清了多少行」，**只有在同轮的
+    ``errors`` / ``skipped`` 都为空时**才是「真的清了这些」。计数读不出来
+    （``_count_rows`` 返回 None）或步骤抛错时，该字段被降级成 0 并在
+    ``errors`` 里留下一条自带原因的记录；因顺序或前置失败而没跑的步骤则出现在
+    ``skipped`` 里。**这就是 ``_count_rows`` 的 None 语义在 health 上的落点**：
+    「不知道」永远带着它的原因一起出现，不会伪装成「一切正常，清了 N 条」。
     """
     last = dict(_last_result) if _last_result is not None else None
     if last is not None:

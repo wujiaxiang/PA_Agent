@@ -304,6 +304,22 @@ async def bind_user_settings_middleware(request: Request, call_next):
         if token is not None:
             reset_request_settings(token)
 
+
+# 紧邻 bind_user_settings_middleware：两者是同一类活儿（每个 /api 请求绑定一份
+# 请求级身份到 ContextVar），挂在一起便于对照。挂载顺序上它在配置中间件**之后**
+# 注册 ⇒ Starlette 把中间件按注册顺序**反向**包裹，故本中间件在**外层**：
+# 会话解析（含一次快照续期写）先于路由执行，且不依赖配置已解析。
+@app.middleware("http")
+async def session_lifecycle_middleware(request: Request, call_next):
+    """刷新会话空闲计时 + 限流续期 ``sessions`` 快照（详见函数 docstring）。
+
+    没有它，``expires_at`` 的唯一续期点是 ``POST /api/subscribe``，而前端 boot
+    从不调它 —— 表现为「订阅后一直挂着不动，30 分钟后 F5 游标回到出厂种子」。
+    """
+    from web.api.session_ctx import session_lifecycle_middleware as _impl
+
+    return await _impl(request, call_next)
+
 from web.api.routes_settings import router as settings_router
 from web.api.routes_data import router as data_router
 from web.api.routes_analyze import router as analyze_router

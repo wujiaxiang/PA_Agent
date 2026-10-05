@@ -290,6 +290,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   loadHistoryList();         // 拉当前 (exchange, symbol, timeframe) 的历史分析记录
   setDataMode('live');              // 把模式状态同步到 body / 按钮 / 只读态
   refreshIncrementalButtonState();  // 判定有无可复用上下文 → 「分析」按钮文案/提示
+  // 追问历史回填：刷新后前端内存里啥都没有，但服务端仍能用「同一 session_id
+  // + 从记录自推导的 record 段」命中同一个线程。enableChat() 内部会触发回填。
+  // 必须放在 setDataMode('live') 之后 —— 只读态判定依赖它。
+  if (typeof enableChat === 'function') enableChat();
   // 经验库范围恒等于当前订阅（交易对 + 周期），切品种/周期后必须同步刷新，
   // 否则面板会停在上一个标的的结果上。
   if (typeof loadExperienceLibrary === 'function') {
@@ -4684,6 +4688,25 @@ function parsePercent(v) {
 // ── Prompt 展示已迁移到 stage-block 内部（见 setStagePrompt / resetStageBlock） ─
 
 // ── Chat（追问嵌入实时 tab，Phase C Task 3） ─────────────────────────
+// 追问历史的回填状态。
+//   chatHistoryKey —— 当前 #chat-messages 里画的是哪个线程。同键重复回填是
+//                     幂等的，而画面上还多出本轮 live 追加的消息，不该被抹掉。
+//   chatHistorySeq —— 请求序号。boot 与 enableChat() 可能同时发起回填，
+//                     慢的那次响应回来会覆盖快的，故用序号丢弃过期响应。
+let chatHistoryKey = null;
+let chatHistorySeq = 0;
+
+// 「加载中…」与「还没有追问记录」共用的提示行 class。
+// 空 div 与「真的没聊过」在界面上长得一模一样 —— 用户分不清是加载失败、
+// 正在加载、还是没有历史。把这两种态明确画出来，是 requirement 5 的底线。
+const CHAT_NOTE_CLASS = 'chat-history-note';
+
+function showChatNote(text) {
+  const panel = $('#chat-messages');
+  if (!panel) return;
+  panel.innerHTML = `<div class="${CHAT_NOTE_CLASS} muted-text">${escapeHtml(text)}</div>`;
+}
+
 function enableChat() {
   const input = $('#chat-input');
   const sendBtn = $('#btn-chat-send');
@@ -4694,23 +4717,116 @@ function enableChat() {
   if (input) input.disabled = ro;
   if (sendBtn) sendBtn.disabled = ro;
   renderChatContext();
+  // 任何解锁追问的路径都要回填历史：刷新后锚点仍是同一条记录（服务端按
+  // session_id + 从记录自推导的 record 段命中同一个桶），但前端内存里已经
+  // 什么都没有了。
+  backfillChatHistory();
+}
+
+/**
+ * 从服务端取当前追问线程的历史并回填 #chat-messages。
+ *
+ * **只读不写**：回填的是历史展示，气泡里没有输入框、没有编辑入口 —— 用户能
+ * 重发（#btn-chat-resend 只重发自己刚发的那一条），但改不了已经发生的对话。
+ *
+ * 三条纪律：
+ * 1. **生成中绝不重画**。`done` 先推、落库在后（见 routes_chat 模块 docstring
+ *    硬约束 2），那一瞬间库里还没有这一轮，重画会把它抹掉。
+ * 2. **失败时不改任何状态**。宁可留着「加载中」，也不要画成「没有历史」——
+ *    那是在用错误的空态掩盖一次网络抖动。
+ * 3. **成功才重画**。回填以服务端给出的历史为准；同键重复回填直接跳过。
+ */
+async function backfillChatHistory() {
+  const panel = $('#chat-messages');
+  if (!panel) return;
+  if (chatAbortController) return;          // 纪律 1
+  const seq = ++chatHistorySeq;
+  // 只有面板是空的时候才提示「加载中」：已经有内容（上一段对话 / 本轮 live
+  // 消息）时把它盖成「加载中」反而是倒退。
+  const wasEmpty = panel.children.length === 0;
+  if (wasEmpty) showChatNote('正在加载追问历史…');
+  let data;
+  try {
+    data = await API.get('/api/chat/turns?attach_kline_snapshot=true');
+  } catch (e) {
+    console.warn('chat history backfill failed:', e);   // 纪律 2
+    if (wasEmpty) showChatNote('追问历史加载失败，可稍后重试');
+    return;
+  }
+  if (seq !== chatHistorySeq) return;       // 有更新的请求在飞，丢弃这次
+  renderChatHistory(data);
+}
+
+/** 把 GET /api/chat/turns 的返回画进 #chat-messages。 */
+function renderChatHistory(data) {
+  const panel = $('#chat-messages');
+  if (!panel) return;
+  const turns = Array.isArray(data?.turns) ? data.turns : [];
+  const key = data?.thread_key || null;
+  // 纪律 3：同一线程重画是幂等的，而画面上可能还叠着本轮 live 追加的消息 ——
+  // 那正是用户要看的，重画等于把它清掉。换了线程才必须整块重画（留着上一段
+  // 对话会让用户以为模型还记得它）。
+  if (key && key === chatHistoryKey && panel.querySelector('.chat-msg')) {
+    return;
+  }
+  chatHistoryKey = key;
+  // 刷新后 lastRecord 是 null，#chat-context 会画「尚未进行交易分析」——
+  // 与紧接着回填出来的历史当场矛盾。有锚点就用服务端给的锚点补上。
+  if (!lastRecord && data?.source === 'db') {
+    renderChatContext({ symbol: data.symbol, timeframe: data.timeframe });
+  }
+  panel.innerHTML = '';
+  if (!turns.length) {
+    showChatNote('还没有追问记录');
+    return;
+  }
+  for (const t of turns) {
+    if (t.user) appendChatMsg('user', t.user);
+    if (t.cancelled) {
+      // 取消的一轮：库里只有提问、没有回答。必须显式画出来，
+      // 否则界面上凭空少一条 assistant，看起来像 UI 吞了消息。
+      appendChatMsg('assistant', '[该轮追问被取消]');
+      continue;
+    }
+    if (!t.assistant) {
+      appendChatMsg('assistant', '[该轮追问没有回答]');
+      continue;
+    }
+    const el = appendChatMsg('assistant', '');
+    if (!el) continue;
+    // 历史气泡绝不能带 id：#chat-content / #chat-reasoning 是**本轮**流式输出
+    // 的落点，靠 `$('#chat-content')` 取第一个匹配项。回填出多个助手气泡后，
+    // 下一轮追问的 token 会全部灌进最早那一条里（重复 id ⇒ 取首个）。
+    el.querySelectorAll('[id]').forEach(n => n.removeAttribute('id'));
+    const rEl = el.querySelector('.reasoning');
+    if (rEl) rEl.textContent = t.reasoning || '';
+    const cEl = el.querySelector('.bubble');
+    if (cEl) cEl.textContent = t.assistant;
+  }
+  panel.scrollTop = panel.scrollHeight;
 }
 
 // 追问会话锚在哪一次分析上，必须让用户看得见 —— 否则切换品种/回看历史后
 // 仍以为在追问上一份结论，实际早就换成了另一个锚点。
-function renderChatContext() {
+//
+// anchor 是**可选**的降级锚点：刷新后 lastRecord 为 null，但服务端已经用
+// 会话游标找回了锚点记录（回填响应里带着它的 symbol/timeframe）。此时若仍
+// 画「尚未进行交易分析」，就会与下方刚回填出来的历史自相矛盾。
+// 不传 anchor 时行为与改造前完全一致。
+function renderChatContext(anchor) {
   const box = $('#chat-context');
   if (!box) return;
   const r = lastRecord;
-  if (!r) {
+  const a = anchor || null;
+  if (!r && !a) {
     box.innerHTML = '<span class="chat-context-empty">尚未进行交易分析，完成后可在此追问</span>';
     return;
   }
-  const sym = r.symbol || r.meta?.symbol || $('#ds-symbol')?.value || '';
-  const tf = r.timeframe || r.meta?.timeframe || $('#ds-timeframe')?.value || '';
-  const ts = r.timestamp_local_iso || r.meta?.timestamp_local_iso || '';
-  const ot = (r.stage2_decision && (r.stage2_decision.order_type
-        || r.stage2_decision.decision?.order_type)) || '';
+  const sym = (r && (r.symbol || r.meta?.symbol)) || a?.symbol || $('#ds-symbol')?.value || '';
+  const tf = (r && (r.timeframe || r.meta?.timeframe)) || a?.timeframe || $('#ds-timeframe')?.value || '';
+  const ts = (r && (r.timestamp_local_iso || r.meta?.timestamp_local_iso)) || '';
+  const ot = (r && (r.stage2_decision && (r.stage2_decision.order_type
+        || r.stage2_decision.decision?.order_type))) || '';
   const time = ts ? new Date(ts).toLocaleString('zh-CN', { hour12: false }) : '';
   box.innerHTML = `<span class="chat-context-tag">锚定分析</span>`
     + `<span class="chat-context-item">${escapeHtml(sym)} · ${escapeHtml(tf)}</span>`
@@ -4746,11 +4862,13 @@ async function sendChat() {
   chatReasoningText = '';
   chatContentText = '';
 
-  // 使用 lastRecord 的 timestamp_local_iso 作为 record_id（与 FreeChatSession 期望格式一致）
-  const recordId = lastRecord && lastRecord.timestamp_local_iso
-    ? `${lastRecord.symbol}_${lastRecord.timeframe}_${lastRecord.timestamp_local_iso}`
-    : `chat_${Date.now()}`;
-  const url = `/api/chat/stream?text=${encodeURIComponent(text)}&record_id=${encodeURIComponent(recordId)}&attach_kline_snapshot=true`;
+  // ⚠️ **不要在这里拼 record_id**。
+  // 它此前派生自 lastRecord，而 lastRecord 每次页面加载重置为 null ⇒ 拼出来
+  // 的 id 每次刷新都不同 ⇒ 服务端分桶键漂移 ⇒ FreeChatSession 在 30 分钟
+  // TTL 内也永远命中不了（实测三连刷新得到三个互不相同的键）。
+  // record 段改由服务端从锚点记录自推导（routes_chat._resolve_thread_key），
+  // 前端只保留它真正知道的开关。
+  const url = `/api/chat/stream?text=${encodeURIComponent(text)}&attach_kline_snapshot=true`;
 
   try {
     const { controller, source } = API.sse(url);
@@ -4819,6 +4937,11 @@ function clearChatOutput() {
   const streamPanel = $('#chat-messages') || $('#tab-chat');
   if (!streamPanel) return;
   streamPanel.querySelectorAll('.chat-msg').forEach(el => el.remove());
+  // 「正在加载…」/「还没有追问记录」也是回填画的，点一次「清空」必须一起清 ——
+  // 否则消息没了却留着一句「还没有追问记录」。
+  streamPanel.querySelectorAll('.chat-history-note').forEach(el => el.remove());
+  // 画面的不再是「已回填的某线程」，下一次回填要重新画一遍。
+  chatHistoryKey = null;
   const ctxEl = $('#chat-context');
   if (ctxEl) ctxEl.innerHTML = '';
   chatReasoningText = '';

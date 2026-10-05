@@ -20,9 +20,13 @@
 ============  ==========================================================
 内存热态      **继续对话靠它**。``FreeChatSession._cached_prefix`` 在
               ``__init__`` 时按 ``base_record`` 固化且永不变，续上下文
-              只能靠 ``_history_full``；重建一个 ``FreeChatSession``
-              去吃 DB 历史并不会让模型看到之前那几轮（那条前缀本身
-              就是按「本轮首次提问」构造的）。
+              只能靠 ``_history_full``。DB 侧对应的恢复入口是
+              :func:`seed_messages`（把库里那一折还原回 ``_history_full``）。
+              ⚠️ 本节原写着「重建一个 ``FreeChatSession`` 去吃 DB 历史并不会让
+              模型看到之前那几轮」—— **该说法已过时且不成立**：``_cached_prefix``
+              只由 ``base_record``（stage1/stage2）构造，**不含任何提问**，
+              追问轮次全部来自 ``_history_full``，故把它们从库里灌回去，模型
+              就能看到之前那几轮。事实上 ``seed_messages`` 就是干这件事的。
 DB 持久态     **查证与恢复靠它**。回答「上周三那个标的追问过什么」只有
               这里答得出来。
 ============  ==========================================================
@@ -48,10 +52,29 @@ DB 持久态     **查证与恢复靠它**。回答「上周三那个标的追�
 - ``sessions.purge_expired()`` **只删** ``sessions`` 表，**不碰** ``chat_turns``；
 - ``sessions.purge_for_user_sessions()`` 才是删 ``chat_turns`` 的那个
   （``session_id`` 已不在 ``sessions`` 表中且超过 7 天宽限期）；
-- 因此两者必须**按序**跑：先让 ``sessions`` 行消失，``chat_turns`` 才算孤儿。
+- ``sessions.purge_anonymous_chat_turns()`` 删另一类**永远不会被前者清掉**的行：
+  ``session_id = ''``（无 ``X-Session-Id`` 的调用方写的全是它们），判据**只有
+  时间戳**（30 天绝对上限），与上面两步的**顺序完全无关**；
+- 因此前两者必须**按序**跑：先让 ``sessions`` 行消失，``chat_turns`` 才算孤儿。
 
-注意（2026-10-05 核实）：``purge_for_user_sessions`` 目前**没有生产调用者**
-（只有定义），即整条清理链尚未接上调度器。在调度器补上之前，这些行只增不减。
+生产调用者是 ``web.api.storage_gc`` 的守护线程（每 10 分钟一轮，``/api/health``
+的 ``storage.gc.last`` 可见其计数）。⚠️ 本节原写「``purge_for_user_sessions``
+**没有生产调用者**（只有定义）」——该结论已过时：接线正是
+``storage_gc.run_once()``，而孤儿步**依赖上一步的 sessions 行先消失**，故两者
+必须相邻执行（上游失败时该步被**跳过并记入 ``skipped``**，而不是静默报 0）。
+
+读端与播种（2026-10-05 补）
+==========================
+``list_turns`` 此前**只有 tests 调用**，没有任何生产读者 —— 追问历史写进了库
+却读不回来，页面一刷新就没了。本节补上它的两个读者，二者共用同一套折叠：
+
+- :func:`load_thread` —— 界面回填用，返回「一轮一条」的列表；
+- :func:`seed_messages` —— **模型上下文播种**用，把同一份折叠还原成
+  ``FreeChatSession._history_full`` 的扁平消息，并给出库里最大的轮次号。
+
+**两者必须读同一份折叠，否则界面与模型会各说各话**：界面显示 N 轮而模型以为
+这是第 1 轮，比空白更糟（这正是 ``FreeChatSession._cached_prefix`` 在构造时按
+「本轮首次提问」固化所导致的，故播种不是可有可无的锦上添花）。
 """
 from __future__ import annotations
 
@@ -194,33 +217,13 @@ def append_turn(
     return True
 
 
-def list_turns(
-    thread_key: str,
-    *,
-    user_id: str = DEFAULT_USER_ID,
-    limit: int = DEFAULT_LIMIT,
-) -> list[dict]:
-    """列出某个追问线程的全部消息行，按 ``(turn, id)`` 升序。
+def _parse_rows(rows: Any) -> list[dict]:
+    """把 hub 返回的行统一成 dict，并把 ``usage_json`` 解析成 ``usage``。
 
-    **一「轮」是两行**（user + assistant），按 ``turn`` 分组即得对话。
-    走 ``ix_chat_thread``，方向与索引一致。
-
-    返回行里的 ``usage_json`` 已解析成 ``usage`` dict 并移除原列 ——
-    调用方要的是数值而不是字符串。
-
-    读失败与「确实没有」同形返回 ``[]``：追问不是资金面主链路，
-    为它引入 ``experience_repo.QueryResult`` 那套失败标志并不划算
-    （真正的权威副本仍在内存与 JSONL sidecar）。
+    ``list_turns`` / ``list_recent_turns`` 共用：解析规则若各写一份，两条读路径
+    迟早在「usage 到底给不给 dict」这种细节上分叉，而分叉出来的分叉只会在某个
+    没人测的字段上表现为「回填后 token 用量是空的」。
     """
-    key = str(thread_key or "").strip()
-    if not key:
-        return []
-    rows = get_hub().query(
-        "SELECT * FROM chat_turns "
-        "WHERE user_id = ? AND thread_key = ? "
-        "ORDER BY turn ASC, id ASC LIMIT ?",
-        (user_id, key, int(limit)),
-    )
     out: list[dict] = []
     for r in rows:
         row = dict(r)
@@ -232,6 +235,158 @@ def list_turns(
             row["usage"] = {}
         out.append(row)
     return out
+
+
+def list_turns(
+    thread_key: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    limit: int = DEFAULT_LIMIT,
+) -> list[dict]:
+    """列出某个追问线程的**最早**若干行，按 ``(turn, id)`` 升序。
+
+    **一「轮」是两行**（user + assistant），按 ``turn`` 分组即得对话。
+    走 ``ix_chat_thread``，方向与索引一致。
+
+    返回行里的 ``usage_json`` 已解析成 ``usage`` dict 并移除原列 ——
+    调用方要的是数值而不是字符串。
+
+    ``LIMIT`` 截断的是**最早**的轮次（见 ``test_limit_truncates_oldest_first``）。
+    回填与播种要的是**最近**的若干轮 —— 否则一个 200 行的老线程会恢复成
+    「最早 100 轮」并让新轮次从 101 重新编号，请用 :func:`list_recent_turns`。
+
+    读失败与「确实没有」同形返回 ``[]``：追问不是资金面主链路，
+    为它引入 ``experience_repo.QueryResult`` 那套失败标志并不划算
+    （回填方拿到空列表就按「没聊过」渲染，不会因此报错或卡住）。
+    """
+    key = str(thread_key or "").strip()
+    if not key:
+        return []
+    rows = get_hub().query(
+        "SELECT * FROM chat_turns "
+        "WHERE user_id = ? AND thread_key = ? "
+        "ORDER BY turn ASC, id ASC LIMIT ?",
+        (user_id, key, int(limit)),
+    )
+    return _parse_rows(rows)
+
+
+def list_recent_turns(
+    thread_key: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    limit: int = DEFAULT_LIMIT,
+) -> list[dict]:
+    """列出某个追问线程的**最新**若干行，返回顺序仍是 ``(turn, id)`` 升序。
+
+    与 :func:`list_turns` 的唯一区别是采样方向：``ORDER BY turn DESC, id DESC
+    LIMIT ?`` 取尾之后再翻回来。方向必须与索引 ``ix_chat_thread`` 一致
+    （``(user_id, thread_key, turn)``），否则每轮回填都是一次全表扫 + 排序。
+
+    **为什么要最新而不是最早**：轮次号在库里是连续递增的。恢复时若取最早 N 行，
+    下一轮就会从 ``N+1`` 重新开始，而库里 N+1 之后的老行还在 —— 非唯一索引
+    ``ix_chat_thread`` 不会拦，写重不报错，只在回读时顺序错乱。
+    """
+    key = str(thread_key or "").strip()
+    if not key:
+        return []
+    rows = get_hub().query(
+        "SELECT * FROM chat_turns "
+        "WHERE user_id = ? AND thread_key = ? "
+        "ORDER BY turn DESC, id DESC LIMIT ?",
+        (user_id, key, int(limit)),
+    )
+    rows = list(rows)[::-1]
+    return _parse_rows(rows)
+
+
+def fold_turns(rows: list[dict]) -> list[dict]:
+    """把「一「轮」两行」折叠成一条。
+
+    返回的每条形如::
+
+        {"turn": 3, "user": "...", "assistant": "...", "reasoning": None,
+         "usage": {...}, "cancelled": False, "ts_ms": 1730000000000}
+
+    - **按 ``turn`` 的连续性分组**：读端保证同一轮的行相邻（``ORDER BY turn``），
+      故「上一条的 ``turn`` 不等于这一条」即新轮。轮次号重复（见 ``append_turn``
+      的 docstring）会让两轮并成一条，这是那处隐患的直接体现，不再另设判据。
+    - **缺一半的轮次不补齐**：截断或历史损坏都可能只留下一行，字段留空即可，
+      由消费方决定怎么显示。凭空造一条空回答就是伪造历史。
+    - ``ts_ms`` 取该轮的最大值：两行是同一毫秒写下的，取 max 只是为了让调用方
+      不必关心哪一行更晚。
+    """
+    turns: list[dict] = []
+    for row in rows:
+        turn = row.get("turn")
+        if not turns or turns[-1]["turn"] != turn:
+            turns.append({
+                "turn": turn,
+                "user": "",
+                "assistant": "",
+                "reasoning": None,
+                "usage": {},
+                "cancelled": bool(row.get("cancelled")),
+                "ts_ms": int(row.get("ts_ms") or 0),
+            })
+        cur = turns[-1]
+        if row.get("role") == ROLE_USER:
+            cur["user"] = row.get("content") or ""
+        elif row.get("role") == ROLE_ASSISTANT:
+            cur["assistant"] = row.get("content") or ""
+            cur["reasoning"] = row.get("reasoning") or None
+            cur["usage"] = row.get("usage") or {}
+        # cancelled / ts_ms 逐行累积：一轮里任意一行标了取消，这一轮就算取消。
+        cur["cancelled"] = bool(cur["cancelled"] or row.get("cancelled"))
+        cur["ts_ms"] = max(cur["ts_ms"], int(row.get("ts_ms") or 0))
+    return turns
+
+
+def load_thread(
+    thread_key: str,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    limit: int = DEFAULT_LIMIT,
+) -> list[dict]:
+    """读一个追问线程，返回折叠后的「一轮一条」列表（界面回填与播种共用）。"""
+    return fold_turns(list_recent_turns(thread_key, user_id=user_id, limit=limit))
+
+
+def seed_messages(turns: list[dict]) -> tuple[list[dict], int]:
+    """把折叠后的轮次还原成 ``FreeChatSession._history_full`` 的消息列表。
+
+    返回 ``(messages, max_turn)``：
+
+    - ``messages`` 与 ``FreeChatSession.send()`` 追加的形状逐字一致
+      （user 只有 content，assistant 带 ``reasoning_content``），
+      ``send()`` 是直接遍历它拼 ``history_for_api`` 的；
+    - ``max_turn`` 是库里最大的轮次号，调用方据此把 ``session._turn``
+      顶到正确位置 —— 否则内存桶回收后轮次从 1 重来，库里出现重复轮次。
+
+    **取消的一轮不产出 assistant 消息**：那一轮本来就没有回答，往上下文里塞一条
+    空 assistant 是在骗模型「这里有过一次回应」。提问本身要保留（用户确实问过）。
+    """
+    messages: list[dict] = []
+    max_turn = 0
+    for t in turns:
+        try:
+            turn_no = int(t.get("turn") or 0)
+        except (TypeError, ValueError):
+            turn_no = 0
+        max_turn = max(max_turn, turn_no)
+        user = t.get("user") or ""
+        if user:
+            messages.append({"role": ROLE_USER, "content": user})
+        if t.get("cancelled"):
+            continue
+        assistant = t.get("assistant") or ""
+        if assistant:
+            messages.append({
+                "role": ROLE_ASSISTANT,
+                "content": assistant,
+                "reasoning_content": t.get("reasoning") or None,
+            })
+    return messages, max_turn
 
 
 def clear_thread(

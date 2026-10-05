@@ -1,15 +1,20 @@
-"""``web.api.storage_gc`` 单测：周期清理**真的会清**。
+"""``web.api.storage_gc`` 单测：周期清理**真的会清**，且**不会编数字**。
 
 **每个用例都必须证明「数据没了」**，不能只断言「函数被调用过」—— mock 掉
 ``purge_*`` 之后测试永远绿，而那恰恰是本模块存在的理由：清理函数早就写好、
 却长期没有任何生产调用者，没人发现它们根本没跑。故本文件一律造真实数据
 （真 SQLite 行 / 真内存条目 / 真 asyncio 锁）再跑真 ``run_once()``。
 
-守护的三条不变式（见 storage_gc 模块 docstring）：
+守护的不变式（见 storage_gc 模块 docstring）：
 
-1. 顺序敏感：``purge_expired()`` 必须先于 ``purge_for_user_sessions()``
+1. 顺序敏感：``purge_expired()`` 必须先于 ``purge_for_user_sessions()``；且上一步
+   失败时孤儿步要**跳过并标进 skipped**，不能照跑出一个无法与「真没孤儿」区分的 0
 2. 不绕过 ``SessionRegistry`` 自己的淘汰策略（会跳过仍挂 SSE 队列的会话）
 3. 任何异常只记 warning、绝不让守卫永久闭锁
+4. **可观测性不许编数字**：``COUNT(*)`` 读不出来时（None）必须跳过本轮并记进
+   ``errors``，绝不返回 ``before - 0`` 那种凭空捏造的正数
+5. 无会话身份（``session_id=''``）的行有独立的**只按时间戳**的清理路径，且它与
+   上面第 1 条的顺序**无关**
 
 反向验证（把实现改坏，确认测试变红）见各用例注释里标「反向验证」的部分。
 """
@@ -19,6 +24,7 @@ import asyncio
 import os
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -64,9 +70,13 @@ def clean_gc_state():
 def chat_table():
     """``routes_chat._chat_sessions`` 的独立副本，并让「事件循环侧清理器」缺席。
 
-    真实模块里那条清理 task 挂在 router 级 ``on_event("startup")`` 上，而
-    FastAPI 0.142 起**不再转发** router 级 startup 事件 ⇒ 它从未启动。
-    用例默认按这个真实状态跑（``_chat_cleanup_task = None``）。
+    真实模块里那条清理 task 挂在 router 级 ``on_event("startup")`` 上，且
+    ``APIRouter.include_router`` **确实转发** ``on_startup``（router 级 startup 在
+    TestClient 下真的会跑，由 ``tests/unit/test_router_startup_forwards.py`` 锁定）。
+    本夹具把它摘掉，是为了**单独**驱动 ``storage_gc`` 这条兜底路径 ——
+    另有 ``test_chat_sweep_defers_to_a_live_loop_task`` 覆盖「task 活着就让位」。
+    ⚠️ 本夹具的旧注释称「FastAPI 0.142 起不再转发 router 级 startup ⇒ 它从未
+    启动」，该结论已被证伪，勿据此改生产代码。
     """
     from web.api import routes_chat
 
@@ -81,8 +91,37 @@ def chat_table():
 
 
 def _rows(table: str) -> int:
+    """表行数。**读失败直接判失败**：断言里 0 与 None 同形，会把「读不出来」误
+    判成「数据没了」—— 那正是本文件要防的那一类假绿。"""
     row = get_hub().query_one(f"SELECT COUNT(*) AS n FROM {table}")   # noqa: S608
-    return int(row["n"]) if row else 0
+    assert row is not None, f"COUNT({table}) 读失败（DB 降级），断言无意义"
+    return int(row["n"])
+
+
+@contextmanager
+def failing_counts(table: str, *, nth: int = 2):
+    """让该表的第 *nth* 次 ``COUNT(*)`` 读失败（返回 ``None``）。
+
+    复刻真实的失败形态：``hub.query()`` 读失败时返回 ``[]``，于是
+    ``query_one()`` 返回 ``None`` —— 与「SELECT 没返回行」同形。
+    ``nth=1`` ⇒ 删除**前**那次读失败；``nth=2`` ⇒ 删除**后**那次读失败。
+    """
+    hub = get_hub()
+    original = hub.query_one
+    seen = {"n": 0}
+
+    def _patched(sql: str, params: tuple = ()):
+        if f"FROM {table}" in sql and "COUNT(*)" in sql:
+            seen["n"] += 1
+            if seen["n"] == nth:
+                return None
+        return original(sql, params)
+
+    hub.query_one = _patched                      # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        hub.query_one = original                  # type: ignore[method-assign]
 
 
 def _turns_of(thread_key: str) -> int:
@@ -154,7 +193,11 @@ def test_orphan_turns_purged_only_after_session_row_is_gone(db):
 
 
 def test_orphan_purge_keeps_recent_and_empty_session_rows(db):
-    """两条不误清：① 孤儿但不足 7 天 ② session_id 为空（无会话身份的行）。"""
+    """孤儿 DELETE **只**碰「有身份 + 已孤儿 + 超 7 天」的行。
+
+    两条不误清：① 孤儿但不足 7 天 ② ``session_id`` 为空（无会话身份的行 ——
+    前者本来就清不到它们，清它们是另一条 DELETE 的职责，见下面一节）。
+    """
     sessions.ensure_session("dead", ttl_s=-1)
     now_ms = int(time.time() * 1000)
     assert chat_repo.append_turn(
@@ -169,7 +212,105 @@ def test_orphan_purge_keeps_recent_and_empty_session_rows(db):
 
     assert sessions.purge_for_user_sessions() == 1
     assert _turns_of("t-recent") == 2, "不足 7 天的孤儿不该被清"
-    assert _turns_of("t-nosid") == 2, "无会话身份的追问不该被清"
+    assert _turns_of("t-nosid") == 2, "这条 DELETE 不负责无身份的行"
+
+
+# ── DB：无会话身份（session_id='')的 chat_turns —— 绝对上限 DELETE ───────────
+def test_anonymous_turns_really_purged_by_gc(db):
+    """**破口①的核心用例**：``session_id=''`` 的行会被 GC 真的清掉。
+
+    此前这些行**没有任何清理入口**：``purge_for_user_sessions()`` 的孤儿判定带
+    ``session_id != ''``，把它们显式排除；而没有 ``X-Session-Id`` 的调用方
+    （直连 API / 脚本 / 老客户端）写的恰恰全是它们。实测 6 条 30 天前的这类行
+    跑完两个 purge 与多轮 GC 后一行不少，而 ``chat_turns_purged`` 全报 0。
+
+    反向验证：去掉 ``run_once()`` 里对 ``_purge_anonymous_chat_turns`` 的调用，
+    本用例立刻红（``chat_turns_anonymous_purged == 6`` 与行数归零两条断言）。
+    """
+    old = int((time.time() - 40 * 86400) * 1000)
+    for i in range(3):                      # 3 轮追问 = 6 行（user + assistant）
+        assert chat_repo.append_turn(
+            thread_key=f"t-nosid-{i}", turn=1, user="q", assistant="a",
+            session_id="", ts_ms=old,
+        )
+    assert _rows("chat_turns") == 6
+
+    # 前置证明：既有两条 purge 对它们**完全无效**（这就是破口①本身）
+    sessions.purge_expired()
+    sessions.purge_for_user_sessions()
+    assert _rows("chat_turns") == 6, "孤儿 DELETE 不该碰无身份的行（前提变了？）"
+
+    summary = storage_gc.run_once()
+
+    assert summary is not None
+    assert summary["chat_turns_anonymous_purged"] == 6, summary
+    assert summary["errors"] == [] and summary["skipped"] == [], summary
+    assert _rows("chat_turns") == 0, "无身份的超期行没被清"
+    for i in range(3):
+        assert _turns_of(f"t-nosid-{i}") == 0
+    # 幂等：第二轮没有新数据就必须是 0，且不许报错
+    second = storage_gc.run_once()
+    assert second["chat_turns_anonymous_purged"] == 0, second
+
+
+def test_anonymous_purge_keeps_fresh_and_identified_rows(db):
+    """**不误删**：30 天上限远大于一切正常写入，两类行都必须留着。"""
+    now_ms = int(time.time() * 1000)
+    assert chat_repo.append_turn(
+        thread_key="t-fresh-nosid", turn=1, user="q", assistant="a",
+        session_id="", ts_ms=now_ms,
+    )
+    sessions.ensure_session("live", ttl_s=600)
+    assert chat_repo.append_turn(
+        thread_key="t-old-with-id", turn=1, user="q", assistant="a",
+        session_id="live", ts_ms=int((time.time() - 40 * 86400) * 1000),
+    )
+
+    summary = storage_gc.run_once()
+
+    assert summary["chat_turns_anonymous_purged"] == 0, summary
+    assert _turns_of("t-fresh-nosid") == 2, "刚写入的无身份行被超期 DELETE 误清"
+    assert _turns_of("t-old-with-id") == 2, "有会话身份的 40 天前行不该被这条 DELETE 清"
+
+
+def test_anonymous_purge_is_independent_of_session_purge_order(monkeypatch, db):
+    """**顺序无关**：``purge_expired`` 失败时无身份行照样被清（它不查 sessions 表）。
+
+    这是它与孤儿 DELETE 的根本差别，也是「为什么不去改那个 ``AND``」的另一半理由：
+    顺序耦合只属于判据含子查询的那一条。反向验证：把它挪进「purge_expired 成功」
+    分支里，本用例立刻红。
+    """
+    old = int((time.time() - 40 * 86400) * 1000)
+    for i in range(2):
+        assert chat_repo.append_turn(
+            thread_key=f"t-nosid-{i}", turn=1, user="q", assistant="a",
+            session_id="", ts_ms=old,
+        )
+
+    def _boom() -> int:
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(storage_gc, "_purge_expired_sessions", _boom)
+    summary = storage_gc.run_once()
+
+    assert summary is not None
+    assert any("sessions.purge_expired" in e for e in summary["errors"]), summary
+    assert summary["chat_turns_anonymous_purged"] == 4, summary
+    assert _rows("chat_turns") == 0
+
+
+def test_anonymous_retention_is_a_parameter_not_a_constant(db):
+    """保留期可调（测试用），且默认是 30 天 —— 远超 sessions TTL(30min) 与孤儿宽限(7d)。"""
+    assert sessions.ANONYMOUS_TURN_RETENTION_S == 30 * 86400
+    old = int((time.time() - 10 * 86400) * 1000)
+    assert chat_repo.append_turn(
+        thread_key="t-10d", turn=1, user="q", assistant="a", session_id="", ts_ms=old,
+    )
+    assert sessions.purge_anonymous_chat_turns() == 1
+    assert _turns_of("t-10d") == 2, "10 天的无身份行不该被 30 天上限清掉"
+
+    assert sessions.purge_anonymous_chat_turns(retention_s=5 * 86400) == 1
+    assert _turns_of("t-10d") == 0, "调小保留期后应当被清"
 
 
 # ── 内存：会话注册表 ─────────────────────────────────────────────────────────
@@ -212,6 +353,29 @@ def test_gc_does_not_bypass_registry_sse_protection(monkeypatch, db):
     assert holder.sse_queue is not None
     assert summary["registry_evicted"] == 1, "超限的普通会话应被 LRU 踢掉"
     assert remaining == {"keep-sse", "overflow"}
+
+
+def test_capacity_eviction_logs_exactly_one_warning(monkeypatch, db, caplog):
+    """一次淘汰只记一条 warning —— ``_evict_locked`` 曾把同一条**逐字重复**两次。
+
+    重复日志不只是噪音：排查「会话被谁踢了」时，两条一模一样的信息会让日志
+    看起来像「踢了两个会话」，与「只踢了一个」的事实不符（实测 3 次 warning
+    里 2 次完全相同）。
+
+    反向验证：把删掉的那条 warning 加回去，本用例立刻红。
+    """
+    reg = ephemeral.SessionRegistry(
+        backend=ephemeral.InMemoryBackend(max_sessions=1, default_ttl_s=10_000)
+    )
+    monkeypatch.setattr(ephemeral, "_registry", reg)
+    reg.get_or_create("first")
+
+    with caplog.at_level("WARNING", logger="pa_agent.storage.ephemeral"):
+        reg.get_or_create("second")
+
+    evictions = [r.getMessage() for r in caplog.records if "evicted LRU session" in r.getMessage()]
+    assert len(evictions) == 1, evictions
+    assert "evicted LRU session first" in evictions[0], evictions
 
 
 def test_registry_scratch_keys_are_swept_too(monkeypatch, db):
@@ -333,24 +497,34 @@ def test_step_failure_is_contained_and_releases_guard(monkeypatch, db):
 
 
 def test_run_once_never_raises(monkeypatch, db, chat_table):
-    """四步全炸时也不能冒泡 —— 它跑在后台线程里，冒泡只会变成无声的线程死掉。"""
+    """每一步都炸时也不能冒泡 —— 它跑在后台线程里，冒泡只会变成无声的线程死掉。"""
     def _boom(*_a, **_k):
         raise RuntimeError("kaboom")
 
     for name in ("_sweep_registry", "_sweep_chat_sessions", "_storage_ready",
-                 "_purge_expired_sessions", "_purge_orphan_chat_turns"):
+                 "_purge_expired_sessions", "_purge_orphan_chat_turns",
+                 "_purge_anonymous_chat_turns"):
         monkeypatch.setattr(storage_gc, name, _boom)
     summary = storage_gc.run_once()
     assert summary is not None
-    # storage_ready 炸了 ⇒ 判不出 DB 可用 ⇒ 后面两步**根本没跑**（顺序与前置
+    # storage_ready 炸了 ⇒ 判不出 DB 可用 ⇒ 后面三步**根本没跑**（顺序与前置
     # 条件都保住），故 errors 只有 3 条。
     assert len(summary["errors"]) == 3, summary["errors"]
     assert summary["total"] == 0
     assert summary["sessions_purged"] == 0 and summary["chat_turns_purged"] == 0
+    assert summary["chat_turns_anonymous_purged"] == 0
 
 
 def test_db_step_failure_is_contained(monkeypatch, db):
-    """DB 可用但两个删除都炸：仍返回统计，错误逐条落到 errors 里。"""
+    """``sessions`` 清不掉时：孤儿步**跳过并标进 skipped**，且绝不被当成「跑过了」。
+
+    上游失败时孤儿判定必然清不出东西，而它报 0 与「真的没孤儿」无法区分 ——
+    旧行为正是 ``errors:['sessions.purge_expired: db kaboom']`` / ``skipped:[]`` /
+    ``chat_turns_purged:0``，一条顺序故障长成了「一切正常」。
+
+    反向验证：去掉「上游失败 ⇒ 跳过并标注」的分支（改回照跑），本用例的
+    ``skipped`` 与「孤儿步不在 errors 里」两条断言立刻红。
+    """
     def _boom(*_a, **_k):
         raise RuntimeError("db kaboom")
 
@@ -359,8 +533,103 @@ def test_db_step_failure_is_contained(monkeypatch, db):
     summary = storage_gc.run_once()
     assert summary is not None
     assert any("sessions.purge_expired" in e for e in summary["errors"]), summary
-    assert any("chat_turns.purge_for_user_sessions" in e for e in summary["errors"])
+    # 孤儿步**根本没跑**：既不抛错（不在 errors 里），也不该伪装成「跑过了，清 0 条」
+    assert not any("purge_for_user_sessions" in e for e in summary["errors"]), summary
+    assert any("purge_for_user_sessions" in s and "skipped" in s
+               for s in summary["skipped"]), summary["skipped"]
     assert summary["sessions_purged"] == 0
+    assert summary["chat_turns_purged"] == 0
+
+
+# ── 可观测性：读不出来 ≠ 清 0 条（**绝不返回编造的差值**）────────────────────
+def test_count_rows_returns_none_on_read_failure(db):
+    """``_count_rows`` 的失败语义是 **None**，不是 0。
+
+    反向验证：把 ``return None`` 改回 ``return 0``，本用例立刻红 —— 而下面三条
+    用例都建立在这个语义上，会跟着一起红。
+    """
+    sessions.ensure_session("live", ttl_s=600)
+    assert storage_gc._count_rows("sessions") == 1
+    with failing_counts("sessions", nth=1):
+        assert storage_gc._count_rows("sessions") is None
+
+
+def test_purge_reports_nothing_when_before_count_is_unreadable(db):
+    """**删除前**读不出来 ⇒ 跳过本轮、不删、不报数，并留下自带原因的错误。
+
+    「拿数据赌一个数字」不是可接受的行为：连清了什么都不知道就先动手。
+    """
+    sessions.ensure_session("dead", ttl_s=-1)
+    assert _rows("sessions") == 1
+
+    with failing_counts("sessions", nth=1):
+        summary = storage_gc.run_once()
+
+    assert summary is not None
+    assert summary["sessions_purged"] == 0, summary
+    assert any("COUNT(sessions) before purge" in e for e in summary["errors"]), summary
+    assert _rows("sessions") == 1, "读不出来时不该盲删"
+
+
+def test_purge_never_reports_a_fabricated_delta(db):
+    """**破口③的核心用例**：第二次 COUNT 读失败时，绝不报出 ``before - 0``。
+
+    旧行为实测：把第二次 COUNT 打成读失败后 ``_purge_orphan_chat_turns()`` 返回
+    **18**，而 ``errors`` / ``skipped`` 全空 —— 「清了多少」这个字段在真正的故障
+    时刻说了谎，而 R3 的全部可观测性挂在它上面。删除本身仍会发生（幂等，下轮
+    重试），但**行数必须报「不知道」**。
+
+    反向验证：把 ``_count_rows`` 改回失败返回 0，本用例立刻红（会看到 8）。
+    """
+    sessions.ensure_session("live", ttl_s=600)
+    sessions.ensure_session("dead", ttl_s=-1)
+    old = int((time.time() - 8 * 86400) * 1000)
+    for key, sid in (("t-live", "live"), ("t-dead", "dead")):
+        for i in range(2):
+            assert chat_repo.append_turn(
+                thread_key=f"{key}-{i}", turn=1, user="q", assistant="a",
+                session_id=sid, ts_ms=old,
+            )
+    assert sessions.purge_expired() == 1          # 先让 dead 的行成为真孤儿
+    assert _rows("chat_turns") == 8
+
+    with failing_counts("chat_turns", nth=2):
+        summary = storage_gc.run_once()
+
+    assert summary is not None
+    assert summary["chat_turns_purged"] == 0, (
+        "第二次 COUNT 读失败时报出了一个编造的正数", summary
+    )
+    assert any("COUNT(chat_turns) after purge" in e for e in summary["errors"]), summary
+    assert _turns_of("t-live-0") == 2, "在用会话的追问历史不能少"
+
+
+def test_unmeasurable_step_is_distinguishable_from_zero(db):
+    """None（没查成）与 0（查过、确实没东西可清）在 summary 里必须可区分。"""
+    sessions.ensure_session("live", ttl_s=600)
+    clean = storage_gc.run_once()
+    assert clean["chat_turns_purged"] == 0 and clean["errors"] == []
+
+    with failing_counts("chat_turns", nth=1):
+        dirty = storage_gc.run_once()
+
+    assert dirty["chat_turns_purged"] == 0
+    assert dirty["errors"], "「没查成」必须留下错误，不能与干净的 0 同形"
+
+
+def test_health_exposes_unmeasurable_as_an_error_not_a_number(chat_table, db):
+    """None 语义一路贯通到 ``/api/health``：计数为 0 + 自带原因的错误条目。"""
+    from fastapi.testclient import TestClient
+
+    import web.server as server
+
+    with failing_counts("chat_turns", nth=1):
+        storage_gc.run_once()
+
+    payload = TestClient(server.app).get("/api/health").json()
+    last = payload["storage"]["gc"]["last"]
+    assert last["chat_turns_purged"] == 0
+    assert any("COUNT(chat_turns)" in e for e in last["errors"]), last
 
 
 # ── DB 不可用时显式跳过（而不是「静默清 0 条」）────────────────────────────────
@@ -426,12 +695,13 @@ def test_status_reports_last_result(db):
     assert st["last"]["sessions_purged"] == 1
     assert st["last"]["total"] == sum(
         st["last"][k] for k in
-        ("registry_evicted", "chat_sessions_evicted", "sessions_purged", "chat_turns_purged")
+        ("registry_evicted", "chat_sessions_evicted", "sessions_purged",
+         "chat_turns_purged", "chat_turns_anonymous_purged")
     )
     assert st["last"]["duration_ms"] >= 0.0
     assert st["last_run_at"] > 0
     for key in ("registry_evicted", "chat_sessions_evicted", "sessions_purged",
-                "chat_turns_purged", "errors", "skipped"):
+                "chat_turns_purged", "chat_turns_anonymous_purged", "errors", "skipped"):
         assert key in st["last"], f"health 少暴露了 {key}"
 
 
@@ -453,5 +723,6 @@ def test_health_endpoint_exposes_gc(chat_table):
     gc = payload["storage"]["gc"]
     assert gc["running"] is False
     assert gc["last"] is not None and "total" in gc["last"]
+    assert "chat_turns_anonymous_purged" in gc["last"], "health 少暴露了无身份行计数"
     for key in ("running", "interval_s", "next_run_at", "last_run_at", "last"):
         assert key in gc, f"/api/health 少暴露了 gc.{key}"

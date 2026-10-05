@@ -16,6 +16,11 @@
    将来换真 Redis 预留的 —— 调用方只依赖本模块的公开 API。
 2. **重启即丢**：L3 游标由 ``sessions`` 表快照恢复；运行时开关
    （keep_analysis / wait_close）刻意不还原 —— 那是缓存语义。
+3. **过期靠请求续命，不靠心跳**：空闲计时只被**请求**刷新（``/api`` 中间件
+   走 :meth:`SessionRegistry.touch`，快照走 ``sessions.touch_session``，
+   两者都限流）。前端在 ``document.hidden`` 时会停掉轮询 ⇒ **隐藏的 tab 不发
+   请求就会真的开始计空闲**。12 小时是为了让这件事对「切走一会儿」不可见，
+   不是为了让 TTL 失效 —— 无人访问超过 12h 的会话本就该清。
 """
 from __future__ import annotations
 
@@ -29,11 +34,29 @@ from typing import Any, Protocol
 logger = logging.getLogger("pa_agent.storage.ephemeral")
 
 # ── 默认参数 ──────────────────────────────────────────────────────────────────
-#: 空闲多久回收一个会话。30 分钟覆盖「切个标签页看看，过会儿回来」。
-DEFAULT_TTL_S = 1800.0
+#: 空闲多久回收一个会话（**12 小时**）。
+#:
+#: **为什么不是 30 分钟**：30 分钟的注释声称「覆盖『切个标签页看看，过会儿回来』」，
+#: 而前端在 ``document.hidden`` 时**主动** ``stopLiveRefresh()`` —— 注释声称覆盖的
+#: 场景，恰恰是前端主动打断、**一个请求都不发**的场景。那 30 分钟里既没有
+#: ``POST /api/subscribe``（唯一的写续期点），也没有 ``/api/bars``（唯一的读），
+#: 于是一次「切走半小时再回来」就会把热层清空，F5 后读的是全局出厂种子
+#: （XAUUSD/15m）——「刷新后丢游标」的直接成因。
+#:
+#: 12h 的口径是「**一整个工作日的正常使用全程保活**」：中间断断续续（切窗口、
+#: 开会、午休）都在内，只有真正搁置（关电脑、过夜）才回收。
+#:
+#: **本值必须 ≤ ``pa_agent.storage.sessions.DEFAULT_TTL_S``（快照 24h）**：
+#: 反过来的话，进程一重启热层清掉的会话其快照也过期了，重启恢复能力形同虚设。
+DEFAULT_TTL_S = 12 * 3600.0
 #: 硬上限。超出按 LRU 踢 —— 没有上限时，一个反复开关标签页的会话可以
 #: 把内存吃光（AGENTS.md 遗留需求 3「SSE 长连接内存泄漏排查」）。
-DEFAULT_MAX_SESSIONS = 64
+#:
+#: 取 **128** 而不是 64：被踢掉的会话会连带丢掉 ``chat``（追问历史）与
+#: ``last_record``（追问锚点）—— 那是**用户可见的数据丢失**，比多吃几 MB 内存
+#: 严重得多。而 128 个 ``SessionState`` 的实际占用（10 个槽位 + 空 dict）也就
+#: 几十 KB 量级，离「吃光内存」差着好几个数量级。
+DEFAULT_MAX_SESSIONS = 128
 #: 每会话 SSE 出站队列上限。取 256 是沿用原服务端广播队列的取值与理由：
 #: 后台标签页不得无限累积事件。K 线推送已改前端轮询，此常量目前只服务
 #: 追问等仍在用 SSE 的端点。
@@ -166,6 +189,11 @@ class EphemeralBackend(Protocol):
 
     def get_or_create(self, session_id: str) -> SessionState: ...
     def get(self, session_id: str) -> SessionState | None: ...
+    def peek(self, session_id: str) -> SessionState | None: ...
+    def touch(self, session_id: str) -> bool: ...
+    def clear_queue(
+        self, session_id: str, expected: object | None = None
+    ) -> bool: ...
     def drop(self, session_id: str) -> None: ...
     def sweep(self) -> int: ...
     def all_sessions(self) -> list[SessionState]: ...
@@ -191,12 +219,33 @@ class InMemoryBackend:
         with self._lock:
             state = self._sessions.get(session_id)
             if state is not None:
-                state.last_touch = now
-                self._sessions.move_to_end(session_id)
-                return state
+                # **过期视同不存在**（与 :meth:`get` 同一判据）—— 2026-10-06 起
+                # 这里也判 TTL。原实现只在 :meth:`get` 判，于是同一个会话
+                # 「get 说是死的、get_or_create 说是活的」，而 ``resolve_view``
+                # 走的是 get_or_create：热层 TTL 形同虚设。
+                #
+                # 这里**不**像 _evict_locked 那样跳过挂 SSE 队列的：本方法的
+                # 契约是「给我这个 sid 的状态」，下面 ``self._sessions[sid] = ...``
+                # 本来就会覆盖它，跳过只会让旧 state 变成没人认领的孤儿。
+                # （SSE 保护的承诺只对**批量淘汰**成立，那是它被写下来的场景。）
+                if now - state.last_touch > self._ttl:
+                    self._pop_locked(session_id, state)
+                else:
+                    state.last_touch = now
+                    self._sessions.move_to_end(session_id)
+                    return state
+            # **先腾位置，再插入。** 反过来（先插后淘汰）会让 LRU 搜索把
+            # **刚插入的这条**当成最久未用的候选踢掉 —— 新会话按定义就是表里
+            # 唯一一个 sse_queue 为 None 的（老会话都挂着或刚被 move_to_end），
+            # 实测返回值当场就不在表里了：调用方拿着一个「孤儿」SessionState
+            # 往里写游标，下一次读却 miss。宁可超限也不静默交出不在表内的对象。
+            self._evict_locked(now, reserve=1)
             state = SessionState(session_id, now=now)
             self._sessions[session_id] = state
-            self._evict_locked(now)
+            if session_id not in self._sessions:      # 防御：绝不返回不在表内的对象
+                raise RuntimeError(
+                    f"session {session_id!r} vanished right after insert"
+                )
             return state
 
     def get(self, session_id: str) -> SessionState | None:
@@ -207,26 +256,111 @@ class InMemoryBackend:
                 return None
             # 已过期则视同不存在（惰性过期）
             if now - state.last_touch > self._ttl:
-                self._sessions.pop(session_id, None)
+                # **挂着的 SSE 会话不弹**（与 _evict_locked 的承诺一致）：
+                # 弹掉它，其 event_generator 会永远 await 一个再也没人写的
+                # queue，而下一次 get_or_create 建出的新 state 与它毫无关系。
+                # 代价是一个已断连的过期会话要等下一次显式 drop 才回收 ——
+                # 换来的是「断连时 ``_detach_queue`` 认得出这个 state」。
+                if state.sse_queue is None:
+                    self._pop_locked(session_id, state)
                 return None
             state.last_touch = now
             self._sessions.move_to_end(session_id)
             return state
 
+    def peek(self, session_id: str) -> SessionState | None:
+        """读，但**不做任何改动**：不弹、不刷新 ``last_touch``、不动 LRU 序。
+
+        为什么需要它：:meth:`get` 的 TTL 分支会 ``pop``，于是任何「只想看一眼
+        状态」的调用方都会顺手**销毁**这个会话。实测
+        :meth:`SessionRegistry.drop_queue` 与 ``routes_chat._detach_queue``
+        都走的 ``get``：断连时如果会话恰好已过 TTL，游标、追问历史、last_record
+        会一起消失 —— 正是 ``drop_queue`` 自己的 docstring（「用 drop 会把追问
+        历史和游标一起清掉」）明令禁止的事。
+        """
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None:
+                return None
+            if time.time() - state.last_touch > self._ttl:
+                return None          # 过期 = 读不到，但**不删**
+            return state
+
+    def touch(self, session_id: str) -> bool:
+        """刷新已存在会话的 ``last_touch``；**不存在则不创建**，返回是否命中。
+
+        与 :meth:`get_or_create` 的区别正是「不创建」：请求路径上的每请求续期
+        不该为任意 ``/api`` 调用方（健康探针、脚本）凭空造出会话条目。
+        """
+        now = time.time()
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None or now - state.last_touch > self._ttl:
+                return False
+            state.last_touch = now
+            self._sessions.move_to_end(session_id)
+            return True
+
+    def clear_queue(
+        self, session_id: str, expected: object | None = None
+    ) -> bool:
+        """摘掉该会话的 ``sse_queue``，**其余状态一个字节都不动**。返回是否命中。
+
+        与 :meth:`peek` 的区别是**不判 TTL**：断连清理必须对**已过期的会话也
+        生效**，否则那个 ``sse_queue`` 会永远挂着 —— TTL 淘汰与 LRU 淘汰都跳过
+        挂着队列的会话（见 :meth:`_evict_locked`），于是它成了既没人写、又不被
+        回收的常驻对象。
+
+        ``expected`` 是**身份校验**（SSE 断连路径必须传）：同一会话可能有多个
+        在途请求共用一个 ``sse_queue``，而每个请求的 ``finally`` 都会调摘队列。
+        不校验身份时，先断开的那个会把还在推的另一个的队列一起摘掉。
+        ``get``/``peek`` 都能提供这项校验，但两者对「已过期 + 挂流」都返回
+        ``None``，所以校验必须收在这里做。
+        """
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None:
+                return False
+            if expected is not None and state.sse_queue is not expected:
+                return False
+            state.sse_queue = None
+            return True
+
     def drop(self, session_id: str) -> None:
         with self._lock:
             self._sessions.pop(session_id, None)
 
-    def _evict_locked(self, now: float) -> None:
-        """先清过期，再按 LRU 踢到上限以下。调用方须持有锁。"""
-        expired = [k for k, v in self._sessions.items() if now - v.last_touch > self._ttl]
+    def _pop_locked(self, session_id: str, state: SessionState) -> None:
+        """从表里摘掉一条**已知存在**的记录。调用方须持有锁。
+
+        用 ``pop`` 而不是 ``del``：``_sessions`` 可能已被并发改动（GC 线程），
+        ``del`` 遇 KeyError 会冒泡进请求路径。
+        """
+        if self._sessions.get(session_id) is state:
+            self._sessions.pop(session_id, None)
+
+    def _evict_locked(self, now: float, *, reserve: int = 0) -> None:
+        """清过期，再按 LRU 腾出位置。调用方须持有锁。
+
+        ``reserve`` = 本次调用方打算紧接着插入几条（:meth:`get_or_create` 传 1）。
+        提前腾位而不是插完再淘汰，见 :meth:`get_or_create` 的说明。
+        """
+        # TTL 与 LRU 两条淘汰路径**都必须**跳过仍挂着 SSE 队列的会话 ——
+        # docstring 承诺过这条，但原先只有 LRU 分支实现了：实测 sweep 确实
+        # 清掉过正挂着追问流的会话，其 event_generator 会永久 await。
+        expired = [
+            k
+            for k, v in self._sessions.items()
+            if now - v.last_touch > self._ttl and v.sse_queue is None
+        ]
         for k in expired:
             self._sessions.pop(k, None)
             logger.debug("session expired: %s", k)
         # 硬上限：宁可踢最久未用的，也不能让内存无限涨。
         # 但**跳过仍有 SSE 队列的会话** —— 被弹的会话其 event_generator 会永久
         # await queue.get()，连接泄漏且 finally 里的清理永不执行。
-        while len(self._sessions) > self._max:
+        # ``>= max - reserve``：先腾出即将被占用的位置，插入后正好落在上限。
+        while len(self._sessions) + reserve > self._max:
             # OrderedDict 按「最近使用」排序，从头找第一个没有挂连接的会话。
             victim_id = next(
                 (k for k, v in self._sessions.items() if v.sse_queue is None), None
@@ -239,10 +373,6 @@ class InMemoryBackend:
                 )
                 break        # 全都挂着连接，宁可暂时超限也不踢
             victim = self._sessions.pop(victim_id)
-            logger.warning(
-                "session registry at capacity (%d), evicted LRU session %s",
-                self._max, victim.session_id,
-            )
             logger.warning(
                 "session registry at capacity (%d), evicted LRU session %s",
                 self._max, victim.session_id,
@@ -296,19 +426,45 @@ class SessionRegistry:
             return None
         return self._backend.get(session_id)
 
+    def peek(self, session_id: str) -> SessionState | None:
+        """只读，不产生任何副作用（不弹表、不刷 ``last_touch``）。见 backend 同名方法。"""
+        if not session_id:
+            return None
+        return self._backend.peek(session_id)
+
+    def touch(self, session_id: str) -> bool:
+        """把「这个会话还活着」记到热层；**不存在或已过期时不创建**。"""
+        if not session_id:
+            return False
+        return self._backend.touch(session_id)
+
+    def clear_queue(self, session_id: str) -> bool:
+        """摘 SSE 队列，不判 TTL、不销毁会话。见 backend 同名方法。"""
+        if not session_id:
+            return False
+        return self._backend.clear_queue(session_id)
+
     def drop(self, session_id: str) -> None:
         """整个会话丢弃（含 chat / cursor / last_record）。仅关 tab 时用。"""
         self._backend.drop(session_id)
 
-    def drop_queue(self, session_id: str) -> None:
+    def drop_queue(self, session_id: str, expected: object | None = None) -> None:
         """**只**清空该会话的 SSE 出站队列，其余状态原样保留。
 
         断连时必须用这个而不是 :meth:`drop` —— 浏览器会自动重连 EventSource，
         用 drop 会把追问历史和游标一起清掉（P2 隔离被静默摧毁的根因）。
+
+        **必须走 :meth:`clear_queue` 而不是 :meth:`get``**：``get`` 的 TTL 分支
+        会 ``pop`` 掉已过期的会话，于是「断连时顺手清个队列」这个动作会连带销毁
+        游标 / 追问历史 / last_record —— 恰好是本函数 docstring 明令禁止的后果
+        （2026-10-06 实测：会话恰好空闲过 TTL 时，drop_queue 之后这三个全没了）。
+
+        也**不能**简单改用 :meth:`peek`：peek 判 TTL，会让「已过期会话的断连
+        清理」变成空操作，那个 ``sse_queue`` 就永远摘不掉了（TTL/LRU 淘汰都跳过
+        挂着队列的会话）。两条不变式要同时成立，就需要一个**不判 TTL 也不弹表**
+        的入口 —— 那就是 :meth:`clear_queue`。
         """
-        state = self._backend.get(session_id)
-        if state is not None:
-            state.sse_queue = None
+        self._backend.clear_queue(session_id, expected=expected)
 
     def sweep(self) -> int:
         return self._backend.sweep()

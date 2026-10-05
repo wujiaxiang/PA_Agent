@@ -61,6 +61,17 @@ def _mask_placeholder(value: str) -> str:
 #: 用户层/系统兜底里持久化；GET 只是把「本 tab 此刻在看什么」告诉前端。
 _CURSOR_FIELDS: tuple[str, ...] = ("last_symbol", "last_timeframe", "last_tradingview_exchange")
 
+#: 响应体顶层的「本会话没有游标」标记（会话过期 / 从未订阅）。
+#:
+#: **为什么必须可见**：会话过期后刷新**不是空白，是别人的数据** —— 回落全局
+#: 出厂种子（实测 XAUUSD/15m），而用户之前在看 BTCUSDT。静默回落会被读成
+#: 「数据丢了」，用户接下来做的第一件事（重跑分析、翻记录、导出）全都建立在
+#: 一个自己没选过的品种上。这是 R2 最糟的形态：错的，不是空的。
+#:
+#: 前端**不需要**改也不会坏：这是纯增量字段，``loadSettings`` 只读
+#: ``general.*``，多余键被忽略。想用它提示用户时再单独接（``showToast``）。
+SESSION_CURSOR_MISSING_FLAG = "_session_cursor_missing"
+
 
 def _apply_session_cursor(payload: dict, ctx, request: Request) -> None:
     """把 **本会话游标** 覆盖进响应体的 general 段（仅响应，不改全局配置）。
@@ -73,25 +84,32 @@ def _apply_session_cursor(payload: dict, ctx, request: Request) -> None:
     ``resolve_view`` 本身就是「会话游标优先，无会话/无游标时回落全局」，所以
     这里直接复用它，不另写一份判定。无 ``X-Session-Id`` 的调用方（老前端、
     脚本、测试）拿到的仍是全局值，行为与改造前完全一致。
+
+    sid 有效却落到全局分支时额外挂 :data:`SESSION_CURSOR_MISSING_FLAG`
+    —— 见该常量说明：会话过期后刷新不是空白，是出厂种子，必须让调用方看得见。
     """
-    from web.api.session_ctx import resolve_view, session_id_of
+    from web.api.session_ctx import resolve_view, session_cursor_of, session_id_of
 
     sid = session_id_of(request)
     if not sid:
         return
     symbol, timeframe, exchange = resolve_view(ctx, sid)
     general = payload.get("general")
-    if not isinstance(general, dict):
-        return
-    resolved = {
-        "last_symbol": symbol,
-        "last_timeframe": timeframe,
-        "last_tradingview_exchange": exchange,
-    }
-    for field in _CURSOR_FIELDS:
-        value = resolved.get(field)
-        if value:
-            general[field] = value
+    if isinstance(general, dict):
+        resolved = {
+            "last_symbol": symbol,
+            "last_timeframe": timeframe,
+            "last_tradingview_exchange": exchange,
+        }
+        for field in _CURSOR_FIELDS:
+            value = resolved.get(field)
+            if value:
+                general[field] = value
+    # 会话游标缺失 ⇒ 现在显示的这三个值**不是本会话选的**。
+    # 判据用 session_cursor_of（不回落全局的那个），而不是「symbol 是否为空」：
+    # 全局回落值恒非空，拿它当判据等于永远不报警。
+    if session_cursor_of(sid) is None:
+        payload[SESSION_CURSOR_MISSING_FLAG] = True
 
 
 @router.get("/settings")
@@ -106,6 +124,10 @@ async def get_settings(request: Request):
 
     ``general`` 段的游标字段（symbol/timeframe/exchange）返回的是**本会话游标**
     而非全局值，见 :func:`_apply_session_cursor`。
+
+    本会话没有游标时（会话过期 / 从未订阅）额外返回
+    ``_session_cursor_missing: true``：此刻那三个字段是**全局出厂种子**，不是
+    用户选的，调用方有权知道这一点。
     """
     ctx = request.app.state.ctx
     from web.api.auth_ctx import current_user_id

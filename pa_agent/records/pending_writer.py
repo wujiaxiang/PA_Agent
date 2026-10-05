@@ -55,7 +55,7 @@ def _build_basename(record: AnalysisRecord) -> str:
     ``_build_record_path``).
     """
     dt = _ms_to_local_datetime(record.meta.timestamp_local_ms)
-    ts_str = dt.strftime("%Y-%m-%d_%H-%m-%S")
+    ts_str = dt.strftime("%Y-%m-%d_%H-%M-%S")
     # Second resolution collided: two analyses of the same
     # (exchange, symbol, timeframe) inside one second produced identical paths and
     # the second truncated the first. Append milliseconds + a short uuid so the

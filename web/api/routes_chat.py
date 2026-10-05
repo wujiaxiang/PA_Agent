@@ -44,10 +44,26 @@ B tab 的上下文里，互相污染。
 2. **先推 ``done`` 再落库**。SQLite 是 ``busy_timeout=5000``，并发写撞锁时
    会阻塞最多 5 秒；先落库等于让用户在「生成中…」上白等 5 秒，而先推
    ``done`` 最多丢掉「客户端在同一毫秒内重载历史」这一种可见性。
-3. **轮次号取自内存会话**（``len(history_full) // 2 + 1``），与
+3. **轮次号取自内存会话的 ``_turn``**（``_next_turn_number``），与
    ``FreeChatSession._turn`` 严格同源。两套计数会让同一段对话在库里出现
    重复轮次，而 ``ix_chat_thread (user_id, thread_key, turn)`` 不是唯一索引
    —— 写重了不报错，只在回读时顺序错乱。
+
+刷新恢复：分桶键、读端与播种同批上线
+====================================
+刷新后追问历史归零有两个互不相干的成因，必须一起修：
+
+1. **分桶键漂移**：``record_id`` 此前由**前端**拼，而它派生自 ``lastRecord``，
+   而 ``lastRecord`` 每次页面加载重置为 ``null`` —— 实测同一 session 刷新前后
+   三个键互不相同（``…|NVDA_15m_2026-10-05T10:31:02|NVDA|15m|k`` /
+   ``…|chat_1791212104|…`` / ``…|chat_1791212855|…``），于是 ``FreeChatSession``
+   在 30 分钟 TTL 内也**永远命中不了**。修法：前端**不再拼** ``record_id``，
+   record 段一律由服务端从锚点记录推导（:func:`_resolve_thread_key`）。
+2. **有写无读**：``chat_repo.list_turns`` 此前只有 tests 调用，没有 HTTP 端点，
+   ``#chat-messages`` 又是空 div —— 刷新后聊天框 100% 为空。
+
+补读端时**必须同时补播种**（:func:`_seed_session_history`），否则界面显示 2 轮
+而模型以为这是第 1 轮 —— 比空白更糟。
 """
 from __future__ import annotations
 
@@ -91,26 +107,44 @@ _chat_cleanup_task: asyncio.Task | None = None
 
 
 async def _chat_cleanup_loop():
-    """周期清理过期 chat session。"""
+    """周期清理过期的 chat session。
+
+    **锁被占用的条目一律跳过**，这是本函数唯一不能省的判断：
+    ``event_generator`` 持有那把锁直到它自己的 ``finally`` 才释放，而这里若先
+    ``release()``，那条流稍后的 ``finally`` 会二次 release 抛
+    ``RuntimeError: Lock is not acquired`` —— 异常抛在 SSE 响应的 finally 里，
+    **整条流当场炸掉**。代价只是「正在追问的会话晚一轮回收」，语义无损。
+
+    循环体整体兜底：一条畸形条目（``AttributeError``）曾让这个 task 静默死亡，
+    而 ``_ensure_chat_cleanup`` 只在 startup 跑一次 ⇒ 清理**永久失效且不报错**。
+    """
     while True:
         await asyncio.sleep(60)
-        now = time.time()
-        expired = [
-            k for k, v in _chat_sessions.items()
-            if now - v.get("last_touch", 0) > _CHAT_SESSION_TTL_SEC
-        ]
-        for k in expired:
-            entry = _chat_sessions.pop(k, None)
-            if entry is not None:
-                lock = entry.get("lock")
-                # 正在等这把锁的请求只会永远等下去（没有等待者计数）。
-                # 解锁让它立刻醒来，醒来后走「取不到会话」的错误分支。
-                if isinstance(lock, asyncio.Lock) and lock.locked():
-                    try:
-                        lock.release()
-                    except RuntimeError:  # pragma: no cover - 防御
-                        pass
-            logger.info("chat session expired, key=%s", k)
+        try:
+            now = time.time()
+            expired = []
+            for k, v in list(_chat_sessions.items()):
+                if not isinstance(v, dict):
+                    continue
+                if now - v.get("last_touch", 0) <= _CHAT_SESSION_TTL_SEC:
+                    continue
+                entry_lock = v.get("lock")
+                if isinstance(entry_lock, asyncio.Lock) and entry_lock.locked():
+                    continue  # 正在被追问占用：本轮放过
+                expired.append(k)
+            for k in expired:
+                entry = _chat_sessions.pop(k, None)
+                if entry is not None:
+                    lock = entry.get("lock")
+                    # 只剩「filter → pop 之间被抢」这一种竞态，仍兜底。
+                    if isinstance(lock, asyncio.Lock) and lock.locked():
+                        try:
+                            lock.release()
+                        except RuntimeError:  # pragma: no cover - 防御
+                            pass
+                logger.info("chat session expired, key=%s", k)
+        except Exception:  # noqa: BLE001 —— 绝不让 task 带走
+            logger.warning("chat session cleanup pass failed", exc_info=True)
 
 
 @router.on_event("startup")
@@ -118,6 +152,28 @@ async def _ensure_chat_cleanup():
     global _chat_cleanup_task
     if _chat_cleanup_task is None or _chat_cleanup_task.done():
         _chat_cleanup_task = asyncio.create_task(_chat_cleanup_loop())
+        _chat_cleanup_task.add_done_callback(_respawn_chat_cleanup)
+
+
+def _respawn_chat_cleanup(task) -> None:
+    """清理 task 异常退出后重拉。
+
+    循环体已有 try/except，走到这里必是异常。``_ensure_chat_cleanup`` 只在
+    startup 跑一次，没有保活的话 task 一死清理就静默永久失效。
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is None:
+        return
+    logger.warning("chat cleanup task died (%r); respawning", exc)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # pragma: no cover - 事件循环已关
+        return
+    global _chat_cleanup_task
+    _chat_cleanup_task = loop.create_task(_chat_cleanup_loop())
+    _chat_cleanup_task.add_done_callback(_respawn_chat_cleanup)
 
 
 def _touch_session(key: str, session: FreeChatSession, lock=None) -> None:
@@ -277,6 +333,232 @@ def _persist_turn(
         logger.warning("chat turn persistence failed (ignored)", exc_info=True)
 
 
+def _key_part(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _derive_record_key_id(record) -> str:
+    """record 段的**服务端**推导值：``symbol|timeframe|timestamp_local_ms``。
+
+    只依赖 ``record.meta``，因此刷新后、从别的 tab 发出的请求、进程重启后
+    重新解析出的**另一个对象**，算出来的都是同一个值 —— 这正是破口①要的性质。
+
+    **为什么不用 ``free_chat._derive_record_id``**：它的格式串是
+    ``%Y-%m-%d_%H-%m-%S``（分钟位写成了**月** ``%m``，小写），同一小时内同一秒的
+    两条记录会推出**完全相同**的 id。拿它分桶等于把「不同记录挤进同一个桶」
+    这件事重新引回来 —— 而那正是模块 docstring 里最危险的那种静默错答
+    （携带上一条的 stage1/stage2，无任何报错）。``free_chat`` 不在本文件写集内，
+    故此处不复用，也不假装它是对的。
+
+    **为什么带毫秒**：`timestamp_local_iso` 只到秒。同一秒内对同一标的跑两次
+    分析再各自追问，就会共用一个桶。毫秒是记录自身就有的字段，不需要任何额外
+    的全局状态，且刷新前后完全一致。
+
+    取不到 meta 字段时返回空串，由调用方回落到 ``"latest"``。
+    """
+    meta = getattr(record, "meta", None)
+    symbol = _key_part(getattr(meta, "symbol", ""))
+    timeframe = _key_part(getattr(meta, "timeframe", ""))
+    ms = getattr(meta, "timestamp_local_ms", None)
+    if isinstance(ms, bool) or not isinstance(ms, int):
+        ms = ""
+    if not (symbol or timeframe or ms):
+        return ""
+    return "|".join([symbol, timeframe, str(ms)]).strip("|")
+
+
+def _record_key_id(record, record_id: str = "") -> str:
+    """``record_key`` 的第一段：锚点记录的唯一标识。**服务端自己推导。**
+
+    优先级：
+
+    1. 调用方显式传入的 *record_id* —— 保留只是为了让老客户端 / 直连 API 还能
+       指定锚点；前端**不再使用**（见模块 docstring 的「刷新恢复」）。
+    2. ``record._basename`` —— 磁盘文件名 stem。调用方挂上时优先；没挂时返回
+       空串（全仓生产代码目前都不会挂，保留只是不掐断这条既有约定）。
+    3. :func:`_derive_record_key_id` —— 从 ``record.meta`` 现算，刷新后唯一
+       稳定的来源。
+    4. ``"latest"`` —— 记录连 meta 都没有时的占位（此时也无法区分记录，
+       但那本就不是真记录）。
+
+    **为什么不让前端拼**：前端唯一的输入是 ``lastRecord``，而它每次页面加载
+    重置为 ``null``，拼出来的 id 每次刷新都不同 ⇒ 分桶键漂移 ⇒ 内存桶永远命中
+    不了（实测三连刷新得到三个不同的键）。
+    """
+    explicit = _key_part(record_id)
+    if explicit:
+        return explicit
+    basename = _key_part(getattr(record, "_basename", ""))
+    if basename:
+        return basename
+    try:
+        derived = _key_part(_derive_record_key_id(record))
+    except Exception as exc:  # noqa: BLE001 - 派生失败只降级，不该让追问 500
+        logger.debug("record key derivation failed: %s", exc)
+        derived = ""
+    return derived or "latest"
+
+
+def _resolve_thread_key(
+    record,
+    *,
+    session_id: str = "",
+    record_id: str = "",
+    attach_kline_snapshot: bool = False,
+) -> tuple[str, str]:
+    """推出 ``(db_record_id, session_key)``。**SSE 与 GET 读端共用这一个实现。**
+
+    ``session_key`` 的形状::
+
+        f"{thread_key}|{record_key}|{'k' if attach_kline_snapshot else 'n'}"
+
+    三个段的语义见模块 docstring。**两处各拼一遍的后果是静默错答**：
+    ``FreeChatSession._cached_prefix`` 在构造时按 ``base_record`` 固化，携带
+    上一条的 stage1/stage2 会让模型答非所问且**无任何报错** —— 分桶键拼错不会
+    抛异常，只会让「回填出来的历史」与「模型以为的历史」悄悄分家。
+
+    *db_record_id* 同时是 ``chat_turns.record_id`` 的取值，必须与内存分桶用
+    同一个值，复制两份表达式迟早漂移（漂移后库里存的是另一条记录的外键）。
+    """
+    meta = getattr(record, "meta", None)
+    db_record_id = _record_key_id(record, record_id)
+    record_key = "|".join([
+        db_record_id,
+        _key_part(getattr(meta, "symbol", "")),
+        _key_part(getattr(meta, "timeframe", "")),
+    ])
+    # thread 段：让「同一个 session 里的不同记录」互不污染，同时让「不同 tab 的
+    # 同一记录」也互不污染。快照标志单独成段，切换它才真的生效。
+    thread_key = session_id or _NO_SESSION
+    session_key = f"{thread_key}|{record_key}|{'k' if attach_kline_snapshot else 'n'}"
+    return db_record_id, session_key
+
+
+async def _resolve_anchor(request, ctx, state):
+    """解析追问的锚点记录，返回 ``(record, view)``。
+
+    锚点必须**会话级**：``ctx._last_record`` 是全局的，A tab 分析完的结果会成为
+    B tab 追问的锚点。没有 sid 时才回落全局（保持改造前行为）。
+
+    与 ``_resolve_thread_key`` 同样被 SSE 与读端共用 —— 锚点一旦分叉，两条路
+    会算出一个键相同但 ``_cached_prefix`` 不同的会话，比键不同还难查。
+    """
+    # 本 tab 的游标（symbol/timeframe/exchange），不读全局 settings。
+    view = _resolve_view(request, ctx)
+    view_symbol, view_timeframe, _ = view
+    record = state.last_record if state is not None else getattr(ctx, "_last_record", None)
+    if not _record_matches_subscription(record, view_symbol, view_timeframe):
+        record = None
+    if record is None:
+        # Try to load latest from history for this tab's instrument. Offloaded:
+        # on a cache miss this rglobs + parses records — blocking file I/O.
+        from pa_agent.records.analysis_history import find_latest_successful_record
+
+        record = await asyncio.to_thread(
+            find_latest_successful_record,
+            symbol=view_symbol or "",
+            timeframe=view_timeframe or "",
+            exchange=view[2] or "",
+        )
+        # Only promote to the shared hint when it is genuinely the newest one;
+        # previously any fallback clobbered a fresh in-memory record.
+        if record is not None:
+            if state is not None:
+                state.last_record = record
+            else:
+                ctx._last_record = record
+    return record, view
+
+
+def _new_session(ctx, record, view, attach_kline_snapshot: bool) -> FreeChatSession:
+    """构造一个新的 ``FreeChatSession``（**不做任何历史播种**）。"""
+    # 仅当 attach_kline_snapshot=true 时附加最新 K 线快照（Phase C Task 3 SubTask 3.8）
+    kline_fn = (
+        _kline_snapshot_fn(ctx, view) if attach_kline_snapshot else None
+    )
+    return FreeChatSession(
+        base_record=record,
+        client=ctx.client,
+        assembler=ctx.assembler,
+        pending_writer=ctx.pending_writer,
+        ledger=ctx.ledger,
+        settings=ctx.settings,
+        kline_snapshot_fn=kline_fn,
+    )
+
+
+def _seed_session_history(session, turns: list[dict]) -> int:
+    """把库里已有的追问历史播种进 ``session._history_full``，返回消息条数。
+
+    **这一步与读端必须同批上线**：``FreeChatSession.__init__`` 把 ``_turn`` 置 0、
+    ``_history_full`` 置空，而 ``send()`` 只把 ``_history_full`` 拼进
+    ``history_for_api``。只回填界面而不播种，模型看到的就是「这是第一轮」——
+    用户眼前 2 轮对话、模型只记得第 1 轮，比空白更糟。
+
+    ``_turn`` 同步顶到 ``max(turn)``，一次解决两处：
+
+    - 轮次号接着往上涨，而不是从 1 重来（``ix_chat_thread`` 非唯一，写重不报错）；
+    - ``_next_turn_number`` 算出的下一轮号与内存里已有的轮次严格同源。
+
+    *turns* 是 ``chat_repo.load_thread`` 的折叠结果。空列表时**什么都不做**：
+    库里没有历史，硬塞一个 ``_turn = 0`` 的假分桶只会掩盖「确实没聊过」。
+    """
+    try:
+        messages, max_turn = chat_repo.seed_messages(turns)
+    except Exception:  # noqa: BLE001 - 播种失败不得阻断追问
+        logger.warning("chat history seeding failed (ignored)", exc_info=True)
+        return 0
+    if not messages:
+        return 0
+    session._history_full = list(messages)
+    try:
+        session._turn = int(max_turn)
+    except (TypeError, ValueError):
+        session._turn = len(messages) // 2
+    logger.info("chat history seeded: %d messages, turn=%s", len(messages), max_turn)
+    return len(messages)
+
+
+def _next_turn_number(session) -> int:
+    """下一轮的轮次号：与 ``FreeChatSession._turn`` 严格同源。
+
+    **不能用 ``len(history_full) // 2 + 1``**：那条式子只在「每轮恰好追加
+    user + assistant 两条」时成立，而播种出来的历史里**取消的一轮只有一条**
+    （``seed_messages`` 不为它造空回答），算出来的号必然偏小；内存桶回收后
+    更是直接从 1 重来。``_turn`` 是 ``send()`` 自己维护的真源。
+
+    ``_turn`` 是私有属性且 ``free_chat`` 不在本文件写集内，故只能这样读；
+    取不到（非 int）时回落长度法，并保证返回 ``int`` —— 轮次号会被
+    ``chat_repo.append_turn`` 用 ``int()`` 强转，类型不对就整轮不落库。
+    """
+    raw = getattr(session, "_turn", None)
+    base = raw if isinstance(raw, int) and not isinstance(raw, bool) else 0
+    if base < 0:
+        base = 0
+    try:
+        by_len = len(session.history_full) // 2
+    except TypeError:  # pragma: no cover - 仅测试替身可能走到
+        by_len = 0
+    return max(base, by_len) + 1
+
+
+async def _load_thread_turns(session_key: str, limit: int = 0) -> list[dict]:
+    """读一个线程的历史轮次（折叠后）。SQLite 同步调用一律 offload。
+
+    *limit* 传 0 表示用仓储默认。读端宁可多读：截断只影响「显示到第几轮」，
+    而播种截断会让模型丢掉最老的上下文 —— 那比少显示几轮糟得多。
+    """
+    try:
+        if limit:
+            return await asyncio.to_thread(
+                lambda: chat_repo.load_thread(session_key, limit=limit)
+            )
+        return await asyncio.to_thread(chat_repo.load_thread, session_key)
+    except Exception:  # noqa: BLE001 - 读不到历史不该让整个端点失败
+        logger.warning("chat thread read failed (ignored)", exc_info=True)
+        return []
+
+
 @router.get("/chat/stream")
 async def chat_stream(
     request: Request,
@@ -305,34 +587,7 @@ async def chat_stream(
         except Exception as exc:  # noqa: BLE001
             logger.warning("chat session state unavailable for %s: %s", sid, exc)
 
-    # 本 tab 的游标（symbol/timeframe/exchange），不读全局 settings。
-    view_symbol, view_timeframe, view_exchange = _resolve_view(request, ctx)
-
-    # Anchor the follow-up to an analysis of the *currently viewed* instrument.
-    # 锚点必须会话级：ctx._last_record 是全局的，A tab 分析完的结果会成为 B tab
-    # 追问的锚点。没有 sid 时才回落全局（保持改造前行为）。
-    record = state.last_record if state is not None else getattr(ctx, "_last_record", None)
-    if not _record_matches_subscription(record, view_symbol, view_timeframe):
-        record = None
-
-    if record is None:
-        # Try to load latest from history for this tab's instrument. Offloaded:
-        # on a cache miss this rglobs + parses records — blocking file I/O.
-        from pa_agent.records.analysis_history import find_latest_successful_record
-
-        record = await asyncio.to_thread(
-            find_latest_successful_record,
-            symbol=view_symbol or "",
-            timeframe=view_timeframe or "",
-            exchange=view_exchange or "",
-        )
-        # Only promote to the shared hint when it is genuinely the newest one;
-        # previously any fallback clobbered a fresh in-memory record.
-        if record is not None:
-            if state is not None:
-                state.last_record = record
-            else:
-                ctx._last_record = record
+    record, view = await _resolve_anchor(request, ctx, state)
 
     if record is None:
         await event_queue.put({"type": "error", "message": "没有已完成的交易分析记录，请先进行一次分析"})
@@ -353,43 +608,22 @@ async def chat_stream(
 
     meta = getattr(record, "meta", None)
 
-    def _key_part(value: object) -> str:
-        return value.strip() if isinstance(value, str) else ""
-
     # record 三段：保留原语义。扩键而非替换 —— 见模块 docstring 的实测说明。
-    # db_record_id 单独取出来：内存分桶与 chat_turns.record_id 用的是同一个值，
-    # 复制两份表达式迟早会漂移（漂移后库里存的是另一条记录的外键）。
-    db_record_id = (
-        record_id or _key_part(getattr(record, "_basename", "")) or "latest"
+    db_record_id, session_key = _resolve_thread_key(
+        record,
+        session_id=sid,
+        record_id=record_id,
+        attach_kline_snapshot=attach_kline_snapshot,
     )
-    record_key = "|".join(
-        [
-            db_record_id,
-            _key_part(getattr(meta, "symbol", "")),
-            _key_part(getattr(meta, "timeframe", "")),
-        ]
-    )
-    # thread 段：让「同一个 session 里的不同记录」互不污染，同时让「不同 tab 的
-    # 同一记录」也互不污染。快照标志单独成段，切换它才真的生效。
-    thread_key = sid or _NO_SESSION
-    session_key = f"{thread_key}|{record_key}|{'k' if attach_kline_snapshot else 'n'}"
 
     session = _get_session(session_key)
     if session is None:
-        # 仅当 attach_kline_snapshot=true 时附加最新 K 线快照（Phase C Task 3 SubTask 3.8）
-        kline_fn = (
-            _kline_snapshot_fn(ctx, (view_symbol, view_timeframe, view_exchange))
-            if attach_kline_snapshot else None
-        )
-        session = FreeChatSession(
-            base_record=record,
-            client=ctx.client,
-            assembler=ctx.assembler,
-            pending_writer=ctx.pending_writer,
-            ledger=ctx.ledger,
-            settings=ctx.settings,
-            kline_snapshot_fn=kline_fn,
-        )
+        # **先播种再建会话的顺序不能反**：_seed_session_history 只写
+        # _history_full / _turn，两者都是构造后即固定、不参与 _cached_prefix
+        # 的字段，先建后播种是唯一安全的方向。
+        turns = await _load_thread_turns(session_key)
+        session = _new_session(ctx, record, view, attach_kline_snapshot)
+        _seed_session_history(session, turns)
         _touch_session(session_key, session, asyncio.Lock())
     entry_lock = _chat_sessions[session_key]["lock"]
 
@@ -412,9 +646,11 @@ async def chat_stream(
         # 移到事件循环侧后：等待发生在事件循环里，不占 worker，永远不会死锁，
         # 同时仍然保证 FreeChatSession 的互斥（send() 无内建锁）。
         #
-        # 轮次号在 send 之前算：_history_full 初始为空、每轮追加 user+assistant
-        # 两条，故「已完成的轮数」= len // 2，与 _turn（send 内先自增）严格同源。
-        turn_number = len(session.history_full) // 2 + 1
+        # 轮次号在 send 之前算（send() 内部会先自增 _turn，故此刻它就是
+        # 「已完成的轮数」）。必须走 _next_turn_number 而不是
+        # len(history_full)//2 + 1 —— 播种出来的历史里取消的一轮只有一条消息，
+        # 长度法会算出偏小的号。见该函数 docstring。
+        turn_number = _next_turn_number(session)
         try:
             cancel_token = CancelToken()
             reply = session.send(text, cancel_token=cancel_token,
@@ -494,6 +730,104 @@ async def chat_stream(
     return EventSourceResponse(event_generator())
 
 
+#: 回填端点的轮次上限。与 ``chat_repo.DEFAULT_LIMIT`` 同值但**独立声明**：
+#: 一个是仓储的默认值，一个是 HTTP 契约的默认值，绑在一起改会牵动别处。
+_CHAT_RESTORE_LIMIT = 200
+
+
+@router.get("/chat/turns")
+async def chat_turns(
+    request: Request,
+    record_id: str = Query(default="", description="Sidecar basename for followups"),
+    attach_kline_snapshot: bool = Query(
+        default=True,
+        description="必须与发起追问时用的取值一致（同属分桶键的第三段）",
+    ),
+):
+    """读端：回填某个追问线程的历史（**不是 SSE**）。
+
+    **为什么不是 SSE**：这是纯粹的「取一份已经存在的快照」，没有增量、没有
+    长时间连接。SSE 在这里只有两个害处：① 原生 ``EventSource`` 带不了请求头，
+    拿不到 ``X-Session-Id`` ⇒ 分不出 tab ⇒ 读回别人的追问；前端得为此把
+    ``api.js`` 的 ``API.sse`` fetch 封装整套借过来（已经借过一次了）；
+    ② 一次性的 4KB JSON 要占一条长连接与心跳。
+    走普通 ``fetch`` 则自带 ``X-Session-Id``（``API.get`` 已带），
+    顺带因此能用上浏览器缓存/错误码那一套正常语义。
+
+    **返回形状为什么是「一轮一条」而不是「一行一条」**：``chat_turns`` 的物理
+    形状是一轮两行（user + assistant），但那只是存储细节 —— 消费方要回答的
+    是「第 N 轮我问了什么、它答了什么」。折叠之后：
+
+    - 前端一次 ``for`` 就能按对话渲染，不必自己去配对；
+    - 取消的一轮（只有 user 行、``cancelled=1``）能作为**完整的一轮**出现并
+      带 ``cancelled`` 标记，而不是让前端发现「assistant 怎么少了一条」去猜；
+    - **与播种共用同一份折叠**（``chat_repo.seed_messages``），界面上看到的
+      与模型上下文里恢复的一定是同一段对话。二者若各行其是，界面 2 轮、
+      模型第 1 轮 —— 那比空白更糟。
+
+    ``record_id`` / ``attach_kline_snapshot`` 仍开放是为了与 SSE 端点**对称**：
+    两者都过 :func:`_resolve_thread_key`，任何一条改键的规则都不会只改一半。
+    前端两者都不传（record 段由服务端推导，快照段恒为 ``true``）。
+    """
+    ctx = request.app.state.ctx
+    sid = session_id_of(request)
+    state = None
+    if sid:
+        try:
+            state = get_registry().get_or_create(sid)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("chat restore state unavailable for %s: %s", sid, exc)
+
+    record, _view = await _resolve_anchor(request, ctx, state)
+
+    if record is None:
+        # 没锚点 ⇒ 这个标的压根没分析过 ⇒ 真的没聊过。
+        # 200 + 空列表，而不是 404/503：前端据此渲染「还没有追问记录」，
+        # 与「分析过但没追问」走同一条渲染路径，避免出现第三种说不清的态。
+        return {
+            "thread_key": "",
+            "record_id": "",
+            "symbol": "",
+            "timeframe": "",
+            "source": "no_anchor",
+            "turn_count": 0,
+            "turns": [],
+        }
+
+    db_record_id, session_key = _resolve_thread_key(
+        record,
+        session_id=sid,
+        record_id=record_id,
+        attach_kline_snapshot=attach_kline_snapshot,
+    )
+    meta = getattr(record, "meta", None)
+
+    turns = await _load_thread_turns(session_key, limit=_CHAT_RESTORE_LIMIT)
+
+    # **读端与播种同批**：内存桶不在就顺手建一个并播种，界面上看到的历史与
+    # 模型上下文从这一刻起就是同一段。只回填界面不播种，下一次 send() 时模型
+    # 仍会以为这是第一轮（见模块 docstring 的「刷新恢复」）。
+    # 空历史不建桶：没有东西可播种，凭空登记一个空会话只会让「没聊过」在内存里
+    # 也长得像「聊过」，掩盖真正的空态。
+    if turns and _get_session(session_key) is None:
+        session = _new_session(ctx, record, _view, attach_kline_snapshot)
+        _seed_session_history(session, turns)
+        _touch_session(session_key, session, asyncio.Lock())
+
+    return {
+        "thread_key": session_key,
+        "record_id": db_record_id,
+        "symbol": _key_part(getattr(meta, "symbol", "")),
+        "timeframe": _key_part(getattr(meta, "timeframe", "")),
+        # 明说历史是从哪儿来的：库里读到 / 当前标的下压根没有分析记录。
+        # 「两者都没有」就是「真的没聊过」，前端据此显示确定的空态而不是
+        # 「加载中」以外任何含糊的中间态。
+        "source": "db" if turns else "empty",
+        "turn_count": len(turns),
+        "turns": turns,
+    }
+
+
 def _detach_queue(sid: str, queue: asyncio.Queue) -> None:
     """断连清理：**只**摘 SSE 队列，绝不 ``registry.drop(sid)``。
 
@@ -505,8 +839,9 @@ def _detach_queue(sid: str, queue: asyncio.Queue) -> None:
         return
     try:
         registry = get_registry()
-        state = registry.get(sid)
-        if state is not None and state.sse_queue is queue:
-            registry.drop_queue(sid)
+        # 用 clear_queue 而非 peek/get：get() 对「已过期且挂流」的会话返回
+        # None（TTL 分支为保护 SSE 刻意不弹表），照旧走 get 会让断连清理
+        # 静默变成空操作 —— 队列再没人写，而 TTL/LRU 淘汰都跳过挂队列者。
+        registry.drop_queue(sid, expected=queue)
     except Exception as exc:  # noqa: BLE001
         logger.debug("chat queue detach failed for %s: %s", sid, exc)
