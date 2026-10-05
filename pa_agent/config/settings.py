@@ -1,6 +1,6 @@
 """Pydantic settings models for PA Agent."""
 from __future__ import annotations
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -277,6 +277,66 @@ def _migrate_legacy_feishu_json(raw: dict, settings_path: Path) -> bool:
     return migrated
 
 
+def normalize_raw(raw: dict) -> dict:
+    """Legacy 字段迁移：**纯函数**，只做「改名 + 黄金默认值修正」。
+
+    从 :func:`_load_settings_from_file` 里抽出来的独立段，因为 **DB 路径也必须跑它**：
+    ``_try_load_from_db`` 曾把文件 raw 原样交给 ``resolve()`` → ``save_baseline()``，
+    于是 ``default_bar_count`` / ``cost_warning_threshold_pct`` 这些旧字段名直接被
+    升格成系统兜底 —— 之后每次启动都解析不出真值，迁移段被彻底绕过。
+
+    **为什么必须留在 config 层、不能下沉到 storage 层**：它依赖
+    ``pa_agent.data.market_defaults``，而 storage 层一旦 import 它，
+    ``data.market_defaults`` → ``data.tradingview`` → tvDatafeed 整条会被拉起来 ——
+    纯配置读路径从此再也起不来（Docker 镜像里 tvDatafeed 还可能是可选依赖）。
+
+    纯函数、无 I/O、无环境变量读取：需要文件路径或环境变量的那部分在
+    :func:`_repair_file_side`。
+    """
+    out = dict(raw or {})
+    general = out.get("general")
+    general = dict(general) if isinstance(general, dict) else {}
+    if "cost_warning_threshold_pct" in general and "context_warning_threshold_pct" not in general:
+        general["context_warning_threshold_pct"] = general.pop("cost_warning_threshold_pct")
+    general.pop("last_htf_text", None)
+    from pa_agent.data.market_defaults import migrate_general_gold_defaults
+
+    migrate_general_gold_defaults(general)
+    if "default_bar_count" in general and "analysis_bar_count" not in general:
+        general["analysis_bar_count"] = general.pop("default_bar_count")
+    out["general"] = general
+
+    provider = out.get("provider")
+    provider = dict(provider) if isinstance(provider, dict) else {}
+    # 「Migrate legacy encrypted key: drop it, api_key already in provider dict」
+    provider.pop("pricing", None)
+    provider.setdefault("api_key", "")
+    out["provider"] = provider
+    return out
+
+
+def _repair_file_side(raw: dict, path: Path) -> bool:
+    """需要**文件路径 / 环境变量**的那部分迁移，就地改 *raw*，返回是否改动过。
+
+    与 :func:`normalize_raw` 分开的原因只有一个：这两个输入 storage 层拿不到也不该拿
+    —— 飞书 legacy 配置在 ``settings.json`` **同目录**（得知道 path 才能找），
+    PushPlus 互锁要看进程环境里的 ``PUSHPLUS_TOKEN``。两条加载路径都跑这两段。
+    """
+    dirty = _migrate_legacy_feishu_json(raw, path)
+    pushplus = raw.get("pushplus")
+    # 段缺失时 Settings 默认 enabled=False，本就无需互锁，故只在段存在时处理
+    if isinstance(pushplus, dict) and pushplus.get("enabled"):
+        empty = not str(pushplus.get("token") or "").strip()
+        if empty and not (os.environ.get("PUSHPLUS_TOKEN") or "").strip():
+            pushplus["enabled"] = False
+            logger.info(
+                "PushPlus enabled but token empty — auto-disabled "
+                "(Feishu notifications unaffected)"
+            )
+            dirty = True
+    return dirty
+
+
 def load_settings(path: Path | None = None) -> "Settings":
     """Load settings from *path* (default: SETTINGS_JSON_PATH).
 
@@ -320,8 +380,15 @@ def _try_load_from_db() -> "Settings | None":
             if SETTINGS_JSON_PATH.exists():
                 raw = json.loads(SETTINGS_JSON_PATH.read_text(encoding="utf-8"))
                 if isinstance(raw, dict):
-                    file_fallback = raw
+                    # **legacy 迁移必须先于播种**（B2）。曾把 raw 原样交给 resolve()
+                    # → save_baseline()，旧字段名被直接固化成系统兜底，且此后
+                    # 每次启动都读它 —— 迁移段被完整绕过。
+                    file_fallback = normalize_raw(raw)
+                    _repair_file_side(file_fallback, SETTINGS_JSON_PATH)
         except (json.JSONDecodeError, OSError):
+            file_fallback = None
+        except Exception as exc:  # noqa: BLE001 - 迁移失败退回纯文件路径，不阻断启动
+            logger.warning("settings.json legacy 迁移失败，退回纯文件路径: %s", exc)
             file_fallback = None
 
         data = resolve(default_user_id(), file_fallback)
@@ -346,35 +413,12 @@ def _load_settings_from_file(path: Path) -> "Settings":
         logger.warning("settings.json unreadable (%s); using defaults", exc)
         return Settings()
 
-    # Migrate legacy field names
-    general = raw.get("general", {})
-    if "cost_warning_threshold_pct" in general and "context_warning_threshold_pct" not in general:
-        general["context_warning_threshold_pct"] = general.pop("cost_warning_threshold_pct")
-    general.pop("last_htf_text", None)
-    from pa_agent.data.market_defaults import migrate_general_gold_defaults
+    # Migrate legacy field names（纯函数段，与 DB 路径共用同一份实现）
+    raw = normalize_raw(raw)
 
-    migrate_general_gold_defaults(general)
-    if "default_bar_count" in general and "analysis_bar_count" not in general:
-        general["analysis_bar_count"] = general.pop("default_bar_count")
-    raw["general"] = general
-    provider = raw.get("provider", {})
-    provider.pop("pricing", None)
-    raw["provider"] = provider
-
-    # Migrate legacy encrypted key: drop it, api_key already in provider dict
-    raw.setdefault("provider", {}).setdefault("api_key", "")
-
-    migrated_feishu = _migrate_legacy_feishu_json(raw, path)
+    # 依赖文件路径 / 环境变量的那一段
+    dirty = _repair_file_side(raw, path)
     settings = Settings.model_validate(raw)
-    dirty = migrated_feishu
-    if settings.pushplus.enabled and not settings.pushplus.token.strip():
-        if not (os.environ.get("PUSHPLUS_TOKEN") or "").strip():
-            settings.pushplus.enabled = False
-            logger.info(
-                "PushPlus enabled but token empty — auto-disabled "
-                "(Feishu notifications unaffected)"
-            )
-            dirty = True
     if dirty:
         save_settings(settings, path)
     return settings
@@ -390,3 +434,83 @@ def save_settings(settings: "Settings", path: Path | None = None) -> None:
     data = settings.model_dump()
 
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ── 级联写入：用户层 patch ─────────────────────────────────────────────────────
+#
+# 唯一允许的「写配置」入口形态。**收 patch，不收整份 Settings** —— 原因见
+# :func:`persist_patch`。系统兜底层（global_config）在这里不可写：它是所有用户的
+# 只读默认值，只有播种（首次把 settings.json 升格进去）才允许动它。
+
+#: connector / 自动 fallback 有权改写的 provider 字段。其余（thinking /
+#: reasoning_effort / seed / top_p / max_output_tokens …）是用户偏好或 .env，
+#: connector 碰了等于替用户做决定。
+_CONNECTOR_PROVIDER_FIELDS = ("model", "base_url", "api_key", "context_window")
+
+
+def persist_patch(patch: dict, *, user_id: str | None = None) -> bool:
+    """把*调用方自己改的那几个键*写进用户层（user_prefs），返回是否落库成功。
+
+    **为什么不能收整份 settings**：内存里的对象已经被 ``apply_env_overrides``
+    盖过一遍环境变量（15 个字段，含 API_KEY / BASE_URL / model）。整份算 diff
+    会把 .env 的值永久烧进用户层 —— 此后用户改 .env 不再生效，删掉 .env 也
+    「配置被莫名重置」，且系统兜底对这些字段的任何后续更新都传不到他身上。
+
+    只声明自己改的键，则用户层永远是稀疏的：没声明的字段继续继承系统兜底。
+
+    写入仍是「合并后再按基准稀疏化」：与基准取值相同的键不会留在用户层里
+    （否则用户把某个字段改回默认值后，它会永久挡住系统兜底的后续更新）。
+    系统兜底层**绝不被触碰**。
+
+    不写 settings.json：那份文件只是灾备副本，且 connector 每次启动都会重新探测
+    并重放一遍，落不落盘无所谓；而在这里写文件等于把「resolve 读不出来 → 用默认
+    Settings 覆写用户配置」变成一个随时可触发的数据丢失路径。
+
+    读失败时拒绝写入（同 :func:`~pa_agent.storage.settings_store.apply_user_change`）：
+    基准读不出来时算出的 diff 没有意义，那会把整份默认值固化成用户覆盖。
+    """
+    try:
+        from pa_agent.storage.db import get_hub
+        from pa_agent.storage.settings_store import (
+            compute_diff,
+            load_baseline,
+            load_overrides,
+            merge_overrides,
+            save_overrides,
+        )
+        from pa_agent.storage.users import default_user_id
+
+        if not patch:
+            return True
+
+        hub = get_hub()
+        if hub.read_failed:
+            logger.error(
+                "拒绝写入用户覆盖（%s）：DB 读取失败（%s）。本次改动只留在内存。",
+                ",".join(sorted(patch)) or "<empty>",
+                hub.read_error,
+            )
+            return False
+
+        uid = user_id or default_user_id()
+        layer = merge_overrides(load_overrides(uid), patch)
+        return save_overrides(compute_diff(load_baseline() or {}, layer), uid)
+    except Exception as exc:  # noqa: BLE001 - 落库失败绝不冒泡进业务流
+        logger.warning("persist_patch failed (%s): %s", patch, exc)
+        return False
+
+
+def persist_provider(provider: Any) -> bool:
+    """connector / 自动 fallback 落库的唯一出口（8 条 provider 写路径归零到此）。
+
+    只写 :data:`_CONNECTOR_PROVIDER_FIELDS` 那四个字段 —— connector 本来也只改
+    这四个（model / base_url / api_key / context_window）。写整段 provider 会把
+    ``apply_env_overrides`` 盖上的 thinking / seed / top_p 一并固化，等于让
+    connector 替用户决定了偏好。
+    """
+    values = {
+        field: getattr(provider, field)
+        for field in _CONNECTOR_PROVIDER_FIELDS
+        if getattr(provider, field, None) is not None
+    }
+    return persist_patch({"provider": values})

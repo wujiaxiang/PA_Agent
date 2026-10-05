@@ -6,6 +6,50 @@
 
 ## 2026-10-05
 
+### 6. 多会话推理收尾：SSE 下线 / 追问隔离 / 交易域补齐 / 配置层收敛
+
+- **问题**：多标签页虽已能各取各的 K 线，但实时推送、追问、配置仍有全局串味
+  1. `/api/bars/stream` 从**全局订阅**取数并广播给所有连接 → 所有标签页收到同一条数据流
+  2. 追问按 `record|symbol|tf` 分桶 → 同记录被两个标签页回看时**共享对话历史**
+  3. `trade_records` 四域中唯一未完成：只有建表语句
+  4. **9 条**配置写路径绕过级联直接写文件，而文件在有系统兜底后**只写不读**
+  5. `GET /api/settings` 返回全局游标 → 前端 `loadSettings` 覆盖本 tab 游标，
+     **一次 F5 就串味**
+- **根因**：SSE 的鉴权天花板 —— 浏览器原生 `EventSource` **无法设置请求头**，
+  服务端拿不到会话身份，任何「服务端按会话分组」的方案都无法实施
+- **改动**：
+  - **SSE 下线改前端轮询**：`routes_bars_stream.py` 357→68 行，只保留
+    `_compute_next_close_ts`（`routes_data.py` 的跨模块硬契约）；`startSSEBarsStream`
+    改调 `startLiveRefresh(5000)`；持续分析触发从 bar_close 事件改为本地定时器，
+    复用 `PAContinuousGate.closedBarTs()`，`triggerSource` 仍传 `'continuous'`
+  - 补三处否则静默坏掉的联动：`fetchAndUpdateNextCloseTs` 删 SSE 短路（否则
+    next_close_ts 永远拉不到）、`refreshBarsOnly` 补 `chartUpdatePaused`、
+    游标 DOM 写入提到启动轮询**之前**（轮询会同步发请求，顺序反了按旧游标取数）
+  - **追问隔离**：分桶键**扩键**为 `session_id|record|sym|tf|快照标志`（不是替换 ——
+    `FreeChatSession._cached_prefix` 构造时一次性固化，只按 session 分桶会让
+    「先追问 A 再回看 B」时 B 携带 A 的上下文**静默错答**）；`_last_record` 读改
+    `SessionState.last_record`；per-session 锁移到事件循环侧（等锁不再占线程池
+    worker，否则一个挂死的追问会堵死全通道）；页内 nonce 防「复制标签页克隆
+    sessionStorage」
+  - **trade_records 域**：CSV+PNG 为权威副本，DB 表只作索引；`trade_id` 用
+    `sha256(symbol|timeframe|record_time|行号)`（CSV 无盈亏列，`pnl_pct` 恒 NULL，
+    绝不拿 TP/SL 距离伪造收益率）
+  - **配置层**：`normalize_raw` + `_repair_file_side` 让 DB 路径复用 legacy 迁移
+    （原先 DB 路径绕过迁移段，`default_bar_count` 静默回落默认值）；9 条写路径改走
+    `persist_patch`（不是 `persist(settings)` —— 那会把 15 个 .env 字段永久烧进
+    user_prefs）；`GET /api/settings` 返回本会话游标
+- **文件**：`web/api/{routes_bars_stream,routes_chat,routes_analyze,routes_data,routes_settings}.py`、`web/server.py`、`web/static/{js/api.js,js/app.js,index.html}`、`pa_agent/{config/settings.py,config/paths.py,storage/*,records/trade_logger.py,app_context.py,orchestrator/two_stage.py}`、`tests/unit/{test_routes_bars_stream,test_trade_repo,test_settings_cascade,test_followup_and_audit_fixes}.py`
+- **验证**：全量 1307 项测试，failures 38 / errors 30 与基线**完全一致**，新增失败 0。
+  实机：双标签页各取各的 K 线（tA 85881 / tB 233.9）、`next-close` 跨模块契约正常、
+  历史跨会话共享、无 traceback
+- **被否决的方案**：① 服务端按游标分组广播 SSE（EventSource 带不了 header，
+  不可实施）；② 追问分桶键换成纯 session_id（跨记录静默错答）；③
+  `persist(settings)` 整份写（会把 .env 字段烧进用户层）
+
+---
+
+## 2026-10-05
+
 ### 5. 多会话隔离 + SQLite 存储层 + 跨品种历史浏览
 
 - **问题**：

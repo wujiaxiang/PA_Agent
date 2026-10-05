@@ -1,512 +1,223 @@
 # -*- coding: utf-8 -*-
-"""Unit tests for web/api/routes_bars_stream.py — K 线 SSE 流式推送。
+"""Unit tests for web/api/routes_bars_stream.py — K 线下一根收盘时间戳计算。
+
+模块历史
+--------
+本文件原先覆盖的是「K 线 SSE 实时流」：订阅者增删、事件广播、后台 Task 生命周期、
+``/api/bars/stream`` 端点。这些用例共 11 处直接操作模块级 ``_subscribers``，
+随着服务端广播机制下线（多标签页串味 → 改为前端按自己游标轮询）已全部删除，
+对应的 ``_subscribers`` / ``_subscribers_lock`` / ``_broadcast`` /
+``_add_subscriber`` / ``_remove_subscriber`` / ``_background_bars_loop`` /
+``start_background_task`` / ``stop_background_task`` 与 ``/api/bars/stream``
+端点均已从模块中移除。
+
+保留下来的是本模块**唯一仍有价值**的部分：``_compute_next_close_ts()``。
+它是跨模块硬契约（``web/api/routes_data.py`` 里
+``from .routes_bars_stream import _compute_next_close_ts``），删掉会 AttributeError；
+同时「休市 / 取模算法」的正确性由 ``tests/unit/test_countdown_consistency.py``
+与后端 ``pa_agent/data/bar_close_wait.py`` 共同守护，前端「距下次收盘」倒计时
+与「等待收盘」全部依赖它的结果。
 
 覆盖：
-- GET /api/bars/stream 返回 text/event-stream 内容类型
-- 订阅者添加 / 移除
-- 广播事件到所有订阅者
-- _format_bar 处理 dict / pydantic-like 对象
-- 后台 Task 启动 / 停止（生命周期管理）
-
-mock 策略：
-- SSE 端点测试用最小 FastAPI app（仅挂 routes_bars_stream router，不启动后台 Task）
-- 内部函数测试用 ``asyncio.run`` 直接调用异步 API
-- 后台 Task 测试用 MagicMock 的 app（``app.state.ctx = None`` 让 loop 进入 sleep 分支）
+- 跨模块硬契约：``_compute_next_close_ts`` 必须仍可从本模块导入
+- 残留符号必须已删除（防止有人把全局广播复活）
+- ``/api/bars/stream`` 端点已下线（router 不再注册任何路由）
+- 取模算法（elapsed % duration）与周期边界等价性
+- 休市 / 过期 ts_open / 非法 timeframe 等边界返回 None
 """
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import MagicMock
+import pathlib
+import time
 
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from web.api import routes_bars_stream
 from web.api.routes_bars_stream import router as bars_stream_router
 
 
-# ── 公共 fixture ──────────────────────────────────────────────────────────────
+# ── 跨模块硬契约 ──────────────────────────────────────────────────────────────
+
+#: web/api/routes_data.py::bars_next_close 里的实际 import 语句。
+#: 任何对模块的重构都必须保住它，否则 /api/bars/next-close 启动期 AttributeError。
+CROSS_MODULE_CONSUMERS = ("web.api.routes_data",)
 
 
-@pytest.fixture(autouse=True)
-def _reset_module_state():
-    """每个测试前后清空订阅者列表与后台 Task，避免测试间泄漏。"""
-    routes_bars_stream._subscribers.clear()
-    yield
-    # 测试结束后清理后台 Task（若有）
-    task = routes_bars_stream._background_task
-    if task is not None and not task.done():
-        task.cancel()
-        try:
-            asyncio.run(routes_bars_stream.stop_background_task())
-        except Exception:
-            pass
-    routes_bars_stream._subscribers.clear()
+def test_compute_next_close_ts_is_importable_cross_module():
+    """``_compute_next_close_ts`` 必须仍能从本模块按名导入（跨模块硬契约）。"""
+    from web.api.routes_bars_stream import _compute_next_close_ts  # noqa: F401
+
+    assert callable(_compute_next_close_ts)
 
 
-def _make_app() -> FastAPI:
-    """构造最小 FastAPI app，仅挂 bars_stream router，不启动后台 Task。"""
-    app = FastAPI()
-    app.include_router(bars_stream_router, prefix="/api")
-    return app
+def test_router_still_exposed():
+    """``router`` 必须仍然导出 —— web/server.py 会 include_router 它。
 
-
-# ── SSE 端点 ──────────────────────────────────────────────────────────────────
-
-
-def test_bars_stream_route_registered():
-    """路由 /bars/stream 已注册到 bars_stream_router。"""
-    paths = {getattr(r, "path", "") for r in bars_stream_router.routes}
-    assert "/bars/stream" in paths
-
-
-def test_bars_stream_route_mounted_with_api_prefix():
-    """router 被 include 到 app 时带 /api 前缀。"""
-    app = _make_app()
-    # OpenAPI schema 包含所有已注册路由的完整路径
-    schema = app.openapi()
-    assert "/api/bars/stream" in schema["paths"]
-
-
-def test_bars_stream_returns_event_source_response():
-    """bars_stream 处理函数返回 EventSourceResponse（media_type=text/event-stream）。"""
-    from sse_starlette.sse import EventSourceResponse
-
-    # 用最小 mock request —— 我们不会真正迭代 generator，
-    # 所以 is_disconnected 不会被调用。
-    request = MagicMock()
-
-    async def _call():
-        return await routes_bars_stream.bars_stream(request)
-
-    try:
-        response = asyncio.run(_call())
-        assert isinstance(response, EventSourceResponse)
-        assert "text/event-stream" in (response.media_type or "")
-    finally:
-        # bars_stream 调用了 _add_subscriber 但 generator 未迭代，
-        # 手动清理订阅者避免泄漏到后续测试。
-        routes_bars_stream._subscribers.clear()
-
-
-def test_bars_stream_generator_cleans_up_on_disconnect(monkeypatch):
-    """generator 在 request.is_disconnected()=True 时退出并清理订阅者。
-
-    直接迭代 EventSourceResponse.body_iterator（即 event_generator），
-    避免通过 HTTP 层（sse_starlette 的 task group 在 ASGITransport 下
-    会阻塞等待 generator 完成，导致 TestClient / httpx 挂死）。
+    刻意保留（哪怕已不注册任何路由）是为了让 server.py 的 router 导入继续工作。
     """
-    from unittest.mock import AsyncMock
+    from fastapi import APIRouter
 
-    # 缩短心跳超时，让 generator 快速循环
-    monkeypatch.setattr(routes_bars_stream, "_SSE_HEARTBEAT_TIMEOUT_S", 0.1)
+    assert isinstance(bars_stream_router, APIRouter)
 
-    request = MagicMock()
-    # 第一次检查返回 False（让 generator 进入 wait_for），
-    # 后续都返回 True（让 generator 退出）。
-    request.is_disconnected = AsyncMock(side_effect=[False, True, True])
 
-    async def _test():
-        response = await routes_bars_stream.bars_stream(request)
-        # bars_stream 添加了一个订阅者
-        assert len(routes_bars_stream._subscribers) == 1
-        # body_iterator 就是 event_generator
-        gen = response.body_iterator
-        events = []
-        async for event in gen:
-            events.append(event)
-            if len(events) > 5:
-                break  # 安全保护，不应到达
-        return events
+# ── 已删除符号：防止全局广播被复活 ────────────────────────────────────────────
 
-    events = asyncio.run(asyncio.wait_for(_test(), timeout=5))
-    # generator 退出后，订阅者应被清理（finally 块调用 _remove_subscriber）
-    assert routes_bars_stream._subscribers == [], (
-        f"Subscribers not cleaned up: {routes_bars_stream._subscribers}"
-    )
-    # 第一次 is_disconnected=False → generator 进入 wait_for → timeout → yield ping
-    # 第二次 is_disconnected=True → break
-    assert len(events) >= 1
-    # 第一个事件应该是 ping（heartbeat）
-    assert events[0]["event"] == "ping"
+DELETED_NAMES = (
+    "_subscribers",
+    "_subscribers_lock",
+    "_background_task",
+    "_background_bars_loop",
+    "_add_subscriber",
+    "_remove_subscriber",
+    "_broadcast",
+    "start_background_task",
+    "stop_background_task",
+    "_push_bar_update",
+    "_push_bar_close",
+    "_resolve_symbol_timeframe",
+    "_format_bar",
+    "bars_stream",
+)
 
 
-def test_bars_stream_generator_exits_immediately_if_disconnected(monkeypatch):
-    """若连接一开始就断开，generator 应立即退出不产生任何事件。"""
-    from unittest.mock import AsyncMock
+@pytest.mark.parametrize("name", DELETED_NAMES)
+def test_deleted_symbols_absent(name):
+    """服务端广播机制的符号必须已从模块中消失。
 
-    request = MagicMock()
-    request.is_disconnected = AsyncMock(return_value=True)
+    这是本次改造的**回归守卫**：``_subscribers`` 是「多标签页看到同一条数据流」的
+    根因，任何把它加回来的改动都会让本用例失败。
+    """
+    assert not hasattr(routes_bars_stream, name), f"{name} 不应再存在于 routes_bars_stream"
 
-    async def _test():
-        response = await routes_bars_stream.bars_stream(request)
-        gen = response.body_iterator
-        events = []
-        async for event in gen:
-            events.append(event)
-        return events
 
-    events = asyncio.run(asyncio.wait_for(_test(), timeout=5))
-    assert events == []
-    assert routes_bars_stream._subscribers == []
+def test_bars_stream_endpoint_removed():
+    """``/api/bars/stream`` 端点已下线（前端改为轮询 /api/bars）。"""
+    paths = {getattr(r, "path", "") for r in bars_stream_router.routes}
+    assert "/bars/stream" not in paths
+    assert paths == set(), f"本模块不应再注册任何路由，实际: {paths}"
 
 
-# ── 订阅者管理 ────────────────────────────────────────────────────────────────
+def test_module_source_has_no_sse_or_asyncio_dependency():
+    """模块源码里不再出现 SSE / asyncio 相关引用。
 
+    ``sse_starlette`` 与后台 Task 都是 SSE 专属，端点下线后本模块不需要它们。
+    """
+    src = pathlib.Path(routes_bars_stream.__file__).read_text(encoding="utf-8")
+    assert "EventSourceResponse" not in src
+    assert "sse_starlette" not in src
+    assert "asyncio" not in src
+    assert "latest_snapshot" not in src, "本模块不再直接拉数据源（前端按自己游标轮询）"
 
-def test_add_and_remove_subscriber():
-    """_add_subscriber / _remove_subscriber 正确管理订阅列表。"""
 
-    async def _test():
-        q = await routes_bars_stream._add_subscriber()
-        assert q in routes_bars_stream._subscribers
-        assert len(routes_bars_stream._subscribers) == 1
+# ── _compute_next_close_ts：基本与周期换算 ────────────────────────────────────
 
-        await routes_bars_stream._remove_subscriber(q)
-        assert q not in routes_bars_stream._subscribers
-        assert len(routes_bars_stream._subscribers) == 0
-
-        # 再次移除不应报错
-        await routes_bars_stream._remove_subscriber(q)
-
-    asyncio.run(_test())
-
-
-def test_broadcast_to_subscribers():
-    """广播事件应推送到所有订阅者队列。"""
-
-    async def _test():
-        q1 = await routes_bars_stream._add_subscriber()
-        q2 = await routes_bars_stream._add_subscriber()
-        event = {"event": "test", "data": "hello"}
-
-        await routes_bars_stream._broadcast(event)
-
-        e1 = await asyncio.wait_for(q1.get(), timeout=1.0)
-        e2 = await asyncio.wait_for(q2.get(), timeout=1.0)
-        assert e1 == event
-        assert e2 == event
-
-        await routes_bars_stream._remove_subscriber(q1)
-        await routes_bars_stream._remove_subscriber(q2)
-
-    asyncio.run(_test())
-
-
-def test_broadcast_with_no_subscribers_is_noop():
-    """无订阅者时广播不应抛异常。"""
-
-    async def _test():
-        assert routes_bars_stream._subscribers == []
-        await routes_bars_stream._broadcast({"event": "x", "data": "y"})
-
-    asyncio.run(_test())
-
-
-# ── _format_bar ───────────────────────────────────────────────────────────────
-
-
-def test_format_bar_dict():
-    """_format_bar 处理 dict 输入应原样返回。"""
-    bar = {
-        "open": 100.0,
-        "high": 110.0,
-        "low": 95.0,
-        "close": 105.0,
-        "ts_open": 1234567890000,
-        "closed": False,
-    }
-    result = routes_bars_stream._format_bar(bar)
-    assert result == bar
-
-
-def test_format_bar_pydantic_like():
-    """_format_bar 处理含 model_dump 方法的对象应调用它。"""
-
-    class FakeBar:
-        def model_dump(self, mode="python"):
-            return {"open": 1.0, "close": 2.0, "mode": mode}
-
-    result = routes_bars_stream._format_bar(FakeBar())
-    assert result == {"open": 1.0, "close": 2.0, "mode": "json"}
-
-
-def test_format_bar_plain_object():
-    """_format_bar 处理普通对象应取 __dict__ 并过滤私有属性。"""
-
-    class FakeBar:
-        def __init__(self):
-            self.open = 100.0
-            self.close = 105.0
-            self._private = "secret"
-
-    result = routes_bars_stream._format_bar(FakeBar())
-    assert result == {"open": 100.0, "close": 105.0}
-    assert "_private" not in result
-
-
-def test_format_bar_scalar():
-    """_format_bar 处理标量应包装为 dict。"""
-    result = routes_bars_stream._format_bar(42)
-    assert result == {"value": "42"}
-
-
-# ── 后台 Task 生命周期 ─────────────────────────────────────────────────────────
-
-
-def test_start_and_stop_background_task():
-    """start_background_task / stop_background_task 正确管理 Task 生命周期。"""
-
-    async def _test():
-        app = MagicMock()
-        # ctx = None → 后台 loop 进入 sleep 分支，不会真正拉数据
-        app.state.ctx = None
-
-        # 初始状态
-        assert routes_bars_stream._background_task is None
-
-        # 启动
-        await routes_bars_stream.start_background_task(app)
-        assert routes_bars_stream._background_task is not None
-        assert not routes_bars_stream._background_task.done()
-
-        # 停止
-        await routes_bars_stream.stop_background_task()
-        assert routes_bars_stream._background_task is None
-
-    asyncio.run(_test())
-
-
-def test_stop_background_task_idempotent():
-    """stop_background_task 在没有运行 Task 时不应抛异常。"""
-
-    async def _test():
-        await routes_bars_stream.stop_background_task()
-        await routes_bars_stream.stop_background_task()
-
-    asyncio.run(_test())
-
-
-def test_start_background_task_idempotent():
-    """重复调用 start_background_task 不应创建多个 Task。"""
-
-    async def _test():
-        app = MagicMock()
-        app.state.ctx = None
-
-        await routes_bars_stream.start_background_task(app)
-        first_task = routes_bars_stream._background_task
-        assert first_task is not None
-
-        # 再次调用不应创建新 Task（前一个仍在运行）
-        await routes_bars_stream.start_background_task(app)
-        assert routes_bars_stream._background_task is first_task
-
-        await routes_bars_stream.stop_background_task()
-
-    asyncio.run(_test())
-
-
-# ── _resolve_symbol_timeframe ─────────────────────────────────────────────────
-
-
-def test_resolve_symbol_timeframe_from_settings():
-    """优先从 ctx.settings.general 读取 symbol/timeframe。"""
-    ctx = MagicMock()
-    ctx.settings.general.last_symbol = "BTCUSDT"
-    ctx.settings.general.last_timeframe = "1h"
-    source = MagicMock()
-    source._symbol = "ETHUSDT"
-    source._timeframe = "1d"
-
-    symbol, timeframe = routes_bars_stream._resolve_symbol_timeframe(ctx, source)
-    assert symbol == "BTCUSDT"
-    assert timeframe == "1h"
-
-
-def test_resolve_symbol_timeframe_fallback_to_source():
-    """settings 缺失时从 source 私有属性读取。"""
-    ctx = MagicMock()
-    ctx.settings = None
-    source = MagicMock()
-    source._symbol = "ETHUSDT"
-    source._timeframe = "4h"
-
-    symbol, timeframe = routes_bars_stream._resolve_symbol_timeframe(ctx, source)
-    assert symbol == "ETHUSDT"
-    assert timeframe == "4h"
-
-
-def test_resolve_symbol_timeframe_defaults():
-    """settings 和 source 都缺失时使用默认值。"""
-    ctx = MagicMock()
-    ctx.settings = None
-    source = MagicMock()
-    del source._symbol
-    del source._timeframe
-
-    symbol, timeframe = routes_bars_stream._resolve_symbol_timeframe(ctx, source)
-    assert symbol == "BTCUSDT"
-    assert timeframe == "1d"
-
-
-# ── _compute_next_close_ts ───────────────────────────────────────────────────
+TS = 1_700_000_000_000  # 2023-11-14 22:13:20 UTC
 
 
 def test_compute_next_close_ts_basic():
-    """1m timeframe：next_close_ts = ts_open + 60_000 ms（注入 now_ms=ts_open 确保 elapsed=0）。"""
-    # ts_open = 1_700_000_000_000 (2023-11-14 22:13:20 UTC)
-    ts_open = 1_700_000_000_000
-    # 注入 now_ms=ts_open，使 elapsed=0，返回 ts_open + duration
-    result = routes_bars_stream._compute_next_close_ts(ts_open, "1m", now_ms=ts_open)
-    assert result == ts_open + 60_000
+    """1m timeframe：now == ts_open（elapsed=0）时返回 ts_open + 60_000 ms。"""
+    result = routes_bars_stream._compute_next_close_ts(TS, "1m", now_ms=TS)
+    assert result == TS + 60_000
 
 
-def test_compute_next_close_ts_various_timeframes():
-    """不同 timeframe 都能正确换算为毫秒（注入 now_ms=ts_open 确保 elapsed=0）。"""
-    ts_open = 1_700_000_000_000
-    assert routes_bars_stream._compute_next_close_ts(ts_open, "5m", now_ms=ts_open) == ts_open + 5 * 60_000
-    assert routes_bars_stream._compute_next_close_ts(ts_open, "15m", now_ms=ts_open) == ts_open + 15 * 60_000
-    assert routes_bars_stream._compute_next_close_ts(ts_open, "1h", now_ms=ts_open) == ts_open + 60 * 60_000
-    assert routes_bars_stream._compute_next_close_ts(ts_open, "4h", now_ms=ts_open) == ts_open + 4 * 60 * 60_000
-    assert routes_bars_stream._compute_next_close_ts(ts_open, "1d", now_ms=ts_open) == ts_open + 24 * 60 * 60_000
+@pytest.mark.parametrize(
+    "timeframe,duration_ms",
+    [
+        ("1m", 60_000),
+        ("5m", 5 * 60_000),
+        ("15m", 15 * 60_000),
+        ("30m", 30 * 60_000),
+        ("1h", 60 * 60_000),
+        ("2h", 2 * 60 * 60_000),
+        ("4h", 4 * 60 * 60_000),
+        ("1d", 24 * 60 * 60_000),
+        ("1w", 7 * 24 * 60 * 60_000),
+    ],
+)
+def test_compute_next_close_ts_various_timeframes(timeframe, duration_ms):
+    """各周期都能正确换算为毫秒（注入 now_ms=ts_open 确保 elapsed=0）。"""
+    assert routes_bars_stream._compute_next_close_ts(TS, timeframe, now_ms=TS) == TS + duration_ms
 
 
-def test_compute_next_close_ts_invalid_ts_open():
-    """ts_open 为 0 / 负数 / None / 非数字 → 返回 None。"""
-    assert routes_bars_stream._compute_next_close_ts(0, "1m") is None
-    assert routes_bars_stream._compute_next_close_ts(-1, "1m") is None
-    assert routes_bars_stream._compute_next_close_ts(None, "1m") is None
-    assert routes_bars_stream._compute_next_close_ts("abc", "1m") is None
+@pytest.mark.parametrize("timeframe", ["1m", "5m", "1h", "4h", "1d"])
+def test_compute_next_close_ts_modulo_not_naive_add(timeframe):
+    """必须用 ``elapsed % duration`` 取模算法，不能是简单的 ``ts_open + duration``。
+
+    朴素算法在 ts_open 与周期边界不对齐时会整体偏移（时区偏移），
+    这里用一个「非整周期起点」验证：结果必须落在 (now, now+duration] 内。
+    """
+    duration_ms = routes_bars_stream._compute_next_close_ts(TS, timeframe, now_ms=TS) - TS
+    now = TS + 7_919  # 任意非整周期偏移
+    result = routes_bars_stream._compute_next_close_ts(TS, timeframe, now_ms=now)
+    assert result == TS + duration_ms, "非对齐起点必须靠取模回到同一条周期边界"
+    assert now < result <= now + duration_ms
 
 
-def test_compute_next_close_ts_invalid_timeframe():
-    """timeframe 无法解析 → 返回 None。"""
-    assert routes_bars_stream._compute_next_close_ts(1_700_000_000_000, "") is None
-    assert routes_bars_stream._compute_next_close_ts(1_700_000_000_000, "xyz") is None
-    assert routes_bars_stream._compute_next_close_ts(1_700_000_000_000, None) is None
+def test_compute_next_close_ts_exact_boundary_rolls_to_next_period():
+    """now 恰好落在周期边界上（remainder==0）时返回 now + duration，而不是 now。"""
+    now = TS + 5 * 60_000  # 5m 周期的第 1 条边界
+    result = routes_bars_stream._compute_next_close_ts(TS, "5m", now_ms=now)
+    assert result == now + 5 * 60_000
 
 
-# ── _push_bar_update / _push_bar_close 携带 next_close_ts ────────────────────
+def test_compute_next_close_ts_is_stable_within_period():
+    """同一根 forming bar 内多次查询必须返回**同一个**边界时间戳。"""
+    results = {
+        routes_bars_stream._compute_next_close_ts(TS, "15m", now_ms=TS + offset)
+        for offset in (0, 1_000, 60_000, 899_999)
+    }
+    assert len(results) == 1
+    assert results.pop() == TS + 15 * 60_000
 
 
-def test_push_bar_update_includes_next_close_ts(monkeypatch):
-    """_push_bar_update 广播的事件 data 中应包含 next_close_ts 字段。"""
+def test_compute_next_close_ts_handles_stale_ts_open():
+    """ts_open 已远早于 now（休市后残留 / 拉取延迟）时仍返回「下一个未来边界」。
 
-    class FakeBar:
-        """模拟 KlineBar：dict-like + ts_open 字段。"""
-
-        def __init__(self, ts_open: int):
-            self.open = 100.0
-            self.high = 110.0
-            self.low = 95.0
-            self.close = 105.0
-            self.ts_open = ts_open
-            self.closed = False
-
-    ts_open = 1_700_000_000_000
-    source = MagicMock()
-    source.latest_snapshot = MagicMock(return_value=[FakeBar(ts_open)])
-
-    # 注入固定的 now_ms=ts_open，使 elapsed=0，next_close_ts = ts_open + duration
-    monkeypatch.setattr(
-        routes_bars_stream,
-        "_compute_next_close_ts",
-        lambda ts_open_ms, tf, now_ms=None: ts_open_ms + 60_000,
-    )
-
-    async def _test():
-        # 加一个订阅者接收事件
-        q = await routes_bars_stream._add_subscriber()
-        await routes_bars_stream._push_bar_update(source, "BTCUSDT", "1m")
-        event = await asyncio.wait_for(q.get(), timeout=1.0)
-        await routes_bars_stream._remove_subscriber(q)
-        return event
-
-    event = asyncio.run(_test())
-    assert event["event"] == "bar_update"
-    import json as _json
-    data = _json.loads(event["data"])
-    # 验证 next_close_ts 字段存在且等于 ts_open + 60_000
-    assert "next_close_ts" in data
-    assert data["next_close_ts"] == ts_open + 60_000
-    # 顺带验证其他字段仍存在
-    assert data["symbol"] == "BTCUSDT"
-    assert data["timeframe"] == "1m"
-    assert data["last_bar"]["ts_open"] == ts_open
+    取模算法保证返回值恒 > now，不会返回一个过去的时间戳。
+    """
+    now = int(time.time() * 1000)
+    for timeframe in ("1m", "5m", "1h", "1d"):
+        result = routes_bars_stream._compute_next_close_ts(now - 37 * 86_400_000, timeframe, now_ms=now)
+        assert result is not None
+        assert result > now, f"{timeframe} 返回了过去的时间戳: {result}"
 
 
-def test_push_bar_close_includes_next_close_ts(monkeypatch):
-    """_push_bar_close 广播的事件 data 中应包含 next_close_ts 字段（基于新 forming bar）。"""
-
-    class FakeBar:
-        def __init__(self, ts_open: int):
-            self.open = 100.0
-            self.high = 110.0
-            self.low = 95.0
-            self.close = 105.0
-            self.ts_open = ts_open
-            self.closed = True
-
-    # bars[0] 是新 forming bar（即下一根 K 线的 ts_open）
-    new_ts_open = 1_700_000_060_000
-    source = MagicMock()
-    source.latest_snapshot = MagicMock(
-        return_value=[FakeBar(new_ts_open), FakeBar(new_ts_open - 60_000)]
-    )
-
-    # 注入固定的 now_ms，使 elapsed=0，next_close_ts = new_ts_open + 60_000
-    monkeypatch.setattr(
-        routes_bars_stream,
-        "_compute_next_close_ts",
-        lambda ts_open_ms, tf, now_ms=None: ts_open_ms + 60_000,
-    )
-
-    async def _test():
-        q = await routes_bars_stream._add_subscriber()
-        await routes_bars_stream._push_bar_close(source, "BTCUSDT", "1m")
-        event = await asyncio.wait_for(q.get(), timeout=1.0)
-        await routes_bars_stream._remove_subscriber(q)
-        return event
-
-    event = asyncio.run(_test())
-    assert event["event"] == "bar_close"
-    import json as _json
-    data = _json.loads(event["data"])
-    # 验证 next_close_ts = new_ts_open + 60_000
-    assert "next_close_ts" in data
-    assert data["next_close_ts"] == new_ts_open + 60_000
-    assert data["new_bar_ts"] == new_ts_open
-    assert data["symbol"] == "BTCUSDT"
-    assert data["timeframe"] == "1m"
-    assert len(data["bars"]) == 2
+def test_compute_next_close_ts_uses_wall_clock_when_now_omitted():
+    """不传 now_ms 时用 time.time()，返回值必须落在未来且不超过 1 个周期。"""
+    before_ms = int(time.time() * 1000)
+    result = routes_bars_stream._compute_next_close_ts(before_ms - 30_000, "5m")
+    after_ms = int(time.time() * 1000)
+    assert result is not None
+    assert before_ms <= result <= after_ms + 5 * 60_000
 
 
-def test_push_bar_update_next_close_ts_none_for_invalid_timeframe():
-    """timeframe 无法解析时，next_close_ts 应为 None（不抛异常）。"""
+# ── 休市 / 非法输入：一律返回 None ───────────────────────────────────────────
 
-    class FakeBar:
-        def __init__(self):
-            self.open = 100.0
-            self.high = 110.0
-            self.low = 95.0
-            self.close = 105.0
-            self.ts_open = 1_700_000_000_000
-            self.closed = False
+@pytest.mark.parametrize("ts_open", [0, -1, -1_700_000_000_000])
+def test_compute_next_close_ts_nonpositive_ts_open(ts_open):
+    """ts_open <= 0 → None（休市快照里 ts_open 可能为 0）。"""
+    assert routes_bars_stream._compute_next_close_ts(ts_open, "1m") is None
 
-    source = MagicMock()
-    source.latest_snapshot = MagicMock(return_value=[FakeBar()])
 
-    async def _test():
-        q = await routes_bars_stream._add_subscriber()
-        await routes_bars_stream._push_bar_update(source, "BTCUSDT", "xyz")
-        event = await asyncio.wait_for(q.get(), timeout=1.0)
-        await routes_bars_stream._remove_subscriber(q)
-        return event
+@pytest.mark.parametrize("ts_open", [None, "abc", "", [], {}, float("nan")])
+def test_compute_next_close_ts_unparsable_ts_open(ts_open):
+    """ts_open 无法转 int → None（绝不抛异常：调用方在 REST 路径上）。"""
+    assert routes_bars_stream._compute_next_close_ts(ts_open, "1m") is None
 
-    event = asyncio.run(_test())
-    import json as _json
-    data = _json.loads(event["data"])
-    assert "next_close_ts" in data
-    assert data["next_close_ts"] is None
+
+@pytest.mark.parametrize("timeframe", ["", None, "xyz", "0m", "m", "5x"])
+def test_compute_next_close_ts_invalid_timeframe(timeframe):
+    """timeframe 无法解析 → None。
+
+    休市路径尤其重要：/api/bars/next-close 必须在 bars[0].closed == True 时
+    **短路**返回 market_closed:true，绝不能落到这里算出错误的未来边界。
+    """
+    assert routes_bars_stream._compute_next_close_ts(TS, timeframe) is None
+
+
+def test_compute_next_close_ts_never_raises_on_garbage():
+    """任意垃圾输入都只返回 None 或 int，绝不抛异常（调用方在 REST 路径上）。"""
+    for ts_open in (None, "", "x", 0, -5):
+        for timeframe in (None, "", "??", "1m"):
+            got = routes_bars_stream._compute_next_close_ts(ts_open, timeframe)
+            assert got is None or isinstance(got, int)

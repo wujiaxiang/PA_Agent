@@ -138,14 +138,22 @@ let isReplaying = false;
 let _liveSubBeforeReplay = null;
 let currentSettings = null;
 let lastBars = null;           // 最近一次 /api/bars 返回的 K 线（供实时刷新复用）
-let liveRefreshTimer = null;   // 实时刷新 setInterval 句柄（fallback 轮询使用）
+// ── K 线实时流：前端按「自己」的游标轮询 ──────────────────────────────────────
+// 原实现是服务端 SSE 全局广播（后台 Task 从 app.state.ctx 拉一次 K 线推给所有
+// 连接），两个标签页看到的是同一条流，与「每个标签页服务自己的 K 线图」冲突；
+// 「按游标分组广播」也被否决 —— 浏览器原生 EventSource 无法设置请求头，服务端
+// 拿不到 X-Session-Id。改为轮询后，隐藏标签页自动停（visibilitychange 已处理），
+// 一个坏 tab 不会传染其它 tab。
+const BARS_POLL_INTERVAL_MS = 5000;      // /api/bars 轮询间隔，对齐原服务端 SSE 推送节奏
+const KEEP_ANALYSIS_TICK_MS = 3000;      // 持续分析本地定时器 tick（纯本地判定，不发请求）
+
+let liveRefreshTimer = null;   // 实时刷新 setInterval 句柄（K 线轮询）
 let liveRefreshLastTs = 0;     // 上次刷新时间戳（ms）
-let sseBarsStream = null;      // SSE EventSource 实例 (/api/bars/stream)
-let sseReconnectTimer = null;  // SSE 重连定时器（10s 退避）
-let sseFallbackPolling = false;// SSE 失败后是否降级为轮询模式
-let sseLastBarUpdateTs = 0;    // 最近一次 SSE bar_update/bar_close 事件的时间戳（ms）
-let sseNextCloseTs = 0;        // 当前 forming bar 的下一收盘时间戳（ms，来自后端 next_close_ts）
+let barsStreamPolling = false; // 「实时 K 线流」是否处于轮询活跃状态
+let sseNextCloseTs = 0;        // 当前 forming bar 的下一收盘时间戳（ms，来自 /api/bars/next-close）
+let marketClosed = false;      // /api/bars/next-close 上报的休市标志（bars[0].closed == true）
 let keepAnalysisLastClosedTs = 0;  // 持续分析哨兵：上次处理的收盘 bar ts_open，防止同一根 bar 重复触发分析
+let keepAnalysisTimer = null;  // 持续分析本地定时器句柄（替代原 bar_close SSE 事件）
 // 下单机会订单类型 —— 由 /api/order-opportunity-types 从后端单一真源
 // （pa_agent.ai.order_opportunity.ORDER_OPPORTUNITY_TYPES）拉取，避免前后端枚举漂移。
 let ORDER_OPPORTUNITY_TYPES = ['限价单', '突破单', '市价单'];
@@ -153,13 +161,13 @@ let ORDER_OPPORTUNITY_TYPES = ['限价单', '突破单', '市价单'];
 let pendingDeleteId = null;
 let chartUpdatePaused = false;  // 分析期间暂停图表实时更新
 let sseStatusExpiryTimer = null;  // updateSSEStatusWithExpiry 定时器句柄
-let nextClosePollingTimer = null;  // 低频拉取 next_close_ts 定时器（fallback/纯轮询模式下使用）
+let nextClosePollingTimer = null;  // 低频拉取 next_close_ts 定时器（轮询模式下使用）
 let nextClosePollingInFlight = false;  // 防止并发 fetch
 let displayTimezone = "Asia/Shanghai";  // 显示时区（IANA 名称），与 chart.js _displayTimezone 同步
 let isAnalyzing = false;                // 是否有分析进行中（供「持续分析」开关判断）
-let waitCloseCountdownTimer = null;     // 等待收盘 setInterval 句柄（仅 SSE 不活跃时使用）
+let waitCloseCountdownTimer = null;     // 等待收盘 setInterval 句柄（仅轮询流不活跃时使用）
 let waitCloseDisplayTimer = null;       // 等待收盘显示用 setInterval 句柄（勾选复选框时使用）
-let waitCloseCountdownResolver = null;  // SSE 活跃时倒计时归零的 resolve 回调（由 updateSSEStatusWithExpiry 触发）
+let waitCloseCountdownResolver = null;  // 轮询流活跃时倒计时归零的 resolve 回调（由 updateSSEStatusWithExpiry 触发）
 
 // ── 追问嵌入实时 tab（Phase C Task 3） ──────────────────────────────────
 // chatAbortController: 追问 SSE 的 AbortController，非 null 表示发送中
@@ -419,6 +427,13 @@ async function refreshBarsOnly() {
   try {
     const data = await API.get('/api/bars?count=100');
     lastBars = data.bars || [];
+    // 分析期间暂停图表 K 线渲染（lastBars 仍然更新，保证持续分析的收盘判定
+    // 用的是最新数据；分析结束后的 loadBars() 会把图表一次性刷新到位）
+    if (chartUpdatePaused) {
+      liveRefreshLastTs = Date.now();
+      updateLiveRefreshStatus();
+      return;
+    }
     applyBarsToChart(lastBars);
     if (lastBars.length) {
       const sorted = [...lastBars].sort((a, b) => a.ts_open - b.ts_open);
@@ -756,12 +771,15 @@ function bindEvents() {
           exchange: live.exchange,
         }, { timeout: 15000 });
         await loadBars();
-        if (wasLive) startSSEBarsStream();
         clearOverlays(candleSeries);
+        // ⚠ 工具栏游标必须**先于** startSSEBarsStream 写好：轮询流的
+        // startNextClosePolling 会同步发起一次 next-close 请求，读的是
+        // #ds-symbol/#ds-exchange/#ds-timeframe；顺序反了会按旧游标取数。
         const hid = $('#ds-symbol'); if (hid) hid.value = live.symbol;
         const shown = $('#ds-symbol-search'); if (shown) shown.value = live.symbol;
         const tf = $('#ds-timeframe'); if (tf) tf.value = live.timeframe;
         const ex = $('#ds-exchange'); if (ex && live.exchange) ex.value = live.exchange;
+        if (wasLive) startSSEBarsStream();
         showToast(`已返回实时：${live.symbol} ${live.timeframe}`, 'success');
       } catch (err) {
         console.error('backToLive:', err);
@@ -1074,7 +1092,7 @@ function bindEvents() {
   const btnChatClear = $('#btn-chat-clear');
   if (btnChatClear) btnChatClear.addEventListener('click', clearChatOutput);
 
-  // 实时刷新开关：优先 SSE，失败降级为 3s 轮询
+  // 实时刷新开关：开 = 启动前端轮询流（每 5s 拉 /api/bars）
   $('#cb-live-refresh').addEventListener('change', (e) => {
     if (e.target.checked) {
       startSSEBarsStream();
@@ -1113,12 +1131,15 @@ function bindEvents() {
       const cbLive = $('#cb-live-refresh');
       const cbWait = $('#cb-wait-close');
       if (cbKeepAnalysis.checked) {
-        // 持续分析依赖 SSE 实时流的 bar_close 事件 + 等待收盘
+        // 持续分析依赖实时 K 线轮询流（本地定时器读刚收盘 bar）+ 等待收盘
         // 强制勾选并锁定「实时」+「等待收盘」
         if (cbLive) { cbLive.checked = true; cbLive.disabled = true; }
         if (cbWait) { cbWait.checked = true; cbWait.disabled = true; }
-        // 如果实时之前未开，现在开启 SSE
-        if (!sseBarsStream) startSSEBarsStream();
+        // 如果实时之前未开，现在开启轮询流
+        if (!barsStreamPolling) startSSEBarsStream();
+        // 哨兵对齐到当前已收盘的那根：等**下一根**收盘才分析（与原 SSE 语义一致，
+        // 否则本地定时器会在 3s 内对早已收盘的 bar 补跑一轮）
+        primeKeepAnalysisSentinel();
         // 启动倒计时显示
         startWaitingCountdownDisplay();
       } else {
@@ -1133,7 +1154,7 @@ function bindEvents() {
       // 同步分析按钮样式（waiting ⇄ idle）
       refreshAnalyzeButtonWaitingState();
       // 更新状态栏文案
-      if (sseBarsStream && !sseFallbackPolling) {
+      if (barsStreamPolling) {
         updateSSEStatusWithExpiry();
       } else {
         updateLiveRefreshStatus();
@@ -1189,17 +1210,17 @@ function bindEvents() {
     });
   }
 
-  // 页面可见性优化：隐藏时暂停 SSE/轮询，可见时恢复
+  // 页面可见性优化：隐藏时暂停轮询流，可见时恢复（隐藏的标签页不占后端请求）
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
-      // 页面隐藏 → 暂停 SSE 与轮询，降低后台资源占用
+      // 页面隐藏 → 暂停轮询流，降低后台资源占用（隐藏的标签页不发请求）
       if ($('#cb-live-refresh').checked) {
         stopSSEBarsStream();
         stopLiveRefresh();
         updateSSEStatus('paused');
       }
     } else {
-      // 页面恢复可见 → 立即拉一次填补空缺，然后重启 SSE
+      // 页面恢复可见 → 立即拉一次填补空缺，然后重启轮询流
       if ($('#cb-live-refresh').checked) {
         refreshBarsOnly();
         startSSEBarsStream();
@@ -1278,7 +1299,7 @@ async function saveSettingsHandler() {
     updateTimezoneLabel(newTz);
     // 重新加载以同步 currentSettings 与 context_window
     await loadSettings();
-    // 若实时刷新已开启，重启 SSE 以应用新的设置（如 fallback polling 间隔）
+    // 若实时刷新已开启，重启轮询流以应用新的设置
     if ($('#cb-live-refresh').checked) {
       stopSSEBarsStream();
       startSSEBarsStream();
@@ -1342,7 +1363,7 @@ async function feishuTestHandler() {
 //   - _inflightSwitch 防重入
 //   - /api/subscribe 15s 超时（AbortController）
 //   - subscribe 成功后并行执行 loadBars/loadSettings/loadHistoryList/refreshIncrementalButtonState
-//   - loadBars 完成后再 startSSEBarsStream（避免 SSE 收到旧 symbol 事件）
+//   - loadBars 完成后再 startSSEBarsStream（避免轮询流按旧游标取数）
 //   - 失败用 showSwitchError 替代 alert，3 秒后恢复按钮状态
 async function applySubscribe() {
   // 重入保护：切换进行中直接忽略后续点击
@@ -1360,7 +1381,7 @@ async function applySubscribe() {
   }
 
   _inflightSwitch = true;
-  // 切换前若实时刷新开启，先关闭 SSE，避免收到旧 symbol 的事件
+  // 切换前若实时刷新开启，先停轮询流，避免按旧游标继续取数
   const wasLiveRefreshOn = $('#cb-live-refresh').checked;
   if (wasLiveRefreshOn) stopSSEBarsStream();
   // 进入 loading 状态：按钮/搜索框/交易所下拉均 disabled
@@ -1400,10 +1421,11 @@ async function applySubscribe() {
     }, { timeout: 15000 });
 
     // subscribe 成功后并行执行 4 个请求：loadBars / loadSettings / loadHistoryList / refreshIncrementalButtonState
-    // - loadBars 成功后才能 startSSEBarsStream（避免 SSE 收到旧 symbol 事件），用 .then 链接
+    // - loadBars 成功后才能 startSSEBarsStream（避免轮询流按旧游标取数），用 .then 链接
     // - 其他三个无依赖，单个失败不影响其他
     const barsPromise = loadBars().then(() => {
-      // SSE 时序：loadBars 完成后再启动 SSE，确保新数据已加载
+      // 时序：loadBars 完成后再启动轮询流，确保新数据已加载且游标已是新的
+      //（#ds-symbol/#ds-timeframe/#ds-exchange 在本函数开头就从 DOM 读出用户新选择）
       if (wasLiveRefreshOn) startSSEBarsStream();
     });
 
@@ -1482,7 +1504,7 @@ async function applySubscribe() {
     // 失败 3 秒后恢复按钮状态（让用户看到错误提示后再恢复可点击）
     setTimeout(() => {
       restoreControls();
-      // 失败后若之前 SSE 是开启的，恢复 SSE（仍是旧 symbol 的 stream）
+      // 失败后若之前实时是开启的，恢复轮询流（仍是旧游标）
       if (wasLiveRefreshOn) startSSEBarsStream();
     }, 3000);
   }
@@ -1595,8 +1617,9 @@ function updateAnalyzeButtonHint() {
   }
 }
 
-// ── 实时刷新（fallback 轮询；SSE 优先） ──────────────────────────────
-// intervalMs 可选：指定轮询间隔（ms）；不传则读取设置中的 refresh_interval_ms
+// ── 实时刷新（前端按自己游标的轮询） ────────────────────────────────────
+// 唯一调用方是 startSSEBarsStream()，间隔固定为 BARS_POLL_INTERVAL_MS（5000ms）；
+// intervalMs 参数保留给潜在的其它调用方，不传则读设置里的 refresh_interval_ms
 function startLiveRefresh(intervalMs) {
   stopLiveRefresh();
   const interval = intervalMs || (parseInt($('#s-refresh-ms').value) || 1000);
@@ -1604,8 +1627,8 @@ function startLiveRefresh(intervalMs) {
   const safeInterval = Math.max(500, interval);
   liveRefreshTimer = setInterval(refreshBarsOnly, safeInterval);
   liveRefreshLastTs = Date.now();
-  // 轮询模式下也需要显示「距下次收盘」倒计时：启动低频拉取 next_close_ts
-  // （SSE 活跃时 fetchAndUpdateNextCloseTs 内部会自动跳过）
+  // 轮询模式下需要「距下次收盘」倒计时：启动低频拉取 next_close_ts
+  // （轮询模式下 next_close_ts 的唯一来源就是它）
   startNextClosePolling();
   updateLiveRefreshStatus();
 }
@@ -1940,9 +1963,9 @@ function stopLiveRefresh() {
 }
 
 function updateLiveRefreshStatus() {
-  // 守卫：SSE 活跃（sseBarsStream 非 null 且非降级轮询）时由 updateSSEStatusWithExpiry
-  // 接管状态栏文案，此处直接返回避免覆盖「距上次刷新 · 距下次收盘」文案
-  if (sseBarsStream && !sseFallbackPolling) {
+  // 守卫：轮询流活跃时由 updateSSEStatusWithExpiry 接管状态栏文案，
+  // 此处直接返回避免覆盖「距上次刷新 · 距下次收盘」文案
+  if (barsStreamPolling) {
     return;
   }
   const cbKeep = $('#cb-keep-analysis');
@@ -1950,7 +1973,8 @@ function updateLiveRefreshStatus() {
   const el = $('#live-refresh-status');
   if (!el) return;
 
-  // 计算倒计时：fallback 轮询 / 纯轮询模式下也显示「距下次收盘」（由 startNextClosePolling 维护 sseNextCloseTs）
+  // 轮询流不活跃（实时关闭 / demo / 回看）时也显示「距下次收盘」
+  //（由 startNextClosePolling 维护 sseNextCloseTs）
   let closeText = '';
   if (sseNextCloseTs > 0) {
     const dsTf = $('#ds-timeframe')?.value || '';
@@ -1963,20 +1987,6 @@ function updateLiveRefreshStatus() {
     }
   }
 
-  if (sseFallbackPolling) {
-    // SSE 失败已降级轮询：显示降级提示 + 距上次刷新 + 倒计时 + 持续分析
-    const elapsed = liveRefreshLastTs ? Math.max(0, (Date.now() - liveRefreshLastTs) / 1000) : 0;
-    el.textContent = `⚠ 降级轮询 · 距上次刷新 ${elapsed.toFixed(1)}s${closeText}${keepSuffix}`;
-    el.style.color = '#ef5350';
-    return;
-  }
-  if (sseBarsStream) {
-    // SSE 连接中（尚未收到事件）：保留原文案，仅追加持续分析后缀
-    const base = el.textContent || '';
-    const stripped = keepSuffix ? base.replace(/ · 持续分析中$/, '') : base;
-    el.textContent = keepSuffix ? (stripped + keepSuffix) : stripped;
-    return;
-  }
   if (!liveRefreshTimer) {
     el.textContent = keepSuffix ? keepSuffix.replace(/^ · /, '') : '';
     if (!el.textContent) el.style.color = '';
@@ -1989,215 +1999,99 @@ function updateLiveRefreshStatus() {
 // 每秒更新一次"距上次刷新"显示
 setInterval(updateLiveRefreshStatus, 1000);
 
-// ── SSE 实时 K 线流（/api/bars/stream） ───────────────────────────────
-// 优先使用 SSE 推送；连接失败时降级为 3s 轮询；页面不可见时暂停。
+// ── 实时 K 线流：前端按自己游标轮询（原 /api/bars/stream SSE 已下线） ──────
+// 历史：服务端 SSE 从**全局**订阅拉一次 K 线再广播给所有连接，两个标签页看到
+// 的是同一条流。「按游标分组广播」被否决 —— EventSource 无法设置请求头，服务端
+// 拿不到 X-Session-Id；且一个坏品种的 auto-probe 会长时间持有
+// TradingViewSource._snapshot_lock，全站 /api/bars 排队。
+// 现在：每个标签页按**自己的** #ds-symbol/#ds-exchange/#ds-timeframe 轮询。
+//   · 间隔 BARS_POLL_INTERVAL_MS = 5000ms，对齐原服务端 SSE 推送节奏
+//   · 隐藏标签页由 visibilitychange 自动停，坏 tab 不传染别人
+//   · next_close_ts 由 startNextClosePolling 低频拉取（唯一来源）
+//
+// ⚠ 调用前必须先写好 #ds-symbol/#ds-exchange/#ds-timeframe：startNextClosePolling
+// 会**同步**发起一次 next-close 请求，读到的必须是新游标而不是旧游标。
 function startSSEBarsStream() {
-  // 先关闭已有 SSE 连接与 fallback 轮询
   stopSSEBarsStream();
-  try {
-    sseBarsStream = new EventSource('/api/bars/stream');
-
-    // bar_close 事件：一根 K 线收盘，推送完整 bars 数组
-    sseBarsStream.addEventListener('bar_close', (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        const bars = data.bars || [];
-        // sorted 提前定义，避免 bars 为空时 L1518 引用未定义变量
-        const sorted = bars.length ? [...bars].sort((a, b) => a.ts_open - b.ts_open) : [];
-        if (bars.length) {
-          // 成套更新（蜡烛 + 序号标记 + 指标重算 + 时间锚点）
-          applyBarsToChart(bars);
-          if (sorted.length) window.__PA_LAST_BAR_TIME__ = sorted[sorted.length - 1].ts_open / 1000;
-        }
-        // 解析后端附带的 next_close_ts（新 forming bar 的收盘时间戳，ms）
-        if (data.next_close_ts != null && data.next_close_ts > 0) {
-          sseNextCloseTs = Number(data.next_close_ts);
-        } else {
-          sseNextCloseTs = 0;
-        }
-        sseLastBarUpdateTs = Date.now();
-        liveRefreshLastTs = sseLastBarUpdateTs;
-        // SSE 恢复正常 → 清除 fallback 标记并停止轮询
-        if (sseFallbackPolling) {
-          sseFallbackPolling = false;
-          stopLiveRefresh();
-          // SSE 恢复后 next_close_ts 由事件推送，停止低频轮询
-          stopNextClosePolling();
-        }
-        // 启动每秒更新状态栏（含 elapsed/remaining）
-        // 注意：必须在收到 bar_close 后启动，而非 onopen，否则 sseNextCloseTs 还没更新
-        startSSEStatusExpiryTimer();
-        // SSE 活跃时由 updateSSEStatusWithExpiry 接管文案（含 elapsed/remaining）
-        updateSSEStatusWithExpiry();
-        // 持续分析：K 线收盘后自动触发新一轮分析（分析期间不重复触发）
-        // 哨兵去重：仅当新收盘 bar 的 ts_open 与上次处理的不同时才触发
-        // 注意：sorted 按 ts_open 升序，sorted[-1] = forming bar，sorted[-2] = 刚收盘 bar
-        const cbKeep = $('#cb-keep-analysis');
-        // 防御性重置：如果分析流已结束但 isAnalyzing 未被正确重置（边界情况），修正它
-        if (isAnalyzing && currentAnalysisStream === null) {
-          isAnalyzing = false;
-        }
-        if (cbKeep && cbKeep.checked && !isAnalyzing) {
-          // 刚收盘 bar 的 ts_open 作为哨兵（统一实现，见 continuous_gate.closedBarTs）
-          const newClosedTs = window.PAContinuousGate
-            ? window.PAContinuousGate.closedBarTs(bars)
-            : (sorted.length >= 2 ? sorted[sorted.length - 2].ts_open : 0);
-          if (newClosedTs && newClosedTs !== keepAnalysisLastClosedTs) {
-            keepAnalysisLastClosedTs = newClosedTs;
-            // 自动选路：有可复用上下文走增量，否则走完整分析
-            if (shouldUseIncremental()) {
-              startIncrementalAnalysis(true, 'continuous');
-            } else {
-              startAnalysis(true, 'continuous');
-            }
-          }
-        }
-      } catch (err) {
-        console.error('bar_close event error:', err);
-      }
-    });
-
-    // bar_update 事件：每 5s 推送正在形成的最后一根 bar
-    sseBarsStream.addEventListener('bar_update', (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        // 分析期间暂停图表更新（仅暂停 K线渲染，仍更新 next_close_ts 和状态栏）
-        if (chartUpdatePaused) {
-          if (data.next_close_ts != null && data.next_close_ts > 0) {
-            sseNextCloseTs = Number(data.next_close_ts);
-          } else {
-            sseNextCloseTs = 0;
-          }
-          sseLastBarUpdateTs = Date.now();
-          liveRefreshLastTs = sseLastBarUpdateTs;
-          updateSSEStatusWithExpiry();
-          return;
-        }
-        const bar = data.last_bar;
-        if (bar) {
-          // 仅更新最后一根（forming）bar
-          candleSeries.update({
-            time: bar.ts_open / 1000,
-            open: bar.open,
-            high: bar.high,
-            low: bar.low,
-            close: bar.close,
-          });
-          // 同步 lastBars 里的同一根 bar。
-          // /api/bars 返回 **newest-first**（bars[0] = forming bar，见 AGENTS.md
-          // 数据快照契约），而休市检测那行读的正是 lastBars[0]。这里原先取
-          // lastBars[length-1]（最老的一根）去比 ts_open，永远匹配不上 ——
-          // forming bar 的 OHLC 从此在 lastBars 里一直是快照时的旧值。
-          // 改为按 ts_open 定位，不依赖数组方向。
-          if (lastBars && lastBars.length) {
-            const hit = lastBars.find(b => b.ts_open === bar.ts_open);
-            if (hit) Object.assign(hit, bar);
-          }
-        }
-        // 解析后端附带的 next_close_ts（当前 forming bar 的收盘时间戳，ms）
-        if (data.next_close_ts != null && data.next_close_ts > 0) {
-          sseNextCloseTs = Number(data.next_close_ts);
-        } else {
-          sseNextCloseTs = 0;
-        }
-        sseLastBarUpdateTs = Date.now();
-        liveRefreshLastTs = sseLastBarUpdateTs;
-        if (sseFallbackPolling) {
-          sseFallbackPolling = false;
-          stopLiveRefresh();
-          stopNextClosePolling();
-        }
-        // 启动每秒更新状态栏（含 elapsed/remaining）
-        // 注意：必须在收到 bar_update 后启动，而非 onopen，否则 sseNextCloseTs 还没更新
-        startSSEStatusExpiryTimer();
-        updateSSEStatusWithExpiry();
-      } catch (err) {
-        console.error('bar_update event error:', err);
-      }
-    });
-
-    // ping 事件：心跳，连接活跃
-    sseBarsStream.addEventListener('ping', () => {
-      liveRefreshLastTs = Date.now();
-      // SSE 活跃期间，仅刷新 elapsed；不更新 next_close_ts
-      if (sseLastBarUpdateTs) updateSSEStatusWithExpiry();
-      else updateLiveRefreshStatus();
-    });
-
-    sseBarsStream.onopen = () => {
-      console.log('SSE bars stream connected');
-      // SSE 连接成功 → 启动每秒更新状态栏
-      // 注意：此处不设 sseLastBarUpdateTs 和 sseNextCloseTs
-      //   - sseLastBarUpdateTs: 等收到第一个 bar_update/bar_close 事件再设
-      //   - sseNextCloseTs: 同上，避免残留旧值导致「距下次收盘」显示异常
-      // 启动定时器后状态栏仅显示「● SSE 实时」，等首个事件到达再补 elapsed/remaining
-      startSSEStatusExpiryTimer();
-      updateSSEStatus('ok');
-      if (sseFallbackPolling) {
-        sseFallbackPolling = false;
-        stopLiveRefresh();
-        updateSSEStatus('ok');
-      }
-    };
-
-    sseBarsStream.onerror = () => {
-      console.warn('SSE bars stream error, falling back to polling');
-      // 关闭已损坏的连接
-      if (sseBarsStream) {
-        sseBarsStream.close();
-        sseBarsStream = null;
-      }
-      // SSE 断开 → 停止每秒更新状态栏，恢复 fallback 文案
-      stopSSEStatusExpiryTimer();
-      sseNextCloseTs = 0;
-      sseLastBarUpdateTs = 0;
-      // 启动 fallback 轮询（仅当尚未降级时，避免重复启动）
-      if (!sseFallbackPolling) {
-        sseFallbackPolling = true;
-        startLiveRefresh(3000);  // 3s 间隔，降低后端压力
-        updateSSEStatus('fallback');
-      }
-      // 启动低频拉取 next_close_ts（fallback 模式下也显示倒计时）
-      startNextClosePolling();
-      // 10s 后尝试重连 SSE（仅在用户仍开启实时且页面可见时）
-      if (sseReconnectTimer) clearTimeout(sseReconnectTimer);
-      sseReconnectTimer = setTimeout(() => {
-        if ($('#cb-live-refresh').checked && !document.hidden) {
-          startSSEBarsStream();
-        }
-      }, 10000);
-    };
-
-    updateSSEStatus('connecting');
-  } catch (e) {
-    console.error('Failed to start SSE bars stream:', e);
-    // SSE 构造失败 → 立即降级为轮询
-    sseFallbackPolling = true;
-    startLiveRefresh(3000);
-    updateSSEStatus('fallback');
-    startNextClosePolling();
-  }
+  barsStreamPolling = true;
+  updateSSEStatus('ok');
+  // 共享 tick：状态栏「距上次刷新 · 距下次收盘」+ 「等待收盘」按钮倒计时
+  startSSEStatusExpiryTimer();
+  // 持续分析的收盘触发（本地定时器，替代原 bar_close SSE 事件）
+  startKeepAnalysisTimer();
+  // K 线轮询（内部同时启动 5s 的 next-close 拉取）
+  startLiveRefresh(BARS_POLL_INTERVAL_MS);
+  // 首次启动且尚无数据时立即补拉一次（切换失败后恢复实时等场景）
+  if (!lastBars || !lastBars.length) refreshBarsOnly();
+  updateSSEStatusWithExpiry();
 }
 
 function stopSSEBarsStream() {
-  if (sseBarsStream) {
-    sseBarsStream.close();
-    sseBarsStream = null;
-  }
-  if (sseReconnectTimer) {
-    clearTimeout(sseReconnectTimer);
-    sseReconnectTimer = null;
-  }
-  if (sseFallbackPolling) {
-    stopLiveRefresh();
-    sseFallbackPolling = false;
-  }
-  // 清除每秒更新状态栏的定时器并重置 SSE 状态变量
+  barsStreamPolling = false;
+  stopKeepAnalysisTimer();
+  // 无条件停：轮询流本身就是 liveRefreshTimer
+  stopLiveRefresh();
   stopSSEStatusExpiryTimer();
   stopNextClosePolling();
   sseNextCloseTs = 0;
-  sseLastBarUpdateTs = 0;
+  marketClosed = false;
 }
+
+// ── 持续分析：本地定时触发（替代原 bar_close SSE 事件） ─────────────────
+// K 线轮询每 5s 刷新一次 lastBars；本定时器只读本地数据、不发请求，
+// 发现「刚收盘的那根 bar」变了就自动发起下一轮分析。
+//   · 判定复用 PAContinuousGate.closedBarTs()（纯函数，Node 单测守护）
+//   · triggerSource 必须传 'continuous'：本次调用本身就是收盘后触发的，
+//     bar 刚刚收盘，再等一根必然出错（AGENTS.md 硬约束）
+//   · 休市时 closedBarTs 恒定不变 → 哨兵去重天然抑制重复触发
+function startKeepAnalysisTimer() {
+  if (keepAnalysisTimer) return;
+  keepAnalysisTimer = setInterval(maybeTriggerContinuousAnalysis, KEEP_ANALYSIS_TICK_MS);
+}
+
+function stopKeepAnalysisTimer() {
+  if (keepAnalysisTimer) {
+    clearInterval(keepAnalysisTimer);
+    keepAnalysisTimer = null;
+  }
+}
+
+// 把哨兵对齐到「当前已收盘的那根」：开启持续分析后等**下一根**收盘再分析。
+// 与原 SSE 语义一致 —— 原来 tick 勾选后要等下一个 bar_close 事件才触发，
+// 若不预置哨兵，轮询定时器会在 3s 内对早已收盘的 bar 补跑一轮。
+function primeKeepAnalysisSentinel() {
+  const ts = window.PAContinuousGate
+    ? window.PAContinuousGate.closedBarTs(lastBars)
+    : 0;
+  if (ts) keepAnalysisLastClosedTs = ts;
+}
+
+function maybeTriggerContinuousAnalysis() {
+  if (!barsStreamPolling || document.hidden) return;
+  const cbKeep = $('#cb-keep-analysis');
+  if (!cbKeep || !cbKeep.checked) return;
+  if (!lastBars || !lastBars.length) return;
+  // 手动「等待收盘」倒计时在途：那一轮分析自己就会在收盘后发起，
+  // 这里再触发一次会对同一根 bar 重复分析
+  if (waitCloseCountdownResolver) return;
+  // 防御性重置：分析流已结束但 isAnalyzing 未被正确重置（边界情况）
+  if (isAnalyzing && currentAnalysisStream === null) {
+    isAnalyzing = false;
+  }
+  if (isAnalyzing) return;
+  const newClosedTs = window.PAContinuousGate
+    ? window.PAContinuousGate.closedBarTs(lastBars)
+    : 0;
+  if (!newClosedTs || newClosedTs === keepAnalysisLastClosedTs) return;
+  keepAnalysisLastClosedTs = newClosedTs;
+  // 自动选路：有可复用上下文走增量，否则走完整分析
+  if (shouldUseIncremental()) {
+    startIncrementalAnalysis(true, 'continuous');
+  } else {
+    startAnalysis(true, 'continuous');
+  }
+}
+
 
 // 启动「距上次刷新 · 距下次收盘」每秒更新定时器（幂等）
 function startSSEStatusExpiryTimer() {
@@ -2213,14 +2107,16 @@ function stopSSEStatusExpiryTimer() {
   }
 }
 
-// 异步拉取 /api/bars/next-close 更新 sseNextCloseTs（用于 fallback/纯轮询模式下显示倒计时）
-// 幂等；并发请求时直接 return。失败静默（下次定时器再试）。
-// force=true 时绕过 SSE 活跃检查（用于 sanity check 失败后强制拉取正确值）
+// 异步拉取 /api/bars/next-close 更新 sseNextCloseTs。
+// 轮询流下这是 next_close_ts 的**唯一来源**（原 SSE 事件已下线），故不再有
+// 「SSE 活跃就跳过」的短路；幂等，并发请求时直接 return。失败静默（下次定时器再试）。
+// force=true 时立即绕过 nextClosePollingInFlight 在途节流（倒计时归零等场景用）
 async function fetchAndUpdateNextCloseTs(force = false) {
-  if (nextClosePollingInFlight) return;
-  // SSE 活跃时 next_close_ts 由 bar_update/bar_close 事件推送，无需 fetch
-  // 除非 force=true（SSE 推送的 next_close_ts 异常时强制拉取正确值）
-  if (!force && sseBarsStream && !sseFallbackPolling) return;
+  // force=true 时不遵守「在途节流」：调用方（等待收盘倒计时、sanity check）需要
+  // 立刻拿到值，而轮询模式下 next-close 每 5s 都在飞，等一拍会直接返回空值，
+  // 导致倒计时拿不到 remaining。
+  if (nextClosePollingInFlight && !force) return;
+  const ownsThrottle = !nextClosePollingInFlight;
   nextClosePollingInFlight = true;
   try {
     const symbol = $('#ds-symbol')?.value || currentSettings?.general?.last_symbol || '';
@@ -2232,21 +2128,25 @@ async function fetchAndUpdateNextCloseTs(force = false) {
     if (data && data.market_closed) {
       // 休市：清空 sseNextCloseTs，触发「休市中」显示，避免取模算法返回错误未来值
       sseNextCloseTs = 0;
-    } else if (data && data.next_close_ts > 0) {
-      sseNextCloseTs = Number(data.next_close_ts);
+      marketClosed = true;
     } else {
-      // 后端返回 null（无 forming bar 或 timeframe 无效），清空避免残留旧值
-      sseNextCloseTs = 0;
+      marketClosed = false;
+      if (data && data.next_close_ts > 0) {
+        sseNextCloseTs = Number(data.next_close_ts);
+      } else {
+        // 后端返回 null（无 forming bar 或 timeframe 无效），清空避免残留旧值
+        sseNextCloseTs = 0;
+      }
     }
   } catch (e) {
     // 静默失败，下次定时器再试
   } finally {
-    nextClosePollingInFlight = false;
+    if (ownsThrottle) nextClosePollingInFlight = false;
   }
 }
 
 // 启动低频（5s）拉取 next_close_ts 定时器（幂等）
-// 用于 SSE 不可用时（fallback 轮询 / 纯轮询模式）也能显示「距下次收盘」倒计时
+// 轮询流下 next_close_ts 的唯一来源，保证「距下次收盘」倒计时可用
 function startNextClosePolling() {
   if (nextClosePollingTimer) return;
   // 立即拉一次，避免首次显示延迟 5s
@@ -2262,7 +2162,7 @@ function stopNextClosePolling() {
 }
 
 // timeframe 字符串 → 秒数（与后端 bar_close_wait.timeframe_to_seconds 对齐）
-// 用于 SSE 状态栏倒计时 sanity check，防止 next_close_ts 过期/竞态时显示异常值
+// 用于状态栏倒计时 sanity check，防止 next_close_ts 过期/竞态时显示异常值
 function timeframeToSeconds(tf) {
   const t = String(tf || '').trim();
   if (!t) return 0;
@@ -2287,14 +2187,15 @@ function formatCountdownHMS(seconds) {
   return `${pad(h)}:${pad(m)}:${pad(sec)}`;
 }
 
-// 计算并更新 #live-refresh-status 文案：● SSE 实时 · 距上次刷新 Ns · 距下次收盘 Ms
-// 仅在 SSE 活跃（sseBarsStream 非 null 且非 fallback）时由定时器调用
+// 计算并更新 #live-refresh-status 文案：● 实时轮询 · 距上次刷新 Ns · 距下次收盘 Ms
+// 仅在轮询流活跃（barsStreamPolling）时由 sseStatusExpiryTimer 每秒调用；
+// 同时承担「等待收盘」共享倒计时（见下方 waitCloseCountdownResolver 分支）
 function updateSSEStatusWithExpiry() {
-  // 守卫：SSE 不活跃或降级轮询时直接 return（由 updateLiveRefreshStatus 接管）
-  if (!sseBarsStream || sseFallbackPolling) return;
+  // 守卫：轮询流不活跃时直接 return（由 updateLiveRefreshStatus 接管）
+  if (!barsStreamPolling) return;
   const el = $('#live-refresh-status');
   if (!el) return;
-  const elapsed = sseLastBarUpdateTs ? Math.max(0, (Date.now() - sseLastBarUpdateTs) / 1000) : 0;
+  const elapsed = liveRefreshLastTs ? Math.max(0, (Date.now() - liveRefreshLastTs) / 1000) : 0;
   // sanity check：remaining 不能超过当前 timeframe 的 duration
   // 防止 next_close_ts 过期、时区偏移或跨周期残留导致显示异常大的倒计时
   // 优先从 #ds-timeframe 读用户实际选择的值（applySubscribe 切换后 currentSettings 可能未同步），
@@ -2303,42 +2204,39 @@ function updateSSEStatusWithExpiry() {
   const tfSecs = timeframeToSeconds(dsTf || currentSettings?.general?.last_timeframe || '');
   let remaining = 0;
   let closeText = '';
-  let isMarketClosed = false;
   if (sseNextCloseTs > 0 && tfSecs > 0) {
     remaining = Math.max(0, (sseNextCloseTs - Date.now()) / 1000);
     // 若 remaining 超过 1 个 timeframe duration，说明 next_close_ts 已过期或错误，丢弃
     if (remaining > tfSecs) {
-      console.warn('[SSE] next_close_ts sanity check failed, fetching /api/bars/next-close:', {
+      console.warn('[bars] next_close_ts sanity check failed, fetching /api/bars/next-close:', {
         sseNextCloseTs, tfSecs, remaining,
         now: Date.now()
       });
-      // fallback: 强制拉取正确的 next_close_ts（绕过 SSE 活跃检查）
+      // fallback: 强制拉取正确的 next_close_ts
       fetchAndUpdateNextCloseTs(true);
       sseNextCloseTs = 0;  // 清除错误值，等待 fallback 更新
     } else {
       closeText = ` · 距下次收盘 ${formatCountdownHMS(remaining)}`;
     }
   }
-  // 休市检测：next_close_ts 已过期（SSE 推送的旧值）或为 0 且长时间无 bar 数据更新
-  // 休市时后端只推 ping 不推 bar_update，sseNextCloseTs 不会被 SSE 更新，
-  // 需要主动调 REST /api/bars/next-close 检测 market_closed 状态
+  // 休市检测：next-close 端点 bars[0].closed == true 时返回 market_closed（此时
+  // 取模算法会基于过期 ts_open 返回错误的未来周期边界，必须短路），主动置位。
+  // 次级信号：next_close_ts 为 0 且超过 1 个周期没有 bar 更新 → 也判定为休市。
   if (!closeText && tfSecs > 0) {
-    const sinceUpdate = sseLastBarUpdateTs ? (Date.now() - sseLastBarUpdateTs) / 1000 : 0;
-    if (sseNextCloseTs === 0) {
-      // sseNextCloseTs 已清零：可能是休市（REST 返回 market_closed:true）或 SSE 还没推第一个事件
-      // sinceUpdate > tfSecs（1 个周期无更新）→ 确认休市
-      if (sinceUpdate > tfSecs) {
-        isMarketClosed = true;
-        closeText = ' · 休市中';
-      }
+    if (marketClosed) {
+      closeText = ' · 休市中';
     } else if (sseNextCloseTs > 0 && sseNextCloseTs < Date.now()) {
-      // sseNextCloseTs 已过期但非 0：SSE 推送的旧值未纠正，主动调 REST 检测休市
-      // 这是休市时的典型场景：SSE 只推 ping，sseNextCloseTs 保留旧值
+      // next_close_ts 已过期但非 0：主动再拉一次纠正（跨越周期边界时的竞态）
       fetchAndUpdateNextCloseTs(true);
       sseNextCloseTs = 0;  // 清除过期值，等待 REST 返回正确状态
+    } else if (sseNextCloseTs === 0) {
+      const sinceUpdate = liveRefreshLastTs ? (Date.now() - liveRefreshLastTs) / 1000 : 0;
+      if (sinceUpdate > tfSecs) {
+        closeText = ' · 休市中';
+      }
     }
   }
-  let text = `● SSE 实时 · 距上次刷新 ${elapsed.toFixed(1)}s${closeText}`;
+  let text = `● 实时轮询 · 距上次刷新 ${elapsed.toFixed(1)}s${closeText}`;
   // 持续分析后缀
   const cbKeep = $('#cb-keep-analysis');
   if (cbKeep && cbKeep.checked) text += ' · 持续分析中';
@@ -2366,7 +2264,7 @@ function updateSSEStatusWithExpiry() {
       stopWaitCloseCountdown();
       loadBars()
         .then(() => {
-          // 更新持续分析去重哨兵（与 bar_close handler 同一实现，避免两处公式漂移）
+          // 更新持续分析去重哨兵（与 maybeTriggerContinuousAnalysis 同一实现，避免两处公式漂移）
           const newClosedTs = window.PAContinuousGate
             ? window.PAContinuousGate.closedBarTs(lastBars)
             : 0;
@@ -2383,7 +2281,7 @@ function updateSSEStatusWithExpiry() {
   }
 }
 
-// 更新 SSE 状态指示器（#live-refresh-status）
+// 更新实时流状态指示器（#live-refresh-status）
 // state: 'ok' | 'connecting' | 'fallback' | 'paused' | 'off'
 function updateSSEStatus(state) {
   const el = $('#live-refresh-status');
@@ -2391,7 +2289,7 @@ function updateSSEStatus(state) {
   let base = '';
   switch (state) {
     case 'ok':
-      base = '● SSE 实时';
+      base = '● 实时轮询';
       el.style.color = '#26a69a';
       break;
     case 'connecting':
@@ -2399,7 +2297,7 @@ function updateSSEStatus(state) {
       el.style.color = '#ffc800';
       break;
     case 'fallback':
-      base = '⚠ 实时连接断开，已降级轮询';
+      base = '⚠ 实时轮询已中断';
       el.style.color = '#ef5350';
       break;
     case 'paused':
@@ -2590,8 +2488,8 @@ async function startAnalysis(continuousMode = false, triggerSource = 'user') {
   // 等待收盘：若勾选了「等待收盘」复选框，先调 /api/bars/next-close 拿到剩余
   // 秒数，每秒更新倒计时，归零后再实际发起 /api/analyze/stream 请求。
   //
-  // triggerSource='continuous' 表示本次是由 bar_close 事件触发的（bar 刚刚收盘），
-  // 此时绝不能再等一根 —— 否则分析整整晚一个周期，且下一个 bar_close 会把
+  // triggerSource='continuous' 表示本次是由「刚收盘」触发的（bar 刚刚收盘），
+  // 此时绝不能再等一根 —— 否则分析整整晚一个周期，且下一次收盘触发会把
   // pending 的 resolver resolve(false) 取消掉，表现为持续分析反复重置、永不
   // 真正发起分析。详见 static/js/continuous_gate.js。
   const cbWaitClose = $('#cb-wait-close');
@@ -2803,13 +2701,13 @@ async function startWaitingCountdownDisplay() {
   // 清理旧的显示定时器
   stopWaitingCountdownDisplay();
 
-  // SSE 不可用时，先走一次 REST fallback 拉取 next_close_ts
+  // 还没有 next_close_ts（或已过期）时，先走一次 REST 拉取
   if (!sseNextCloseTs || sseNextCloseTs <= Date.now()) {
     await fetchAndUpdateNextCloseTs(true);
   }
 
-  // SSE 活跃：复用 sseStatusExpiryTimer，由 updateSSEStatusWithExpiry 更新按钮文本
-  if (sseBarsStream && !sseFallbackPolling) {
+  // 轮询流活跃：复用 sseStatusExpiryTimer，由 updateSSEStatusWithExpiry 更新按钮文本
+  if (barsStreamPolling) {
     startSSEStatusExpiryTimer();
     // 立即更新一次按钮文本
     if (sseNextCloseTs > 0) {
@@ -2820,7 +2718,7 @@ async function startWaitingCountdownDisplay() {
     return;
   }
 
-  // SSE 不活跃：走独立 setInterval 更新按钮文本
+  // 轮询流不活跃（实时关闭 / demo / 回看）：走独立 setInterval 更新按钮文本
   const computeRemaining = () => {
     if (!sseNextCloseTs || sseNextCloseTs <= 0) return -1;
     const remMs = sseNextCloseTs - Date.now();
@@ -2871,17 +2769,16 @@ function stopWaitingCountdownDisplay() {
 async function startWaitCloseCountdown() {
   stopWaitCloseCountdown();
 
-  // SSE 不可用时（sseNextCloseTs 为 0 或已过期），先走一次 REST fallback
-  // 拉取 next_close_ts 写入 sseNextCloseTs；失败也不退出，倒计时循环每秒
-  // 会重新读取 sseNextCloseTs，SSE 连上后自动恢复同源
+  // 还没有 next_close_ts（或已过期）时，先走一次 REST 拉取写入 sseNextCloseTs；
+  // 失败也不退出，倒计时循环每秒会重新读取 sseNextCloseTs
   if (!sseNextCloseTs || sseNextCloseTs <= Date.now()) {
     await fetchAndUpdateNextCloseTs(true);
   }
 
-  // SSE 活跃：复用 sseStatusExpiryTimer（与状态栏共享同一 tick、同一 remaining），
+  // 轮询流活跃：复用 sseStatusExpiryTimer（与状态栏共享同一 tick、同一 remaining），
   // 不创建独立 setInterval，彻底消除两个定时器不同步和算法不一致的问题。
   // 由 updateSSEStatusWithExpiry 在 remaining <= 0 时调用 resolver 触发分析。
-  if (sseBarsStream && !sseFallbackPolling) {
+  if (barsStreamPolling) {
     startSSEStatusExpiryTimer();
     // 立即更新一次按钮文本（不等下一个 tick，避免首次显示延迟）
     if (sseNextCloseTs > 0) {
@@ -2894,7 +2791,7 @@ async function startWaitCloseCountdown() {
     });
   }
 
-  // SSE 不活跃（fallback 轮询 / 纯轮询模式）：走独立 setInterval
+  // 轮询流不活跃（实时关闭 / demo / 回看）：走独立 setInterval
   // updateSSEStatusWithExpiry 在此模式下不跑，需要自己维护倒计时
   const computeRemaining = () => {
     if (!sseNextCloseTs || sseNextCloseTs <= 0) return -1;
@@ -2917,7 +2814,7 @@ async function startWaitCloseCountdown() {
         return;
       }
       remaining = computeRemaining();
-      // SSE 未就绪：周期性拉取 REST 等待恢复，不归零触发
+      // next_close_ts 未就绪：周期性拉取 REST 等待恢复，不归零触发
       if (remaining < 0) {
         tickCount++;
         if (tickCount % 5 === 0) {
@@ -2930,7 +2827,7 @@ async function startWaitCloseCountdown() {
         // 倒计时归零，await loadBars 刷新 K线（含新 bar 的 seq/指标）后再触发分析
         loadBars()
           .then(() => {
-            // 同上：统一用 continuous_gate.closedBarTs，防止 SSE 重复触发分析
+            // 同上：统一用 continuous_gate.closedBarTs，防止持续分析重复触发
             const newClosedTs = window.PAContinuousGate
               ? window.PAContinuousGate.closedBarTs(lastBars)
               : 0;
@@ -2971,7 +2868,7 @@ function stopWaitCloseCountdown() {
 // 复用 startAnalysis 的事件处理逻辑，仅切换 endpoint 为 /api/analyze/incremental/stream
 async function startIncrementalAnalysis(continuousMode = false, triggerSource = 'user') {
   const cbWaitClose = $('#cb-wait-close');
-  // 同 startAnalysis：持续分析由 bar_close 触发时不再等一根
+  // 同 startAnalysis：持续分析由「刚收盘」触发时不再等一根
   const needWait = window.PAContinuousGate
     ? window.PAContinuousGate.shouldWaitForClose(triggerSource, cbWaitClose && cbWaitClose.checked)
     : !!(cbWaitClose && cbWaitClose.checked);
@@ -5025,12 +4922,15 @@ async function applyReplayChart(record) {
       kind: 'tradingview', symbol, timeframe, exchange,
     }, { timeout: 15000 });
     await loadBars();
-    if (wasLive) startSSEBarsStream();
     // 工具栏同步，避免「图上是 ETHUSDT、工具栏写 NVDA」
+    // ⚠ 必须**先于** startSSEBarsStream：轮询流的 startNextClosePolling 会同步
+    // 发起一次 next-close 请求，读的是 #ds-symbol/#ds-exchange/#ds-timeframe；
+    // 原来先启流后写 DOM，读到的是回看前的旧游标。
     const hid = $('#ds-symbol'); if (hid) hid.value = symbol;
     const shown = $('#ds-symbol-search'); if (shown) shown.value = symbol;
     const tf = $('#ds-timeframe'); if (tf) tf.value = timeframe;
     const ex = $('#ds-exchange'); if (ex && exchange) ex.value = exchange;
+    if (wasLive) startSSEBarsStream();
 
     // ── 先解析「分析当时」的锚点 bar ──────────────────────────────────
     // 必须在画方向箭头**之前**算好：箭头要落在当时那根 K 线上，

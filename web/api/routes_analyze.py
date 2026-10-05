@@ -483,8 +483,20 @@ def _run_analysis(
             **callbacks,
         )
         record_payload = _serialize_record(record)
-        # 保存最近记录引用，供追问（/api/chat/stream）路由使用
-        ctx._last_record = record
+        # 保存最近记录引用，供追问（/api/chat/stream）路由使用。
+        # **必须会话级**：挂在全局 ctx._last_record 上时，A tab 刚跑完的分析会
+        # 成为 B tab 追问的锚点 —— 追问的多标签页隔离就成了装饰。
+        # 无 session_id（老客户端 / 直连 API）时才回落全局，行为与改造前一致。
+        if session_id:
+            try:
+                from pa_agent.storage.ephemeral import get_registry
+
+                get_registry().get_or_create(session_id).last_record = record
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("failed to store session last_record: %s", exc)
+                ctx._last_record = record
+        else:
+            ctx._last_record = record
         # 下单机会：落 trade_records + 推 Feishu/PushPlus（后台线程，失败不影响主流程）。
         # 桌面 GUI 的等价逻辑在 MainWindow._spawn_post_order_followup；此前 Web 端
         # 完全没有调用方，导致服务端部署下告警与交易落盘都是死的。

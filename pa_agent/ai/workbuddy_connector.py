@@ -522,10 +522,14 @@ def apply_workbuddy_provider_to_settings(
 ) -> str | None:
     """Populate *settings.provider* from WorkBuddy environment.
 
+    成功后由 :func:`~pa_agent.config.settings.persist_provider` 写**用户层**
+    （不碰系统兜底、不整份写文件）—— 启动时的 token 刷新因此能跨重启生效。
+
     Returns None on success, or a user-facing error string.
     """
     from pa_agent.ai.cursor_connector import is_openclaw_cs_model
     from pa_agent.ai.qclaw_connector import is_openclaw_model
+    from pa_agent.config.settings import persist_provider
 
     model_hint = (preferred_model or getattr(settings.provider, "model", "") or "").strip()
     if is_openclaw_model(model_hint):
@@ -582,6 +586,10 @@ def apply_workbuddy_provider_to_settings(
     ok, health_msg = workbuddy_health_check()
     if not ok:
         return f"WorkBuddy 连通性检查失败：\n\n{health_msg}"
+    # 连通性通过才算数，此时才落库。写**用户层**（用户自己的配置区），
+    # **绝不写系统兜底**：凭证属 L1 单机账号，兜底是所有用户的只读默认值。
+    # 只声明 connector 真正改的那几个键 → 不会把 .env 的 15 个字段烧进来。
+    persist_provider(provider)
     return None
 
 
@@ -684,40 +692,26 @@ def workbuddy_health_check(*, timeout: float = 5.0) -> tuple[bool, str]:
         return False, f"无法连接 WorkBuddy API ({base_url}): {exc}"
 
 
-def sync_workbuddy_provider_on_load(
-    settings: Any,
-    *,
-    save_path: Path | None = None,
-) -> None:
-    """Refresh token/base_url for openclaw_wb routing on load."""
+def sync_workbuddy_provider_on_load(settings: Any) -> None:
+    """Refresh token/base_url for openclaw_wb routing on load.
+
+    落库由 :func:`apply_workbuddy_provider_to_settings` 自带（``persist_provider``
+    写用户层）—— 曾在这里「apply 之后再整份 Settings 写文件」，而系统兜底一旦
+    存在那份文件根本没人读，改动静默丢失。``save_path`` 参数随之删除。
+    """
     if not detect_workbuddy():
         return
     provider = settings.provider
     if not is_workbuddy_route(provider):
         return
 
-    before_url = str(getattr(provider, "base_url", "") or "")
-    before_model = str(getattr(provider, "model", "") or "")
     err = apply_workbuddy_provider_to_settings(settings)
     if err:
         logger.warning("WorkBuddy provider sync failed: %s", err)
         return
 
-    after_url = str(getattr(provider, "base_url", "") or "")
-    after_model = str(getattr(provider, "model", "") or "")
-    if save_path is not None and (
-        before_url != after_url or before_model != after_model
-    ):
-        try:
-            from pa_agent.config.settings import save_settings
-
-            save_settings(settings, save_path)
-            logger.info(
-                "WorkBuddy provider synced on load: %s @ %s",
-                after_model,
-                after_url,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to persist synced WorkBuddy provider: %s", exc
-            )
+    logger.info(
+        "WorkBuddy provider synced on load: %s @ %s",
+        getattr(provider, "model", ""),
+        getattr(provider, "base_url", ""),
+    )

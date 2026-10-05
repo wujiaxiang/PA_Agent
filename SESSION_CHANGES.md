@@ -22,59 +22,51 @@
 
 ## 🔴 进行中（有人正在改这些文件，不要动）
 
-### 2026-10-05 · 剩余改造并行开工（P1/P2a/P3/P4）
+## ✅ 已提交（本条改动待 commit；条目已不再占用写入范围）
+### 2026-10-05 · 多会话推理收尾（P1 SSE下线 / P2a 追问隔离 / P3 交易域 / P4 配置层）
 
-**状态**：进行中（W0 前置已提交 `32b405e`，以下三路并行中）
+**状态**：已完工（待本次统一提交）
 
-#### 方案评审裁决摘要
-方案原文见 `docs/REMAINING_PLAN.md`。5 位专家评审后**推翻了原方案的关键决策**：
+#### 方案评审裁决（推翻了原方案）
+`docs/REMAINING_PLAN.md` 原文已被评审推翻，文件顶部已加过时标注。原方案的三处关键错误：
 
-- **P1 方案 A（服务端按游标分组广播）不可实施** —— 浏览器原生 `EventSource`
-  无法设置请求头，服务端拿不到 session_id，分组无从取值；且会引入
-  head-of-line blocking（坏品种 auto-probe 持锁 80s，全站 `/api/bars` 排队）。
-  改判 **B（前端轮询）**：该路径本就存在，且隐藏标签页自动停，一个坏 tab
-  不传染别人。
-- **P2 前提事实错误**：并非「全内存重启即丢」，JSONL sidecar 已在落盘；
-  且分桶键必须**扩键**而非替换 —— `FreeChatSession._cached_prefix` 在构造时
-  一次性固化，只按 session_id 分桶会让「先追问 A、再回看 B」时 B 携带 A 的
-  上下文，**静默错答**。
-- **P4 落点与签名错误**：不是 5 条而是 **9 条**写路径；`persist(settings)`
-  会把 15 个 .env 字段永久烧进 user_prefs，必须改 `persist_patch`；
-  `normalize_raw` 放 storage 层会反向拉起整个 tradingview + tvDatafeed。
+- **P1 方案 A 不可实施** —— 浏览器原生 `EventSource` 无法设置请求头，服务端拿不到
+  session_id，分组无从取值；且坏品种的 auto-probe 会持 `TradingViewSource._snapshot_lock`
+  长达数十秒，全站 `/api/bars` 排队。改判 **B（前端按自己游标轮询）**：该路径本就
+  存在，隐藏标签页自动停，一个坏 tab 不会传染别人
+- **P2 分桶键是扩键不是替换** —— `FreeChatSession._cached_prefix` 构造时一次性固化，
+  只按 session 分桶会让「先追问 A、再回看 B」时 B 携带 A 的 stage1/stage2 **静默错答**
+- **P4 是 9 条路径不是 5 条**，且必须是 `persist_patch` 不是 `persist(settings)`
+  ——后者会把 15 个 .env 字段永久烧进 user_prefs
 
-#### 改动文件（写入范围，三路互不相交）
+#### 实际改动文件（已合并清单）
 
-| 子代理 | 独占写集 |
+| 范围 | 文件 |
 |---|---|
-| **A1 · P1** | `web/api/routes_bars_stream.py`、`web/static/js/app.js`、`web/static/index.html`、`tests/unit/test_routes_bars_stream.py` |
-| **A2 · P2a** | `web/api/routes_chat.py`、`web/api/routes_analyze.py`、`web/static/js/api.js` |
-| **A3 · P3** | `pa_agent/storage/trade_repo.py`、`pa_agent/records/trade_logger.py`、`pa_agent/storage/importer.py`、`pa_agent/config/paths.py`、`tests/unit/test_trade_repo.py` |
-| **A4 · P4** | `pa_agent/config/settings.py`、`pa_agent/storage/settings_store.py`、`web/api/routes_data.py`、`web/api/routes_settings.py`、`pa_agent/app_context.py`、`pa_agent/ai/{qclaw,workbuddy,trae,cursor}_connector.py`、`pa_agent/orchestrator/two_stage.py`、`tests/unit/test_settings_cascade.py` |
+| SSE 下线 | `web/api/routes_bars_stream.py`(357→68)、`web/static/js/app.js`、`web/static/index.html`、`tests/unit/test_routes_bars_stream.py`、`web/server.py` |
+| 追问隔离 | `web/api/routes_chat.py`、`web/api/routes_analyze.py`、`web/static/js/api.js`、`tests/unit/test_followup_and_audit_fixes.py` |
+| 交易域 | `pa_agent/storage/trade_repo.py`(新)、`tests/unit/test_trade_repo.py`(新)、`pa_agent/records/trade_logger.py`、`pa_agent/storage/importer.py`、`pa_agent/config/paths.py` |
+| 配置层 | `pa_agent/config/settings.py`、`pa_agent/storage/settings_store.py`、`web/api/routes_data.py`、`web/api/routes_settings.py`、`pa_agent/app_context.py`、`pa_agent/orchestrator/two_stage.py`、`pa_agent/ai/{qclaw,workbuddy,cursor,trae}_connector.py`、`tests/unit/test_settings_cascade.py` |
+| 前置 | `pa_agent/storage/ephemeral.py`、`web/api/session_ctx.py`（W0，已随 `32b405e` 提交） |
 
-**并行前已由主代理单独完成并提交（`32b405e`）**，不属任何子代理写集：
-`pa_agent/storage/ephemeral.py`（Cursor 可哈希 / drop_queue / 淘汰跳过活跃会话）、
-`web/api/session_ctx.py`（抽出 sanitize_session_id + 新增 `?sid=` query 入口）、
-`pa_agent/storage/settings_store.py`（apply_user_change 的 read_failed 守卫）。
-
-#### 跨代理硬契约（不得破坏）
-1. `web/api/routes_data.py:368` 有 `from .routes_bars_stream import _compute_next_close_ts`
-   —— **A1 删除后台 loop 时必须保留 `_compute_next_close_ts`**，它是纯函数，
-   A4 不得删改
-2. A2 只**只读** import `routes_data._resolve_view`，不改那个文件
-3. `app.js?v=N` 递增归 A1 独占；A2 改 `api.js` 需告知是否要一并递增
+#### 接口变更 ⚠️
+- **删除** `GET /api/bars/stream`（现返回 404）；`routes_bars_stream.start_background_task`
+  / `stop_background_task` 不再存在
+- **保留** `_compute_next_close_ts` —— `routes_data.py` 的跨模块硬契约，不得删
+- `routes_chat._record_matches_subscription(record, symbol, timeframe)` —— **不再收 ctx**
+- 前端 `api.js?v=5`、`app.js?v=64`
+- `GET /api/settings` 的 general 段返回**本会话游标**而非全局值
 
 #### 冲突风险
-- **`routes_data.py` 是热点**：A4 独占写，A2 只读 import
-- `tests/unit/test_routes_bars_stream.py` 现有 11+ 处用例直接操作模块级
-  `_subscribers`，删掉后会**全篇失败**（非断言失败）。A1 需整体重写，
-  但必须保留 `_compute_next_close_ts` 的等价性与取模算法用例
-- `routes_settings.py::get_settings` 返回全局游标会让前端 `loadSettings`
-  覆盖本 tab 游标（**一次 F5 即串味**）。A4 负责后端侧；前端配套改动
-  需 A1 在 `app.js` 侧配合 —— **这是跨代理依赖，须等 A4 交付后由主代理统一处理**
-- **禁止 `git reset --hard` / `git checkout -- .`**：本仓库长期存在并行会话的
-  未提交工作，本轮三路并行期间清空工作区会直接摧毁两个子代理的全部产出
+- 工作区仍有**另一会话未提交**的 `config/settings.json.bak-*` / `.corrupt-*`，
+  以及 `.githooks/`、`.github/workflows/ci.yml`、`tools/check_write_scope.py`
+  属他人提交范围 —— **提交时不要一并带上**
+- `routes_data.py` 是热点：A4 独占写，A2 只读 import `_resolve_view`
+- 既有不稳定测试（勿误判为本轮引入）：`test_routes_records::test_list_records_returns_200`
+  （`order_type` 恒 None，系既有 `stage2_decision` 嵌套结构）、缺 `pytest-qt` 的 30 项 error、
+  缺 `hypothesis` 的 3 项收集失败
 
-## ✅ 已提交（本条改动待 commit；条目已不再占用写入范围）
+
 ### 2026-10-05 · 配置层加固（写端校验 + 一次性初始化）
 
 **状态**：已提交 `32b405e`（W0 前置 + apply_user_change 现存 bug 修复）

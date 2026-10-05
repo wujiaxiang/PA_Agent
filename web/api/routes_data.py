@@ -147,21 +147,31 @@ async def list_order_opportunity_types():
 
 @router.post("/subscribe")
 async def subscribe(req: SubscribeRequest, request: Request):
-    """Switch to a new symbol/timeframe/data-source."""
+    """Switch to a new symbol/timeframe/data-source.
+
+    **游标只写本会话（L3），两层都不写**：游标是「这个 tab 现在在看什么」，
+    写进 ``ctx.settings.general.last_*`` 等于把「上一个 tab 的标的」固化成全局值，
+    写进 user_prefs 则让它跨重启存活 —— 两者都是「一次 F5 就串味」的来源
+    （docs/SESSION_STORAGE_DESIGN.md §5.1）。
+    """
     ctx = request.app.state.ctx
     kind = normalize_data_source_kind(req.kind)
     old_kind = normalize_data_source_kind(
         getattr(ctx.settings.general, "last_data_source", "mt5")
     )
 
-    # Fall back to current settings when the request omits a field.  This
+    # 缺省值取**本会话**游标而非全局：前端只切一个维度时（如只换交易所），
+    # 回落全局会让本 tab 订阅到别的 tab 的标的。
+    view_symbol, view_timeframe, view_exchange = _resolve_view(request, ctx)
+
+    # Fall back to the current view when the request omits a field.  This
     # keeps the endpoint safe when the frontend only wants to switch one
     # dimension (e.g. just the exchange).
-    symbol = req.symbol or ctx.settings.general.last_symbol
-    timeframe = req.timeframe or ctx.settings.general.last_timeframe
+    symbol = req.symbol or view_symbol
+    timeframe = req.timeframe or view_timeframe
     exchange = req.exchange
     if kind == "tradingview" and not exchange:
-        exchange = getattr(ctx.settings.general, "last_tradingview_exchange", "")
+        exchange = view_exchange
 
     if kind != old_kind:
         try:
@@ -210,20 +220,16 @@ async def subscribe(req: SubscribeRequest, request: Request):
         response.headers["X-Error-Type"] = error_type
         return response
 
-    ctx.settings.general.last_data_source = kind
-    ctx.settings.general.last_symbol = symbol
-    ctx.settings.general.last_timeframe = timeframe
-    if kind == "tradingview":
-        ctx.settings.general.last_tradingview_exchange = exchange
-
-    from pa_agent.config.paths import SETTINGS_JSON_PATH
-    from pa_agent.config.settings import save_settings
-    await asyncio.to_thread(save_settings, ctx.settings, SETTINGS_JSON_PATH)
-
-    # ── 会话游标（L3）────────────────────────────────────────────────────
-    # 同时写入本 tab 的游标：会话快照 + 内存热层。有了它，切品种不再只是
-    # 改全局订阅 —— 别的 tab 仍读自己的游标（docs/SESSION_STORAGE_DESIGN.md §3）。
-    # 写入失败只记 warning：游标是缓存，丢了回落全局设置即可。
+    # ── 会话游标（L3）：本 endpoint 唯一的持久化动作 ──────────────────────
+    # 同时写入本 tab 的游标：会话快照（SQLite，TTL 1800s）+ 内存热层。
+    # 有了它，切品种不再只是改全局订阅 —— 别的 tab 仍读自己的游标
+    # （docs/SESSION_STORAGE_DESIGN.md §3）。
+    #
+    # **不再改 ctx.settings.general.last_*，也不再 save_settings()**：
+    #   - 改内存：多 tab 下立刻串味，且会污染 bars 等回落全局的读路径
+    #   - 写文件：系统兜底一旦存在那份文件根本没人读 → 静默丢失
+    #   - 写 user_prefs：游标跨重启存活，F5 之后回到上一个 tab 的标的
+    # 快照写失败只记 warning：游标是缓存，丢了回落全局设置即可。
     try:
         from web.api.session_ctx import session_id_of
 
@@ -269,7 +275,7 @@ async def get_bars(request: Request, count: int = 100):
     # latest_snapshot() can open a TradingView WebSocket + HTTP get_hist on a
     # cache miss. The frontend polls this every second, so calling it inline
     # would block the event loop and freeze every SSE stream. The background SSE
-    # loop already offloads the same call (see routes_bars_stream._push_bar_update).
+    # 轮询流同样 offloads 这同一个调用。
     # 按**本会话游标**取数，而不是全局订阅：多标签页各看各的标的时，
     # 读全局订阅会让 A tab 拿到 B tab 的 K 线（评审 H1）。
     view_symbol, view_timeframe, view_exchange = _resolve_view(request, ctx)

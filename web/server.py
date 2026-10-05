@@ -84,14 +84,11 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Failed to start experience scheduler: %s", exc)
 
-    # Start background bars-stream task (SSE /api/bars/stream)
-    from web.api import routes_bars_stream
-    logger.info("Starting bars stream background task...")
-    try:
-        await routes_bars_stream.start_background_task(app)
-        logger.info("Bars stream background task started successfully")
-    except Exception as exc:
-        logger.error("Failed to start bars stream background task: %s", exc)
+    # K 线实时推送已改为**前端按自己游标轮询** /api/bars（见 docs/REMAINING_PLAN.md
+    # 的评审裁决）：原 SSE 后台广播从全局订阅取数并推给所有连接，多标签页下
+    # 所有人收到同一条数据流；而原生 EventSource 又带不了 X-Session-Id，服务端
+    # 根本拿不到会话身份，无法分组。轮询路径本就存在，且隐藏标签页会自动停，
+    # 一个坏 tab 不会传染别人。服务端不再常驻任何 K 线推送任务。
 
     # ── 存储层（SQLite）+ 会话注册表 ────────────────────────────────────────
     # 纯增量接入：DB 只是索引/快照层，文件仍是权威副本。任何一步失败都降级
@@ -120,7 +117,6 @@ async def lifespan(app: FastAPI):
         await heartbeat_task
     except asyncio.CancelledError:
         pass
-    await routes_bars_stream.stop_background_task()
     try:
         from web.api import experience_scheduler
 

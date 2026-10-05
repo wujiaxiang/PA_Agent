@@ -25,29 +25,35 @@ def _record(symbol="BTCUSDT", timeframe="15m"):
 # ── follow-up anchoring ───────────────────────────────────────────────────────
 
 
+# 契约变更（追问多会话隔离）：_record_matches_subscription 不再收 ctx，
+# 改收**本会话游标**的 symbol / timeframe。原先读全局 settings 会让 A tab 的
+# 追问锚到 B tab 的标的 —— 那正是本次隔离要消除的串味。
 def test_record_matching_subscription():
-    ctx = _ctx("BTCUSDT", "15m")
-    assert routes_chat._record_matches_subscription(_record("BTCUSDT", "15m"), ctx) is True
+    assert routes_chat._record_matches_subscription(
+        _record("BTCUSDT", "15m"), "BTCUSDT", "15m"
+    ) is True
 
 
 def test_record_from_other_symbol_is_rejected():
     """A follow-up after switching instruments must not answer about the old one."""
-    ctx = _ctx("ETHUSDT", "1h")
-    assert routes_chat._record_matches_subscription(_record("BTCUSDT", "15m"), ctx) is False
+    assert routes_chat._record_matches_subscription(
+        _record("BTCUSDT", "15m"), "ETHUSDT", "1h"
+    ) is False
 
 
 def test_record_from_other_timeframe_is_rejected():
-    ctx = _ctx("BTCUSDT", "1h")
-    assert routes_chat._record_matches_subscription(_record("BTCUSDT", "15m"), ctx) is False
+    assert routes_chat._record_matches_subscription(
+        _record("BTCUSDT", "15m"), "BTCUSDT", "1h"
+    ) is False
 
 
 def test_none_record_never_matches():
-    assert routes_chat._record_matches_subscription(None, _ctx()) is False
+    assert routes_chat._record_matches_subscription(None, "BTCUSDT", "15m") is False
 
 
-def test_missing_settings_is_permissive():
-    """No settings to compare against — keep prior behaviour rather than blocking."""
-    assert routes_chat._record_matches_subscription(_record(), SimpleNamespace(settings=None)) is True
+def test_empty_view_is_permissive():
+    """没有游标可比对 —— 保持既有宽松行为，而不是把追问堵死。"""
+    assert routes_chat._record_matches_subscription(_record(), "", "") is True
 
 
 # ── session locking ──────────────────────────────────────────────────────────

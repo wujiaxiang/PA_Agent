@@ -56,13 +56,13 @@ def is_cursor_agent_route(model: str | None) -> bool:
     return is_openclaw_cs_model(model)
 
 
-def sync_cursor_provider_on_load(
-    settings: Any,
-    *,
-    save_path: Any | None = None,
-) -> None:
-    """No-op for Cursor SDK route (no gateway autodetect)."""
-    del settings, save_path
+def sync_cursor_provider_on_load(settings: Any) -> None:
+    """No-op for Cursor SDK route (no gateway autodetect).
+
+    ``save_path`` 参数已删除：启动时不再整份写 settings.json（系统兜底一旦存在，
+    那份文件没人读，写了也是静默丢弃）。
+    """
+    del settings
 
 
 def apply_cursor_provider_to_settings(
@@ -72,8 +72,13 @@ def apply_cursor_provider_to_settings(
 ) -> str | None:
     """Validate *settings.provider* for Cursor SDK route.
 
+    成功后由 :func:`~pa_agent.config.settings.persist_provider` 写**用户层**
+    （只写 connector 改过的那几个键，不碰系统兜底、不整份写文件）。
+
     Returns None on success, or a user-facing error string.
     """
+    from pa_agent.config.settings import persist_provider
+
     model_hint = (preferred_model or getattr(settings.provider, "model", "") or "").strip()
     provider = settings.provider
     # Preserve whatever the user typed as the alias (openclaw_cs or openclaw_cs/<id>)
@@ -86,4 +91,5 @@ def apply_cursor_provider_to_settings(
         return "Cursor 路由需要 API Key（形如 crsr_...）。请在设置里填写 API Key。"
     if not key.startswith("crsr_"):
         logger.warning("Cursor API key does not start with crsr_: %s", key[:8])
+    persist_provider(provider)
     return None

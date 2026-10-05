@@ -93,12 +93,13 @@ def _uses_qclaw_gateway(provider: Any) -> bool:
     return f":{port}" in base_url
 
 
-def sync_qclaw_agent_provider_on_load(
-    settings: Any,
-    *,
-    save_path: Path | None = None,
-) -> None:
-    """Refresh token/base_url for openclaw Agent routing (no relay on 19004)."""
+def sync_qclaw_agent_provider_on_load(settings: Any) -> None:
+    """Refresh token/base_url for openclaw Agent routing (no relay on 19004).
+
+    落库由 :func:`apply_qclaw_provider_to_settings` 自带（写用户层，不碰系统兜底、
+    不整份写文件）—— 此前这里是「apply 之后再整份 Settings 写文件」，而系统兜底
+    一旦存在那份文件根本没人读，改动静默丢失。
+    """
     from pa_agent.ai.workbuddy_connector import is_openclaw_wb_model
 
     if not detect_qclaw():
@@ -114,27 +115,15 @@ def sync_qclaw_agent_provider_on_load(
     if not is_openclaw_model(model) and not _uses_qclaw_gateway(provider):
         return
 
-    before_url = str(getattr(provider, "base_url", "") or "")
-    before_model = str(getattr(provider, "model", "") or "")
     err = apply_qclaw_provider_to_settings(settings)
     if err:
         logger.warning("QClaw agent provider sync failed: %s", err)
         return
-
-    after_url = str(getattr(provider, "base_url", "") or "")
-    after_model = str(getattr(provider, "model", "") or "")
-    if save_path is not None and (before_url != after_url or before_model != after_model):
-        try:
-            from pa_agent.config.settings import save_settings
-
-            save_settings(settings, save_path)
-            logger.info(
-                "QClaw agent provider synced on load: %s @ %s",
-                after_model,
-                after_url,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to persist synced QClaw provider: %s", exc)
+    logger.info(
+        "QClaw agent provider synced on load: %s @ %s",
+        getattr(provider, "model", ""),
+        getattr(provider, "base_url", ""),
+    )
 
 
 def _find_qclaw_config() -> Path | None:

@@ -47,6 +47,22 @@ def deep_merge(base: dict, patch: dict) -> dict:
     return out
 
 
+def merge_overrides(existing: dict, patch: dict) -> dict:
+    """Merge *patch* onto an existing override layer (sparse stays sparse).
+
+    与 :func:`save_overrides` 的**整体替换**语义并存且不冲突：
+
+    - ``PATCH /api/settings`` 的语义是「这份 body 就是我想要的覆盖层」→ 替换，
+      合并会让用户删掉的字段复活（见 :func:`save_overrides`）
+    - 而内部写入方（connector 同步、provider fallback、设置页保存）只知道
+      **自己改了哪几个键**，必须在其余部分保留既有覆盖 → 合并
+
+    合并结果仍会由调用方按基准重新稀疏化，避免「改回默认值」的键永久挡住
+    系统兜底的后续更新。
+    """
+    return deep_merge(existing or {}, patch or {})
+
+
 def compute_diff(base: dict, current: dict) -> dict:
     """Sparse patch turning *base* into *current* (only differing leaves).
 

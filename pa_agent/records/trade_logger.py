@@ -4,6 +4,8 @@ When stage-2 produces an order (限价单 / 突破单 / 市价单), this module:
   1. Appends a rich row to  trade_records/<symbol>_<timeframe>.csv
   2. Renders a K-line + EMA20 chart for the last ≤50 bars and saves it as a
      PNG next to the CSV.
+  3. **双写** one index row into SQLite (``trade_records`` table) — index only,
+     the CSV above stays the authoritative copy (see ``storage/trade_repo.py``).
 
 File naming convention
 ----------------------
@@ -12,6 +14,12 @@ Image : trade_records/<symbol>_<timeframe>_<timestamp>.png
 
 The image filename uses the same timestamp as the ``record_time`` field so
 entries are easy to correlate.
+
+**谁是权威？** CSV/PNG 是权威副本。飞书卡片要发 PNG，DB 里放不了二进制；
+人工核对与导出也以 CSV 为准。**不一致时以 CSV 为准** —— ``trade_records`` 表
+只是索引与查询加速层，可由 ``importer.import_trade_records`` 从 CSV 幂等重建，
+删库不丢任何交易记录。因此第 3 步的任何失败都只记 warning：调用方在分析主流程
+里，DB 故障不该让一条交易记录消失，更不该中断写入链。
 """
 from __future__ import annotations
 
@@ -19,15 +27,21 @@ import csv
 import json
 import logging
 import math
-import os
 import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from pa_agent.config.paths import TRADE_RECORDS_DIR
+
 logger = logging.getLogger(__name__)
 
-_TRADE_RECORDS_DIR = Path("trade_records")
+# **不再是 CWD 相对的 ``Path("trade_records")``** —— 那意味着换个工作目录启动，
+# 同一份历史就会写到另一个目录（且静默发生）。真源统一到 ``config.paths``，
+# 导入器读的是同一个常量，否则「写 A 读 B」，交易记录凭空消失。
+# 保留私有名：``web.api.order_followup`` / ``gui.main_window`` / 既有测试都按
+# 模块属性引用它（测试靠 monkeypatch 把它指向 tmp_path）。
+_TRADE_RECORDS_DIR = TRADE_RECORDS_DIR
 
 # Maximum bars to show in the chart image
 _CHART_MAX_BARS = 50
@@ -119,6 +133,72 @@ _CSV_FIELDNAMES = [
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _next_row_no(csv_path: Path) -> int:
+    """The 1-based data-row index the next append will occupy (0 = unavailable).
+
+    存储层不可用时返回 0 而**不是抛错** —— CSV 是权威副本，不能因为索引层
+    缺席就不落盘。0 只用于让调用方跳过 SQLite 写入。
+    """
+    try:
+        from pa_agent.storage.trade_repo import peek_next_row_no
+
+        return peek_next_row_no(csv_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("trade row numbering unavailable (CSV still written): %s", exc)
+        return 0
+
+
+def _note_row_appended(csv_path: Path, row_no: int) -> None:
+    """Refresh the row-count memo after a successful append (keeps it O(1))."""
+    try:
+        from pa_agent.storage.trade_repo import note_row_appended
+
+        note_row_appended(csv_path, row_no)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("note_row_appended failed for %s: %s", csv_path, exc)
+
+
+def _mirror_to_sqlite(
+    row: dict[str, str],
+    *,
+    csv_path: Path,
+    row_no: int,
+    chart_path: Path | None = None,
+) -> None:
+    """把刚落盘的那一行同步一份到 SQLite（**索引层**，CSV 才是权威副本）。
+
+    挂在 ``_save_trade_record_impl`` 内、**CSV 写完之后**：外层
+    ``save_trade_record`` 拿不到 ``row``，无从索引；而「先落 CSV 再写库」保证
+    DB 故障时记录已经存在（DB 可由导入器从 CSV 重建，反过来则不行）。
+
+    ``row_no`` 是该行在 CSV 里的 1 基行号，构成 ``trade_id`` 的一部分，
+    必须在 CSV 锁内取（见调用点）。传错会让导入器给同一行再造一份副本。
+
+    任何异常只记 warning，**绝不冒泡**：调用方是分析主流程 + 后台 follow-up
+    线程（AGENTS.md「必须 daemon 线程 + 分步 try/except」）。
+    """
+    if row_no <= 0:
+        logger.warning(
+            "row numbering unavailable; skipping SQLite index for %s (CSV is authoritative)",
+            csv_path.name,
+        )
+        return
+    try:
+        from pa_agent.storage.trade_repo import upsert_trade_row
+
+        upsert_trade_row(
+            row,
+            csv_path=csv_path,
+            row_no=row_no,
+            chart_path=str(chart_path) if chart_path else "",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "trade SQLite mirror failed for %s row %d (CSV already saved): %s",
+            csv_path.name, row_no, exc,
+        )
+
 
 def _parse_sr_price(raw: object) -> float | None:
     """Parse a price value that may be a number, string, or range (e.g. '5380-5400').
@@ -635,10 +715,25 @@ def _save_trade_record_impl(
 
     with _csv_lock_for(csv_path):
         needs_header = not csv_path.exists() or csv_path.stat().st_size == 0
+        # 行号（1 基数据行，不含表头）是 trade_id 的组成部分，**必须在锁内取**：
+        # 锁外取号时并发追加会拿到同一个号，两笔不同交易共用一个 PRIMARY KEY，
+        # 后一笔静默覆盖前一笔。计数本身按 (size, mtime) 缓存，稳态是 O(1)。
+        row_no = _next_row_no(csv_path)
         with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=_CSV_FIELDNAMES, extrasaction="ignore")
             if needs_header:
                 writer.writeheader()
             writer.writerow({k: merged_row.get(k, "") for k in _CSV_FIELDNAMES})
+    _note_row_appended(csv_path, row_no)
 
-    logger.info("Trade record appended: %s", csv_path)
+    logger.info("Trade record appended: %s (row %d)", csv_path, row_no)
+
+    # ── 双写 SQLite（索引层；CSV 已落盘，是权威副本） ──────────────────────────
+    # 放在锁外：DB 写可能因 busy_timeout 等几毫秒，持有 CSV 文件锁会放大并发写入的
+    # 等待。row_no 已在锁内取定，锁外用它是安全的。
+    _mirror_to_sqlite(
+        merged_row,
+        csv_path=csv_path,
+        row_no=row_no,
+        chart_path=image_path if chart_written else None,
+    )

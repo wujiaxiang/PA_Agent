@@ -34,8 +34,9 @@ DEFAULT_TTL_S = 1800.0
 #: 硬上限。超出按 LRU 踢 —— 没有上限时，一个反复开关标签页的会话可以
 #: 把内存吃光（AGENTS.md 遗留需求 3「SSE 长连接内存泄漏排查」）。
 DEFAULT_MAX_SESSIONS = 64
-#: 每会话 SSE 出站队列上限。沿用 routes_bars_stream.SUBSCRIBER_QUEUE_MAXSIZE
-#: 的取值与理由：后台标签页不得无限累积事件。
+#: 每会话 SSE 出站队列上限。取 256 是沿用原服务端广播队列的取值与理由：
+#: 后台标签页不得无限累积事件。K 线推送已改前端轮询，此常量目前只服务
+#: 追问等仍在用 SSE 的端点。
 DEFAULT_QUEUE_MAXSIZE = 256
 
 

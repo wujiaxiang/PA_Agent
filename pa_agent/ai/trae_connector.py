@@ -548,11 +548,15 @@ def apply_trae_cn_provider_to_settings(
 ) -> str | None:
     """Populate *settings.provider* from TRAE Work CN environment.
 
+    成功后由 :func:`~pa_agent.config.settings.persist_provider` 写**用户层**
+    （只写 connector 改过的那几个键，不碰系统兜底、不整份写文件）。
+
     Returns None on success, or a user-facing error string.
     """
     from pa_agent.ai.cursor_connector import is_openclaw_cs_model
     from pa_agent.ai.qclaw_connector import is_openclaw_model
     from pa_agent.ai.workbuddy_connector import is_openclaw_wb_model
+    from pa_agent.config.settings import persist_provider
 
     model_hint = (preferred_model or getattr(settings.provider, "model", "") or "").strip()
     if is_openclaw_model(model_hint):
@@ -603,38 +607,33 @@ def apply_trae_cn_provider_to_settings(
             "程序会自动从本地存储中提取最新的 Token。"
         )
 
+    # 一切校验通过才落库：写**用户层**，**绝不写系统兜底**（凭证属 L1 单机账号）。
+    # 只声明 connector 真正改的那几个键 → 不会把 .env 的 15 个字段烧进来。
+    persist_provider(provider)
     return None
 
 
 # ── Sync on load ──────────────────────────────────────────────────────────────
 
-def sync_trae_cn_provider_on_load(
-    settings: Any,
-    *,
-    save_path: Path | None = None,
-) -> None:
-    """Refresh token for openclaw_twc routing on load."""
+def sync_trae_cn_provider_on_load(settings: Any) -> None:
+    """Refresh token for openclaw_twc routing on load.
+
+    落库由 :func:`apply_trae_cn_provider_to_settings` 自带（``persist_provider``
+    写用户层）—— 曾在这里「apply 之后再整份 Settings 写文件」，而系统兜底一旦
+    存在那份文件根本没人读，token 刷新静默丢失。``save_path`` 参数随之删除。
+    """
     if not detect_trae_cn():
         return
     provider = settings.provider
     if not is_trae_cn_route(provider):
         return
 
-    before_token = str(getattr(provider, "api_key", "") or "")
     err = apply_trae_cn_provider_to_settings(settings)
     if err:
         logger.warning("TRAE CN provider sync failed: %s", err)
         return
 
-    after_token = str(getattr(provider, "api_key", "") or "")
-    if save_path is not None and before_token != after_token:
-        try:
-            from pa_agent.config.settings import save_settings
-
-            save_settings(settings, save_path)
-            logger.info("TRAE CN provider synced on load (token refreshed)")
-        except Exception as exc:
-            logger.warning("Failed to persist synced TRAE CN provider: %s", exc)
+    logger.info("TRAE CN provider synced on load (token refreshed)")
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

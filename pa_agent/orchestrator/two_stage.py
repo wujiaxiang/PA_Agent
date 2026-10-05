@@ -1186,14 +1186,13 @@ class TwoStageOrchestrator:
             apply_qclaw_provider_to_settings,
             is_openclaw_model,
         )
-        from pa_agent.config.paths import SETTINGS_JSON_PATH
 
         if not is_openclaw_model(original_model):
             return False
         if self._settings is None:
             return False
 
-        from pa_agent.config.settings import save_settings
+        from pa_agent.config.settings import persist_provider
         from pa_agent.util.logging import update_api_key
 
         err = apply_qclaw_provider_to_settings(self._settings)
@@ -1202,11 +1201,15 @@ class TwoStageOrchestrator:
             return False
 
         self._client.update_provider(self._settings.provider)
+        # 不再整份写 settings.json：系统兜底一旦存在那份文件根本没人读 → 静默丢弃。
+        # 只声明式写用户层的 connector 字段（model/base_url/api_key/context_window），
+        # 绝不写系统兜底（凭证属 L1 单机账号），也绝不整份持久化 .env 的 15 个字段。
+        if not persist_provider(self._settings.provider):
+            logger.warning("QClaw fallback applied but user-layer persist failed")
         try:
-            save_settings(self._settings, SETTINGS_JSON_PATH)
             update_api_key(self._settings.provider.api_key)
         except Exception as save_exc:  # noqa: BLE001
-            logger.warning("QClaw fallback applied but settings save failed: %s", save_exc)
+            logger.warning("QClaw fallback applied but log masking update failed: %s", save_exc)
 
         logger.info(
             "QClaw auto-fallback: model=%s base_url=%s",
@@ -1221,14 +1224,13 @@ class TwoStageOrchestrator:
             apply_cursor_provider_to_settings,
             is_openclaw_cs_model,
         )
-        from pa_agent.config.paths import SETTINGS_JSON_PATH
 
         if not is_openclaw_cs_model(original_model):
             return False
         if self._settings is None:
             return False
 
-        from pa_agent.config.settings import save_settings
+        from pa_agent.config.settings import persist_provider
         from pa_agent.util.logging import update_api_key
 
         err = apply_cursor_provider_to_settings(
@@ -1240,11 +1242,13 @@ class TwoStageOrchestrator:
             return False
 
         self._client.update_provider(self._settings.provider)
+        # 同上：声明式写用户层，不整份写文件、不碰系统兜底。
+        if not persist_provider(self._settings.provider):
+            logger.warning("Cursor fallback applied but user-layer persist failed")
         try:
-            save_settings(self._settings, SETTINGS_JSON_PATH)
             update_api_key(self._settings.provider.api_key)
         except Exception as save_exc:  # noqa: BLE001
-            logger.warning("Cursor fallback applied but settings save failed: %s", save_exc)
+            logger.warning("Cursor fallback applied but log masking update failed: %s", save_exc)
 
         logger.info(
             "Cursor auto-fallback: model=%s base_url=%s",
@@ -1259,14 +1263,13 @@ class TwoStageOrchestrator:
             apply_workbuddy_provider_to_settings,
             is_openclaw_wb_model,
         )
-        from pa_agent.config.paths import SETTINGS_JSON_PATH
 
         if not is_openclaw_wb_model(original_model):
             return False
         if self._settings is None:
             return False
 
-        from pa_agent.config.settings import save_settings
+        from pa_agent.config.settings import persist_provider
         from pa_agent.util.logging import update_api_key
 
         err = apply_workbuddy_provider_to_settings(self._settings)
@@ -1275,11 +1278,13 @@ class TwoStageOrchestrator:
             return False
 
         self._client.update_provider(self._settings.provider)
+        # 同上：声明式写用户层，不整份写文件、不碰系统兜底。
+        if not persist_provider(self._settings.provider):
+            logger.warning("WorkBuddy fallback applied but user-layer persist failed")
         try:
-            save_settings(self._settings, SETTINGS_JSON_PATH)
             update_api_key(self._settings.provider.api_key)
         except Exception as save_exc:  # noqa: BLE001
-            logger.warning("WorkBuddy fallback applied but settings save failed: %s", save_exc)
+            logger.warning("WorkBuddy fallback applied but log masking update failed: %s", save_exc)
 
         logger.info(
             "WorkBuddy auto-fallback: model=%s base_url=%s",
@@ -1294,14 +1299,13 @@ class TwoStageOrchestrator:
             apply_trae_cn_provider_to_settings,
             is_openclaw_twc_model,
         )
-        from pa_agent.config.paths import SETTINGS_JSON_PATH
 
         if not is_openclaw_twc_model(original_model):
             return False
         if self._settings is None:
             return False
 
-        from pa_agent.config.settings import save_settings
+        from pa_agent.config.settings import persist_provider
         from pa_agent.util.logging import update_api_key
 
         err = apply_trae_cn_provider_to_settings(
@@ -1312,12 +1316,17 @@ class TwoStageOrchestrator:
             return False
 
         self._client.update_provider(self._settings.provider)
+        # 同上：声明式写用户层，不整份写文件、不碰系统兜底。
+        if not persist_provider(self._settings.provider):
+            logger.warning(
+                "TRAE Work CN fallback applied but user-layer persist failed"
+            )
         try:
-            save_settings(self._settings, SETTINGS_JSON_PATH)
             update_api_key(self._settings.provider.api_key)
         except Exception as save_exc:  # noqa: BLE001
             logger.warning(
-                "TRAE Work CN fallback applied but settings save failed: %s", save_exc
+                "TRAE Work CN fallback applied but log masking update failed: %s",
+                save_exc,
             )
 
         logger.info(

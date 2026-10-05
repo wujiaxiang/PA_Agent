@@ -59,11 +59,14 @@ class AppContext:
         from pa_agent.ai.trae_connector import sync_trae_cn_provider_on_load
         from pa_agent.ai.qoder_connector import sync_qoder_cn_provider_on_load
 
-        sync_qclaw_agent_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
-        sync_workbuddy_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
-        sync_cursor_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
-        sync_trae_cn_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
-        sync_qoder_cn_provider_on_load(settings, save_path=SETTINGS_JSON_PATH)
+        # 同步后**不再整份写文件**：系统兜底一旦存在，settings.json 根本没人读，
+        # 写了也是静默丢弃。各 sync_* 内部由 apply_*_provider_to_settings 调
+        # `persist_provider()` 声明式写用户层（只写 connector 真正改的那几个键）。
+        sync_qclaw_agent_provider_on_load(settings)
+        sync_workbuddy_provider_on_load(settings)
+        sync_cursor_provider_on_load(settings)
+        sync_trae_cn_provider_on_load(settings)
+        sync_qoder_cn_provider_on_load(settings)
 
         # Apply .env / process env overrides (TODO P1.2). Web mode typically
         # uses .env for secrets; GUI mode leaves .env absent and this is no-op.
