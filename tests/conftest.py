@@ -14,6 +14,8 @@
 """
 from __future__ import annotations
 
+import pytest
+
 import os
 import tempfile
 from pathlib import Path
@@ -26,3 +28,16 @@ os.environ.setdefault(
 
 # 部分测试会连真实 .env，模型凭证可能指向付费端点。测试里一律不发真请求。
 os.environ.setdefault("PA_AGENT_TESTING", "1")
+
+@pytest.fixture()
+def db_path_isolated(tmp_path, monkeypatch):
+    """把 hub 指向 tmp 目录下的独立 DB，并保证每次测试拿到全新的 hub。"""
+    from pa_agent.storage import db as db_mod
+
+    target = tmp_path / "isolated.db"
+    monkeypatch.setattr(db_mod, "db_path", lambda: target)
+    # initialize=False：不建表、不置初始化标记 —— 让测试能从「库还不存在」
+    # 这个干净起点出发，验证「未初始化时不许建库/写入」这条不变式。
+    db_mod.reset_hub_for_tests(target, initialize=False)
+    yield target
+    db_mod.reset_hub_for_tests(Path(os.environ["PA_AGENT_DB_PATH"]))

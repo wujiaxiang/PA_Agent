@@ -146,7 +146,21 @@ def resolve(user_id: str, file_fallback: dict[str, Any] | None = None) -> dict |
     """Full effective config: baseline ← overrides, with file as last resort.
 
     返回 None 表示「DB 与文件都没有配置」，调用方应落默认值。
+
+    **读失败绝不等于「首次运行」**：若 DB 已初始化却读不出来（损坏 / 权限 / 只读），
+    此时若继续播种就会把一份可能已损坏的文件**升格成系统兜底**，污染所有用户且
+    永不重播种（seed_from_file 只在兜底为空时动作）。故此时明确返回 None，
+    交给调用方走纯文件路径 —— 文件本身不会被写坏。
     """
+    hub = get_hub()
+    if hub.read_failed:
+        logger.error(
+            "settings baseline 读取失败（%s）；本次不使用 DB，也不播种。"
+            "请修复数据库或检查挂载权限。",
+            hub.read_error,
+        )
+        return None
+
     baseline = load_baseline()
     if baseline is None and file_fallback is not None:
         # 首次运行：把既有文件升格为系统兜底，之后用户继承它

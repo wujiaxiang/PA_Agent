@@ -11,6 +11,7 @@ import asyncio
 
 import requests
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import ValidationError
 from fastapi.responses import JSONResponse
 
 from pa_agent.config.paths import SETTINGS_JSON_PATH
@@ -99,10 +100,18 @@ def _should_keep_existing(section: str, field: str, value) -> bool:
 
 @router.put("/settings")
 async def put_settings(request: Request, body: dict):
-    """Merge *body* into current settings and save to disk."""
+    """Merge *body* into current settings and save.
+
+    赋值走 Pydantic 的 ``validate_assignment=True``：越界/类型不合法的值会被拒，
+    而不是像 2026-10-05 那次一样被静默写入、把 base_url 与 api_key 冲成默认值。
+    任一字段校验失败即整体回滚（见下方 staged copy），返回 400 并指明字段。
+    """
     ctx = request.app.state.ctx
     current = ctx.settings
     masked_key_dropped = False
+    # 先快照原值再统一提交：整段赋值是一体的，某个字段校验失败时无法只回滚
+    # 那一个，必须靠快照还原 —— 否则会留下半套配置，比全盘拒绝更危险。
+    staged: list[tuple[object, str, object, object]] = []
     for section in ("provider", "prompt", "validation", "general", "feishu", "tushare", "pushplus", "tradingview"):
         if section in body and isinstance(body[section], dict):
             target = getattr(current, section, None)
@@ -115,7 +124,23 @@ async def put_settings(request: Request, body: dict):
                         if (section, k) in _SECRET_FIELDS and _should_keep_existing(section, k, v):
                             masked_key_dropped = True
                             continue
-                        setattr(target, k, v)
+                        staged.append((target, k, getattr(target, k), v))
+
+    for target, key, original, value in staged:
+        try:
+            setattr(target, key, value)
+        except ValidationError as exc:
+            for t2, k2, orig2, _v2 in staged:
+                try:
+                    setattr(t2, k2, orig2)
+                except Exception:  # noqa: BLE001 - 还原的是已验证过的原值
+                    logger.exception("回滚配置字段失败: %s.%s", type(t2).__name__, k2)
+            first = exc.errors()[0] if exc.errors() else {}
+            loc = ".".join(str(x) for x in (first.get("loc") or (key,)))
+            raise HTTPException(
+                status_code=400,
+                detail=f"配置无效：{loc} = {value!r}（{first.get('msg', '校验失败')}）",
+            ) from exc
     # 落盘两份：① 用户自己的配置区（稀疏覆盖，日后此处才是该用户的真源）
     # ② settings.json 作为灾备/遗留副本 —— DB 损坏时仍能凭它启动。
     # 系统兜底区**不被用户改动触碰**：它是所有用户的只读默认值。

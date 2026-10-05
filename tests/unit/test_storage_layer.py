@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from pa_agent.storage import ephemeral, importer, repositories, sessions
-from pa_agent.storage.db import get_hub, reset_hub_for_tests
+from pa_agent.storage.db import get_hub, initialize_storage, reset_hub_for_tests
 from pa_agent.storage.schema import SCHEMA_VERSION, all_statements, tables
 
 
@@ -358,3 +358,75 @@ def test_import_missing_dir(db, tmp_path):
     assert importer.import_analysis_records(tmp_path / "nope") == {
         "scanned": 0, "imported": 0, "skipped": 0
     }
+
+
+# ── 一次性初始化不变式（2026-10-05 评审 B5/B6）───────────────────────────────
+# 原则：一个环境只有一个 DB 文件，路径启动时定死，只在启动时初始化一次。
+
+
+def test_get_hub_does_not_create_db(db_path_isolated: Path):
+    """get_hub 只取实例，**绝不建库**。
+
+    建库必须显式 initialize_storage()。此前 get_hub 内部顺手 migrate()，
+    于是任何一处 import 触发调用都可能在真实数据目录里建出库 —— 测试写脏
+    开发者真实数据的根因。
+    """
+    from pa_agent.storage.db import get_hub, initialize_storage
+
+    hub = get_hub()
+    assert not db_path_isolated.exists(), "get_hub 不该建库"
+    initialize_storage()
+    assert db_path_isolated.exists(), "initialize_storage 才建库"
+
+
+def test_execute_refused_before_initialization(db_path_isolated: Path):
+    hub = get_hub()
+    assert hub.execute("CREATE TABLE t(a)") is False
+    initialize_storage()
+    assert hub.execute("CREATE TABLE IF NOT EXISTS t(a)") is True
+
+
+def test_initialize_storage_is_idempotent(db_path_isolated: Path):
+    h1 = initialize_storage()
+    h2 = initialize_storage()
+    assert h1 is h2 and h2._initialized
+
+
+def test_reset_hub_for_tests_requires_explicit_path():
+    """省略 path 曾静默回落到真实 records/pa_agent.db —— 测试因此写脏真实数据。"""
+    from pa_agent.storage.db import reset_hub_for_tests
+
+    with pytest.raises(ValueError, match="必须显式传 path"):
+        reset_hub_for_tests()
+
+
+def test_stats_does_not_raise(db_path_isolated: Path):
+    """回归守卫：stats() 曾引用不存在的属性，导致启动时整个存储初始化失败。"""
+    initialize_storage()
+    st = get_hub().stats()
+    assert st["initialized"] is True
+    assert "read_failed" in st and st["read_failed"] is False
+
+
+def test_concurrent_lock_error_does_not_latch(db_path_isolated: Path):
+    """『database is locked』是并发问题，不是致命故障 —— 闩死会让进程永久退化。"""
+    hub = initialize_storage()
+    hub._maybe_latch("database is locked")
+    assert hub.disabled is False
+
+
+def test_corruption_does_latch(db_path_isolated: Path):
+    hub = initialize_storage()
+    hub._maybe_latch("file is not a database")
+    assert hub.disabled is True
+
+
+def test_read_failure_is_distinguishable_from_empty(db_path_isolated: Path):
+    """读失败 ≠ 表里没数据。把两者混同会把损坏文件升格成系统兜底。"""
+    hub = initialize_storage()
+    assert hub.query("SELECT * FROM global_config") == []
+    assert hub.read_failed is False, "正常读到空表不算失败"
+
+    hub._read_error = "no such table: nope"
+    assert hub.query("SELECT * FROM nope") == []
+    assert hub.read_failed is True, "读失败必须能被上层识别"

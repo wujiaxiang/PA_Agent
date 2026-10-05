@@ -22,7 +22,47 @@
 
 ## 🔴 进行中（有人正在改这些文件，不要动）
 
-> **当前状态：无进行中条目。** 下方最近一条已完工。
+### 2026-10-05 · 配置层加固（写端校验 + 一次性初始化）
+
+**状态**：进行中（工作区未提交）
+
+#### 需求
+6 位专家评审判定配置层有 6 个 BLOCKER，其中 3 个与「DB 实例每环境唯一、
+启动时确定」直接相关。本条处理 B1 / B5 / B6。
+
+#### 方案
+- **B1 写端零校验**：九个 section 加 `validate_assignment=True`；`PUT /api/settings`
+  先快照原值再逐字段提交，失败整体回滚并返回 400。此前越界值被静默写入，
+  2026-10-05 实际造成 base_url 被冲成默认值、api_key 清空、分析整体不可用
+- **B5 读失败与「无数据」不可区分**：新增 `hub.read_failed`；`resolve()` 读失败时
+  **拒绝播种**并走纯文件，避免把损坏文件升格成系统兜底且永不重播种
+- **B6 初始化不是一次性**：`get_hub()` 只取实例不再建库；新增 `initialize_storage()`，
+  在 lifespan 中**早于 `AppContext.bootstrap()`** 调用（此前顺序颠倒，bootstrap
+  读配置报 `no such table: user_prefs` 静默退回文件）；未初始化时 `execute()` 拒写
+- 并发锁冲突（`database is locked`）不再闩死存储层，只有文件损坏/只读才置 `_disabled`
+- `reset_hub_for_tests()` 无参直接抛错，不再静默回落到真实 `records/pa_agent.db`
+
+#### 改动文件（写入范围）
+
+| 文件 | 改动 |
+|---|---|
+| `pa_agent/config/settings.py` | 9 个 section 加 `validate_assignment=True` |
+| `web/api/routes_settings.py` | 快照/提交/回滚 + 400 响应 |
+| `pa_agent/storage/db.py` | 初始化闸门、`read_failed`、按错误类型决定是否闩死 |
+| `pa_agent/storage/settings_store.py` | 读失败时拒绝播种 |
+| `web/server.py` | 初始化提前到 bootstrap 之前 |
+| `tests/unit/test_storage_layer.py` | 新增 8 项初始化不变式测试 |
+| `tests/conftest.py` | 新增 `db_path_isolated` 夹具 |
+
+#### 接口变更
+- `PUT /api/settings` 遇非法取值从静默写入改为 **400 + 指明字段**
+
+#### 冲突风险
+- `pa_agent/config/settings.py` 与 `web/api/routes_settings.py` 是配置层热点
+- `stats()` 曾因引用不存在的属性导致启动时整个存储初始化失败；已加回归测试
+- 测量陷阱：校验「测试是否写脏真实 DB」前**必须先 rm**，否则看到的是上一次残留
+  （本轮已两次误判为「仍被污染」）
+
 
 ## ✅ 已提交（本条改动待 commit；条目已不再占用写入范围）
 

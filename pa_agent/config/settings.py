@@ -11,7 +11,7 @@ NormalizationMode = Literal["strict", "lenient"]
 
 class AIProviderSettings(BaseModel):
     """AI provider connection and behaviour settings."""
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", validate_assignment=True)
 
     # 服务端 prompt cache 预热：真实请求前先用同一稳定前缀发一条
     # max_tokens=1 的廉价请求。实测把缓存率从 0.2% 提到 100%，
@@ -39,7 +39,7 @@ class AIProviderSettings(BaseModel):
 
 class PromptSettings(BaseModel):
     """Prompt assembly tuning (accuracy-oriented defaults)."""
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", validate_assignment=True)
 
     #: When True, Stage 2 loads every strategy .txt (legacy/test behaviour).
     stage2_load_full_strategy_library: bool = False
@@ -70,7 +70,7 @@ class PromptSettings(BaseModel):
 
 class ValidationSettings(BaseModel):
     """Post-LLM validation behaviour."""
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", validate_assignment=True)
 
     normalization_mode: NormalizationMode = "lenient"
     #: Stage-1 cross-field checks (gate trace, bar_by_bar, pattern tags). Off by default.
@@ -91,7 +91,7 @@ class ValidationSettings(BaseModel):
 
 class GeneralSettings(BaseModel):
     """UI and data-feed general settings."""
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", validate_assignment=True)
 
     analysis_bar_count: int = Field(default=100, ge=2, le=5000)
     refresh_interval_ms: int = 1000
@@ -170,7 +170,7 @@ _FEISHU_CONFIG_KEYS = (
 
 class FeishuSettings(BaseModel):
     """Feishu bot notification settings (persisted in settings.json)."""
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", validate_assignment=True)
 
     enabled: bool = True
     webhook_url: str = ""
@@ -183,7 +183,7 @@ class FeishuSettings(BaseModel):
 
 class TushareSettings(BaseModel):
     """Tushare Pro data source settings (persisted in ignored settings.json)."""
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", validate_assignment=True)
 
     token: str = ""
 
@@ -201,7 +201,7 @@ class TradingViewSettings(BaseModel):
     Env vars ``PA_AGENT_TRADINGVIEW_SESSION_ID`` / ``PA_AGENT_TRADINGVIEW_USERNAME``
     / ``PA_AGENT_TRADINGVIEW_PASSWORD`` override these on a per-deployment basis.
     """
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", validate_assignment=True)
 
     username: str = ""
     password: str = ""
@@ -210,7 +210,7 @@ class TradingViewSettings(BaseModel):
 
 class PushPlusSettings(BaseModel):
     """PushPlus notification settings (settings.json only; no GUI)."""
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", validate_assignment=True)
 
     enabled: bool = False
     token: str = ""
@@ -218,7 +218,7 @@ class PushPlusSettings(BaseModel):
 
 class Settings(BaseModel):
     """Root settings object persisted to config/settings.json."""
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", validate_assignment=True)
 
     provider: AIProviderSettings = Field(default_factory=AIProviderSettings)
     general: GeneralSettings = Field(default_factory=GeneralSettings)

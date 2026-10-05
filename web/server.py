@@ -45,6 +45,24 @@ async def lifespan(app: FastAPI):
     from web.bridge.event_bus import AsyncEventBus
 
     logger.info("Lifespan startup: beginning bootstrap")
+
+    # ── 存储层一次性初始化：必须早于 AppContext.bootstrap() ────────────────
+    # bootstrap() 内会 load_settings()，而配置真源在 DB。若 DB 还没建好就去读，
+    # 会得到「no such table: user_prefs」并静默退回纯文件 —— 表现为「DB 明明
+    # 开着，配置却一直走文件」。一个环境一个 DB 文件，路径在此时定死。
+    try:
+        from pa_agent.storage.db import initialize_storage
+
+        hub = initialize_storage()
+        logger.info("SQLite storage initialized: %s", hub.stats())
+        if hub.disabled:
+            logger.warning(
+                "SQLite unavailable (%s) — running in file-only mode",
+                hub.stats()["disabled_reason"],
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Storage init failed, continuing file-only: %s", exc)
+
     ctx = AppContext.bootstrap()
     # Replace Qt EventBus with async stub so core emits don't crash
     ctx.event_bus = AsyncEventBus()
@@ -84,14 +102,8 @@ async def lifespan(app: FastAPI):
         from pa_agent.storage.importer import import_all
         from pa_agent.storage.users import ensure_admin_user
 
-        hub = get_hub()
-        logger.info("SQLite storage: %s", hub.stats())
-        if hub.disabled:
-            logger.warning(
-                "SQLite unavailable (%s) — running in file-only mode",
-                hub.stats()["disabled_reason"],
-            )
-        else:
+        hub = get_hub()   # 上面已 initialize_storage()，此处只取实例
+        if not hub.disabled:
             # 单机部署恒为 admin；UI 暂不做登录。将来接鉴权只改 default_user_id()
             logger.info("Default user ready: %s", ensure_admin_user())
             reg = get_registry()
