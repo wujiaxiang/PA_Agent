@@ -26,6 +26,7 @@ STAGE2_VALIDATION_AUTO_RETRY = False
 import copy
 import dataclasses
 import logging
+from typing import Any
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -45,6 +46,22 @@ from pa_agent.util.threading import CancelToken, OrchestratorEvent
 from pa_agent.util.timefmt import now_local_ms
 
 logger = logging.getLogger(__name__)
+
+
+def _pick_last_closed_bar(kline_data: Any) -> Any:
+    """Return the newest bar that is actually closed, else a legacy fallback.
+
+    Extracted from the ``last_close_bar_iso`` derivation so it is unit
+    testable without running the whole pipeline.
+    """
+    bars = list(kline_data or [])
+    if not bars:
+        return None
+    for bar in bars:
+        if isinstance(bar, dict) and bar.get("closed"):
+            return bar
+    # 老格式没有 closed 标志：退回「bars[1] 为最近已收盘」的旧启发式
+    return bars[1] if len(bars) > 1 else bars[0]
 
 
 def _latency_ms_label(latency_ms: object) -> str:
@@ -238,14 +255,18 @@ def _build_empty_record(
     if settings is not None:
         exchange = str(getattr(settings.general, "last_tradingview_exchange", "") or "")
 
-    # Derive last_close_bar_iso from the first closed bar's ts_open (ms timestamp).
-    # kline_data is newest-first: bars[0] = forming bar, bars[1] = K1 (just closed).
-    # Use K1's ts_open as the "close bar time" for display in history list.
+    # Derive last_close_bar_iso from the first *closed* bar's ts_open.
+    #
+    # 快照通常是 newest-first 且 bars[0] 是未收盘 forming bar，此时第一根
+    # closed 就是 bars[1]。但并非总是如此：休市、或快照未带 forming bar 时
+    # bars[0] 本身就是已收盘的 —— 曾硬取 kline_data[1] 导致锚点整整差一根，
+    # 历史回看时箭头指向错误的 K 线。改为按 closed 标志找第一根。
     last_close_bar_iso = ""
     if kline_data:
         try:
-            # bars[0] = forming bar (closed=False), bars[1] = K1 (just closed)
-            target_bar = kline_data[1] if len(kline_data) > 1 else kline_data[0]
+            target_bar = _pick_last_closed_bar(kline_data)
+            if target_bar is None:
+                raise IndexError("empty kline_data")
             ts_close_ms = int(target_bar.get("ts_open") or target_bar.get("time", 0))
             if ts_close_ms > 0:
                 last_close_bar_iso = datetime.fromtimestamp(

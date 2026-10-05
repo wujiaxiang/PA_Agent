@@ -54,6 +54,32 @@ def _looks_like_iso_datetime(s) -> bool:
         return False
 
 
+def _derive_anchor_bar_ts_ms(record: AnalysisRecord) -> int:
+    """Authoritative ts_open (ms) of the record's last **closed** bar.
+
+    Derived from the record's own ``kline_data`` rather than from the stored
+    ``meta.last_close_bar_iso``:
+
+    * ``kline_data`` is immutable history, so the answer never drifts.
+    * Records written before the off-by-one fix still carry a stale ISO value
+      baked into their JSON. Re-deriving here repairs those at read time
+      instead of rewriting history on disk.
+
+    ``bars[0]`` is not always the forming bar — a closed market or a snapshot
+    without one puts an already-closed bar at index 0. Index 1 then points a
+    full bar into the past.
+    """
+    from pa_agent.orchestrator.two_stage import _pick_last_closed_bar
+
+    bar = _pick_last_closed_bar(getattr(record, "kline_data", None))
+    if not isinstance(bar, dict):
+        return 0
+    try:
+        return int(bar.get("ts_open") or bar.get("time") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _derive_last_close_bar_iso(record: AnalysisRecord) -> str:
     """提取 last_close_bar_iso，优先 meta；为空则从 kline_data / stage1 派生。
 
@@ -70,15 +96,11 @@ def _derive_last_close_bar_iso(record: AnalysisRecord) -> str:
     if last_close_bar_iso:
         return last_close_bar_iso
 
-    if record.kline_data:
+    ts_ms = _derive_anchor_bar_ts_ms(record)
+    if ts_ms:
         try:
-            # kline_data is newest-first: bars[0] = forming bar, bars[1] = K1 (just closed)
-            target_bar = record.kline_data[1] if len(record.kline_data) > 1 else record.kline_data[0]
-            # 实际时间字段是 ts_open（ms）；time 是旧字段名，做兼容
-            ts_ms = int(target_bar.get("ts_open") or target_bar.get("time") or 0)
-            if ts_ms > 0:
-                return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
-        except (TypeError, ValueError, AttributeError, IndexError):
+            return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OverflowError, OSError):
             pass
 
     if record.stage1_diagnosis:
@@ -171,6 +193,9 @@ def _list_records(
             "partial_reason": partial_reason,
             "has_exception": record.exception is not None,
             "last_close_bar_iso": _derive_last_close_bar_iso(record),
+            # 权威锚点（ms）。前端回放视窗与方向箭头优先用它，而不是
+            # 可能已烙进旧记录 JSON 的 last_close_bar_iso。
+            "anchor_bar_ts_ms": _derive_anchor_bar_ts_ms(record),
             "incremental": getattr(record.meta, "incremental", False),
             "continuous": getattr(record.meta, "continuous", False),
         })
@@ -229,6 +254,10 @@ async def get_record(record_id: str, request: Request):
     # 回填 _partial_reason（非 schema 字段，但前端可能需要）
     if partial_reason is not None:
         result["_partial_reason"] = partial_reason
+    # 权威锚点：从记录自身的 kline_data 现算，顺带修正旧记录里
+    # 已烙进 JSON 的差一根 last_close_bar_iso（见 _derive_anchor_bar_ts_ms）
+    result["anchor_bar_ts_ms"] = _derive_anchor_bar_ts_ms(record)
+    result["last_close_bar_iso"] = _derive_last_close_bar_iso(record)
 
     # 脱敏：复用 PendingWriter._sanitize，用当前 ctx 的 api_key 作为防御性二次脱敏
     # （磁盘上的记录在保存时已脱敏；此处针对未脱敏的遗留记录做兜底）。

@@ -4933,44 +4933,57 @@ async function applyReplayChart(record) {
     const tf = $('#ds-timeframe'); if (tf) tf.value = timeframe;
     const ex = $('#ds-exchange'); if (ex && exchange) ex.value = exchange;
 
-    // 清掉上一次回看留下的横线，再画本次记录的
-    clearOverlays(candleSeries);
-    const overlay = record.decision_overlay || record.stage2_decision || {};
-    setDecisionOverlays(candleSeries, overlay);
-    setDirectionMarker(candleSeries, overlay);
-    _renderTradeLegend(overlay);
-
-    // 视窗对齐到「分析当时」：以该记录最后一根已收盘 bar 为锚。
-    // 注意：老记录的分析时间可能已不在当前加载的数据范围内
-    // （例如回看 8 月的 ETH，而当前只有 10 月的 K 线），
-    // 此时若硬对齐到最近的一根，会被钳到序列边界、视窗退化成开头两三根
-    // 超宽 K 线。所以锚点落在数据范围外时改为回退到近期窗口。
+    // ── 先解析「分析当时」的锚点 bar ──────────────────────────────────
+    // 必须在画方向箭头**之前**算好：箭头要落在当时那根 K 线上，
+    // 而不是刚加载数据的最新一根（回看历史记录时两者相差几周）。
+    //
+    // 注意：老记录的分析时间可能已不在当前加载的数据范围内（例如回看
+    // 8 月的 ETH，而当前只有 10 月的 K 线）。此时若硬对齐会被钳到序列
+    // 边界、视窗退化成开头两三根超宽 K 线，所以范围外改为回退到近期窗口，
+    // 并且**不画方向箭头** —— 画在一个不相关的 bar 上比不画更有害。
+    let anchorSec = null;
+    let total = 0;
     try {
       if (lastBars && lastBars.length) {
         const sorted = [...lastBars].sort((a, b) => a.ts_open - b.ts_open);
+        total = sorted.length;
         const firstTs = sorted[0].ts_open / 1000;
-        const lastTs = sorted[sorted.length - 1].ts_open / 1000;
-        const anchorTs = record.last_close_bar_iso
-          ? Date.parse(record.last_close_bar_iso) / 1000
-          : lastTs;
-        const total = sorted.length;
-        if (anchorTs >= firstTs && anchorTs <= lastTs) {
+        const lastTs = sorted[total - 1].ts_open / 1000;
+        // 优先用服务端现算的权威锚点：旧记录的 last_close_bar_iso 里可能
+        // 烙着差一根的值（当时 bars[0] 并非 forming bar），用 kline_data
+        // 重新推导才能修正，且不必改写磁盘上的历史。
+        const anchorMs = Number(record.anchor_bar_ts_ms || 0);
+        const anchorTs = anchorMs > 0
+          ? anchorMs / 1000
+          : (record.last_close_bar_iso
+              ? Date.parse(record.last_close_bar_iso) / 1000
+              : lastTs);
+        if (Number.isFinite(anchorTs) && anchorTs >= firstTs && anchorTs <= lastTs) {
           let nearest = 0, best = Infinity;
           sorted.forEach((b, i) => {
             const d = Math.abs(b.ts_open / 1000 - anchorTs);
             if (d < best) { best = d; nearest = i; }
           });
+          // 用真实 bar 的 ts（marker 时间必须落在实际数据点上）
+          anchorSec = Math.floor(sorted[nearest].ts_open / 1000);
           const half = Math.min(30, Math.floor(total / 3));
           const from = Math.max(0, nearest - half);
           const to = Math.min(total - 1, nearest + half);
           if (to > from) chart.timeScale().setVisibleLogicalRange({ from, to: to + 0.5 });
         } else {
-          // 锚点不在范围内：展示最近窗口，价位是否在视野内由图例「视野外」标注说明
           const win = Math.min(60, total);
           chart.timeScale().setVisibleLogicalRange({ from: total - win, to: total - 1 + 1.5 });
+          anchorSec = null;   // 锚点不在数据范围内
         }
       }
     } catch (_) { /* 视窗调整失败不影响回看主体 */ }
+
+    // 清掉上一次回看留下的横线，再画本次记录的
+    clearOverlays(candleSeries);
+    const overlay = record.decision_overlay || record.stage2_decision || {};
+    setDecisionOverlays(candleSeries, overlay);
+    setDirectionMarker(candleSeries, overlay, anchorSec);
+    _renderTradeLegend(overlay);
 
     // 复盘模式不参与持续分析的自动触发判定，避免回看时误触发新一轮分析
     const cbKeep = $('#cb-keep-analysis');

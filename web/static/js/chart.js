@@ -420,7 +420,7 @@ function setSupportResistance(candleSeries, levels) {
 }
 
 // ── 方向箭头 marker ──────────────────────────────────────────────────
-function setDirectionMarker(candleSeries, decision) {
+function setDirectionMarker(candleSeries, decision, anchorTimeSec) {
   const st = _getOverlayState(candleSeries);
   // 移除旧的方向 marker（保留 seq marker 由 setSeqMarkers 管理）
   st.markers = st.markers.filter(m => !m._isDirection);
@@ -432,16 +432,26 @@ function setDirectionMarker(candleSeries, decision) {
   const isShort = dir === 'short' || dir === '做空' || dir === 'sell';
   if (!isLong && !isShort) return;
 
-  // 拿最新一根 bar 的时间作为 marker 锚点
-  const lastBar = candleSeries.dataByIndex
-    ? null  // API 不直接暴露
-    : null;
-  // 通过 series 数据范围取最后一根
-  const logicalRange = candleSeries?.options?._lastLogicalRange;  // 不一定可用
-  // 退而求其次：从 chart.timeScale() 拿 visible range 的 to
-  // 由于难以可靠拿到最后一根 bar 的 time，调用方需在 setBars 后通过 _lastBarTime 全局传递
-  const t = (typeof window !== 'undefined' && window.__PA_LAST_BAR_TIME__) || null;
-  if (t == null) return;
+  // 锚点优先级：
+  //   1) 调用方显式传入（历史回看：必须是「该记录分析当时」那一根 bar）
+  //   2) 回退到最新一根 bar（实时/demo 分析场景，last bar 就是当下）
+  // 曾经只用 (2)，于是回看一条历史记录时，箭头画在了**今天**的 K 线上，
+  // 而不是当时那根 —— 图看着对，语义完全错。
+  //
+  // 注意用 `=== undefined` 而非 `!= null` 判断「是否显式传入」：
+  // 历史回看在锚点落到数据范围外时会显式传 null 表示「**不要画**」。
+  // 用 != null 会让 null 掉进 (2) 分支，箭头又被画到最新一根上 ——
+  // 恰恰是这个 bug 要避免的情形。
+  let t;
+  if (anchorTimeSec === undefined) {
+    t = (typeof window !== 'undefined' && window.__PA_LAST_BAR_TIME__) || null;
+  } else if (anchorTimeSec === null) {
+    t = null;              // 显式要求不画
+  } else {
+    const n = Number(anchorTimeSec);
+    t = Number.isFinite(n) ? Math.floor(n) : null;
+  }
+  if (t == null || !Number.isFinite(t)) return;
 
   const marker = {
     time: t,
