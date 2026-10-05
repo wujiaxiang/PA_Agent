@@ -548,9 +548,17 @@ function fitView(chart, visibleBars = FIT_VISIBLE_BARS, totalBars = 0) {
 function clearOverlays(candleSeries) {
   _clearPriceLines(candleSeries);
   clearTradeLegend();
+  // 经验回放图例也必须一起清：它描述的是刚刚被清掉的那些价格线。
+  // 留着会在图上留下一段没有对应线条的陈旧说明，比不画更误导。
+  clearExperienceLegend();
   const st = _getOverlayState(candleSeries);
   st.markers = [];
   _applyMarkers(candleSeries);
+}
+
+function clearExperienceLegend() {
+  const el = document.getElementById('experience-legend');
+  if (el) el.innerHTML = '';
 }
 
 function _clearPriceLines(candleSeries) {
@@ -628,10 +636,18 @@ function setExperienceReplay(series, entry) {
   // 把"被判定的 K 线区间"圈出来：入场之后的第一根到最后结算的那根
   const markers = [];
   const from = Number(entry.entry_ts_open_ms || 0);
+  // LWC 的 marker 时间必须落在真实 bar 上，否则会被静默丢弃。
+  // 老案例的入场 bar 早已不在当前 200 根窗口里 —— 这种情况不画，
+  // 而在图例里说明「入场点不在当前 K 线范围内」。
+  let entryMarked = false;
   if (from > 0 && Number.isFinite(from)) {
     const sec = Math.floor(from / 1000);
-    markers.push({ time: sec, position: 'aboveBar', shape: 'arrowDown',
-                   color: '#2962ff', text: '入场' });
+    const has = _hasBarAt(series, sec);
+    if (has) {
+      markers.push({ time: sec, position: 'aboveBar', shape: 'arrowDown',
+                     color: '#2962ff', text: '入场' });
+      entryMarked = true;
+    }
   }
   if (entry.resolved_ts_open_ms) {
     const sec = Math.floor(Number(entry.resolved_ts_open_ms) / 1000);
@@ -646,17 +662,28 @@ function setExperienceReplay(series, entry) {
     try { series.setMarkers(markers); } catch (e) { /* 忽略 */ }
   }
 
-  _renderExperienceLegend(entry, statusLabel, isLong, dir);
+  _renderExperienceLegend(entry, statusLabel, isLong, dir, entryMarked);
+}
+
+// 该时间点是否存在于已加载的 bar 中
+function _hasBarAt(series, sec) {
+  try {
+    const data = series.data ? series.data() : null;
+    if (!Array.isArray(data)) return true;   // 取不到就按「在」处理，不阻断
+    return data.some(b => Math.floor(b.time) === sec);
+  } catch (e) {
+    return true;
+  }
 }
 
 function clearExperienceReplay(series) {
   _clearPriceLines(series);
-  try { series.setMarkers([]); } catch (e) { /* 忽略 */ }
-  const el = document.getElementById('experience-legend');
-  if (el) el.innerHTML = '';
+  // 注意：不要在这里 series.setMarkers([]) —— 那会连 seq 序号标记一起抹掉。
+  // 由 clearOverlays 统一处理 markers。
+  clearExperienceLegend();
 }
 
-function _renderExperienceLegend(entry, statusLabel, isLong, dir) {
+function _renderExperienceLegend(entry, statusLabel, isLong, dir, entryMarked = true) {
   const el = document.getElementById('experience-legend');
   if (!el) return;
   const pnl = typeof entry.pnl_pct === 'number' ? entry.pnl_pct : null;
@@ -671,6 +698,7 @@ function _renderExperienceLegend(entry, statusLabel, isLong, dir) {
     ${bars ? `<div class="exp-lg-row">判定窗口 ${escapeHtml(bars)} ${pnlText}</div>` : ''}
     ${entry.status === 'pending' ? '<div class="exp-lg-row dim">K 线尚未走完，继续等待结算</div>' : ''}
     ${entry.status === 'unresolved' ? '<div class="exp-lg-row dim">窗口内未触及任一价位</div>' : ''}
+    ${entryMarked ? '' : '<div class="exp-lg-row dim">入场点不在当前 K 线范围内，未标注</div>'}
   `;
 }
 

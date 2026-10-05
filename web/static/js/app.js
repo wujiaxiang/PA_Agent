@@ -947,6 +947,11 @@ function bindEvents() {
       const group = groupOf(target);
       if (group) {
         group.forEach(k => document.querySelector(`#tab-${k}`)?.classList.remove('active'));
+      } else {
+        // 单视图面板（如「追问」）没有同组兄弟。正常情况下用户点不到隐藏
+        // 面板里的子 tab，但仍要防御：否则会给侧边栏留下两个 .active
+        // 面板（先前曾出现 tab-tree + tab-raw 同时可见）。
+        $$('.tab-panel.active').forEach(p => p.classList.remove('active'));
       }
       panel.classList.add('active');
       btn.parentElement.querySelectorAll('.subtab').forEach(b => {
@@ -1753,10 +1758,12 @@ function filterSymbolList(query) {
 
 function showSymbolDropdown() {
   const dropdown = $('#symbol-search-dropdown');
-  if (dropdown) {
-    dropdown.removeAttribute('hidden');
-    filterSymbolList($('#ds-symbol-search').value.trim());
-  }
+  if (!dropdown) return;
+  dropdown.removeAttribute('hidden');
+  // 聚焦一律展示**浏览清单**（常用 + 分类），而不是拿框里的值去搜。
+  // 此前聚焦会搜索框内已有的当前品种，只返回寥寥几条 —— 看起来像功能坏了，
+  // 而那份分组清单只能靠点「清空」才够得着。输入才会切到搜索。
+  filterSymbolList('');
 }
 
 function renderSymbolResults(rows) {
@@ -1805,6 +1812,7 @@ function selectSymbol(symbol) {
   if (searchInput) searchInput.value = symbol;
   if (hiddenInput) hiddenInput.value = symbol;
   if (dropdown) dropdown.setAttribute('hidden', '');
+  _expSelectedSymbol = symbol;
 
   const alert = $('#symbol-alert');
   if (alert) alert.setAttribute('hidden', '');
@@ -2026,12 +2034,15 @@ function startSSEBarsStream() {
             low: bar.low,
             close: bar.close,
           });
-          // 同步 lastBars 末尾元素
+          // 同步 lastBars 里的同一根 bar。
+          // /api/bars 返回 **newest-first**（bars[0] = forming bar，见 AGENTS.md
+          // 数据快照契约），而休市检测那行读的正是 lastBars[0]。这里原先取
+          // lastBars[length-1]（最老的一根）去比 ts_open，永远匹配不上 ——
+          // forming bar 的 OHLC 从此在 lastBars 里一直是快照时的旧值。
+          // 改为按 ts_open 定位，不依赖数组方向。
           if (lastBars && lastBars.length) {
-            const lastIdx = lastBars.length - 1;
-            if (lastBars[lastIdx].ts_open === bar.ts_open) {
-              lastBars[lastIdx] = bar;
-            }
+            const hit = lastBars.find(b => b.ts_open === bar.ts_open);
+            if (hit) Object.assign(hit, bar);
           }
         }
         // 解析后端附带的 next_close_ts（当前 forming bar 的收盘时间戳，ms）
@@ -5392,6 +5403,7 @@ async function loadExperienceLibrary(opts) {
   }
 }
 
+let _expSelectedSymbol = '';
 let _expShowAll = false;
 let _expReviewAbort = null;
 

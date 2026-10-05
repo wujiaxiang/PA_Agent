@@ -146,3 +146,31 @@ assert.strictEqual(G.shouldWaitForClose('user', false), false);
     console.log('continuous_gate: all assertions passed');
   });
 }
+
+// ── 休市模式：全部 bar 已收盘 ────────────────────────────────────────────────
+// 原实现硬编码 offset=2（假定末位恒为 forming bar）。休市时全部已收盘，
+// 「刚收盘」就是最后一根 —— 沿用 offset 会返回两根之前的 ts，使
+// bar_close 哨兵错位：重新开盘后可能误判「这根已处理过」而漏触发。
+const g2 = globalThis.PAContinuousGate;
+let gateFailures = 0;
+function checkGate(name, cond) {
+  if (!cond) { console.error('  FAIL: ' + name); gateFailures++; }
+}
+const B = (ts, closed) => ({ ts_open: ts, closed: closed });
+
+checkGate('正常模式取倒数第二根',
+  g2.closedBarTs([B(3000, false), B(2000, true), B(1000, true)]) === 2000);
+checkGate('休市模式取最后一根',
+  g2.closedBarTs([B(3000, true), B(2000, true), B(1000, true)]) === 3000);
+checkGate('休市单根', g2.closedBarTs([B(1000, true)]) === 1000);
+checkGate('乱序输入',
+  g2.closedBarTs([B(1000, true), B(3000, true), B(2000, true)]) === 3000);
+checkGate('无 closed 标志退回启发式',
+  g2.closedBarTs([{ ts_open: 3000 }, { ts_open: 2000 }, { ts_open: 1000 }]) === 2000);
+checkGate('空输入返回 0', g2.closedBarTs([]) === 0 && g2.closedBarTs(null) === 0);
+
+if (gateFailures) {
+  console.error(gateFailures + ' closedBarTs assertion(s) failed');
+  process.exit(1);
+}
+console.log('closedBarTs: all assertions passed');
