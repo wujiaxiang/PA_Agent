@@ -138,7 +138,9 @@ def test_put_settings_accepts_a_genuinely_new_key(tmp_path):
         r = client.put("/api/settings", json={"provider": {"api_key": new_key}})
         assert r.status_code == 200
         assert r.json()["api_key_masked_ignored"] is False
-        assert load_settings(p).provider.api_key == new_key
+        # PUT 不再回写 settings.json（那是出厂配置，不是当前状态）。
+        # 要验的是新 key 真的生效了 —— 断言落点改为 ctx.settings。
+        assert client.app.state.ctx.settings.provider.api_key == new_key
     finally:
         routes_settings.SETTINGS_JSON_PATH = original
 
@@ -265,9 +267,9 @@ def test_user_can_still_set_and_clear_secrets(tmp_path):
     try:
         client = TestClient(app)
         client.put("/api/settings", json={"tushare": {"token": "new-short-tok"}})
-        assert load_settings(p).tushare.token == "new-short-tok"
+        assert client.app.state.ctx.settings.tushare.token == "new-short-tok"
 
         client.put("/api/settings", json={"tushare": {"token": ""}})
-        assert load_settings(p).tushare.token == ""
+        assert client.app.state.ctx.settings.tushare.token == ""
     finally:
         routes_settings.SETTINGS_JSON_PATH = original
