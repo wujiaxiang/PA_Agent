@@ -305,10 +305,58 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **`direction` 比较前必须归一**：阶段一输出 `bullish/bearish/neutral`，
   阶段二 `order_direction` 输出 `做多/做空`。直接比字符串则永远不等，
   +2 分恒为 0，检索退化成「只看形态交集」且毫无报错
-- **复盘（`experience_reviews` 独立表）**：可重跑并留历史；只有**正常返回**
-  才落库（失败/空内容一律不写，否则半截复盘会占掉「最新一版」并被当结论
-  用）；复盘**不改**条目本身的状态与时序；落盘由**后端**在 SSE `done` 之前做，
-  依赖前端回报等于「用户关页面即丢失」
+### 复盘是混合的：程序层（必做）+ LLM 层（可选）
+
+- **程序层**：`review_program.build_program_review()`，结算时由
+  `settle_record` 自动生成，`source='program'`。纯算术、零成本、不依赖模型，
+  **同输入必同输出因而可以写断言**。verdict 取自**闭词表**
+  （尚未判定 / 被结果证实 / 判断成立但运气不佳 / 与走势相悖 / 窗口内未触及）
+- **`loss` 判「运气不佳」的门槛是 `MFE ≥ 0.5 × 风险距离`**（`LUCKY_MFE_RATIO`），
+  不是 `MFE > 0`。写成 `> 0` 时，一进场就逆向、最大浮盈 0.01% 而回撤 11%
+  的单子也会被判「判断成立」—— MAE 都算出来了却不参与判定，而这类单子
+  恰恰最不该让检索端以为「这个形态其实是对的」
+- **计划价位自洽性**（`plan_is_sane`）：写入侧只校验 `tp != entry`，
+  不校验 entry 是否夹在 SL/TP 之间。「做多但 TP=80 < entry=100 < SL=110」
+  会在第一根正常 bar 就触发 win —— 复盘层若不拦，就会给结构非法的计划盖上
+  闭词表里最强的那句肯定。自洽性失败时结论强制降级为「尚未判定」
+- **MFE/MAE 只统计到出场那根为止**（`resolve_exit`）：拿入场后全部 K 线算，
+  会把出场后的行情算到这笔单头上 —— 「止盈后回落」显示成曾浮盈 30%，
+  运气成分完全失真。`evaluate_outcome` 已改为 `resolve_exit` 的薄封装，两者
+  不得各写一套
+- **LLM 层**：`review_spec.parse_review()` 按五小节规格解析，`source='llm'`，
+  用户主动触发、可重跑留历史。**解析失败必须显式失败**（记 warning +
+  verdict 留空），不得静默降级
+- **不合规格的 LLM 版不可取用**：`latest_llm_review` 只取 `verdict <> ''`。
+  一份解析失败的复盘若被取用，它的空 verdict 加上空判据，等于把该有的
+  确定性事实整个顶掉
+- **注入提示词的只有结构化字段，且逐字段封顶**（verdict 40 / criteria 300 字符）。
+  **不注入 `content` 全文** —— 那是给人读的 Markdown，可能含「忽略上述指令」，
+  直接进决策提示词就是自己开的注入面
+- **事实与推测必须分开取**：`program_review()`（确定性：MFE/MAE/触及时机）
+  与 `latest_llm_review()`（推测：判据）两个入口，渲染时**合并**，不让任一层
+  覆盖另一层。曾用单条「取最新且 LLM 优先」，结果是确定性层算出的 MFE=0
+  （判「判断与走势相悖」）会被模型写的「判断对了但运气不好」整体顶掉 ——
+  **事实被推测覆盖，是两层设计最不该发生的方向**
+- **`ExperienceEntry.filename` 存的就是 entry_id**（字段名沿用文件布局时代，
+  内容早换成主键）。渲染期查复盘依赖它，漏掉只表现为「复盘不进提示词」
+- **复盘归属必须与条目一致**：存量行的 `content` 里**没有** `user_id` 键 →
+  取值为空 → 回落默认用户，而紧挨着的 `finalize()` 会先不过滤读记录取回 owner。
+  两次调用给出不同答案 = 复盘挂到 admin 名下、carol 看不到自己的
+- **词表只有一份**（`review_program.VERDICTS`）。`review_spec` 的兜底值必须
+  取自它 —— 兜底路径正是词表校验最薄的地方，曾硬编码出一个词表外的值
+- **重建表必须先 `PRAGMA foreign_keys=OFF`**：`connect()` 开着 FK，而重建要
+  `DROP TABLE`，SQLite 视为删全部行 → `ON DELETE CASCADE` **静默清空子表**，
+  `migrate()` 还返回 True（实测重建 `experience_entries` 会删光
+  `experience_reviews`）。且该 PRAGMA **在事务内是 no-op**，关闭与恢复
+  都必须先 `commit()` —— 恢复那句静默无效会让全局一直停在 OFF
+- **曾经复盘从未进过提示词**：`_persist_review` 没传 `verdict`/`criteria`，
+  渲染层 `if crit or verdict` 恒为假，全链无报错。根因是测试直接调
+  `attach_review(..., verdict=...)` 走了只有测试会走的分支 ——
+  **集成测试必须走生产路径**（`settle_record` / `_persist_review`）
+- **`CREATE TABLE IF NOT EXISTS` 对已存在的表完全无效**，加列必须写进
+  `schema.MIGRATIONS` 的 ALTER。漏了的后果特别隐蔽：INSERT 报
+  "no column named source"，而 `db.execute` 把它当 transient 吞掉 ——
+  结算照常成功、复盘一条都没写进库，只留一行 warning
 - **`experience_max_chars_per_entry` 上限 `le=4000` 装不下真实 payload**
   （实测 7032 字符，`analysis_context` 从第 471 字符才开始）。**调参不是捷径**：
   `_render_experience` 必须字段感知地挑字段，并把复盘结论**单独追加**

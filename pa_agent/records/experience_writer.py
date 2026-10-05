@@ -360,6 +360,7 @@ class ExperienceWriter:
         model: str = "",
         verdict: str = "",
         reusable_criteria: str = "",
+        source: str = "llm",
         user_id: str = "",
     ) -> bool:
         """把一次 LLM 复盘挂到条目上（P3）。
@@ -371,7 +372,8 @@ class ExperienceWriter:
 
             return _attach(
                 payload, entry_id=entry_id, user_id=self._owner(user_id),
-                model=model, verdict=verdict, reusable_criteria=reusable_criteria,
+                model=model, source=source, verdict=verdict,
+                reusable_criteria=reusable_criteria,
             )
         except Exception as exc:  # noqa: BLE001
             self._log.warning("experience review attach failed for %s: %s", entry_id, exc)
@@ -403,6 +405,84 @@ class ExperienceWriter:
 
 
 
+def resolve_exit(
+    bars: list[dict[str, Any]],
+    *,
+    entry_price: float,
+    take_profit_price: float,
+    stop_loss_price: float,
+    is_long: bool = True,
+) -> dict[str, Any] | None:
+    """Resolve a plan against subsequent bars, **plus what happened on the way**.
+
+    返回首个触及 TP/SL 那根 bar 及其之前的全部信息：
+
+    ``{result, pnl_pct, exit_index, bars_to_exit, mfe_pct, mae_pct, touched}``
+
+    ``touched`` 为 False 表示窗口内两个价位都没碰到（未决终态），此时
+    ``exit_index`` 为 None，MFE/MAE 覆盖**全部** ``bars``。
+
+    **MFE/MAE 只统计到出场那根为止（含）**：拿入场后全部 K 线算最大浮盈，
+    会把出场之后的行情算进这笔交易头上，于是「TP 后又回落」的 loss 会被
+    误判成「先大赚过」，运气成分完全失真。
+
+    同一根 bar 同时触及 TP 与 SL 时**按止损计** —— OHLC 无法还原 intrabar
+    路径，按乐观计会把经验库偏向虚高胜率。
+    """
+    if not bars or entry_price <= 0:
+        return None
+    ordered = sorted(bars, key=lambda b: b.get("ts_open", 0))
+
+    def _excursion(window: list[dict[str, Any]]) -> tuple[float, float]:
+        """(最大浮盈%, 最大回撤%)，均以 entry 为基准，回撤为非负数。"""
+        hi = lo = None
+        for b in window:
+            h, l = b.get("high"), b.get("low")
+            if h is not None:
+                hi = h if hi is None else max(hi, h)
+            if l is not None:
+                lo = l if lo is None else min(lo, l)
+        if hi is None or lo is None:
+            return 0.0, 0.0
+        mfe = (hi - entry_price) / entry_price * 100.0 if is_long else (entry_price - lo) / entry_price * 100.0
+        mae = (entry_price - lo) / entry_price * 100.0 if is_long else (hi - entry_price) / entry_price * 100.0
+        return max(0.0, mfe), max(0.0, mae)
+
+    for i, bar in enumerate(ordered):
+        high, low = bar.get("high"), bar.get("low")
+        if high is None or low is None:
+            continue
+        hit_tp = high >= take_profit_price if is_long else low <= take_profit_price
+        hit_sl = low <= stop_loss_price if is_long else high >= stop_loss_price
+        if not (hit_tp or hit_sl):
+            continue
+        if hit_sl:
+            result, pnl = "loss", -abs(stop_loss_price - entry_price) / entry_price * 100.0
+        else:
+            result, pnl = "win", abs(take_profit_price - entry_price) / entry_price * 100.0
+        mfe, mae = _excursion(ordered[: i + 1])
+        return {
+            "result": result,
+            "pnl_pct": pnl,
+            "exit_index": i,
+            "bars_to_exit": i + 1,
+            "mfe_pct": mfe,
+            "mae_pct": mae,
+            "touched": True,
+        }
+
+    mfe, mae = _excursion(ordered)
+    return {
+        "result": None,
+        "pnl_pct": None,
+        "exit_index": None,
+        "bars_to_exit": len(ordered),
+        "mfe_pct": mfe,
+        "mae_pct": mae,
+        "touched": False,
+    }
+
+
 def evaluate_outcome(
     bars: list[dict[str, Any]],
     *,
@@ -413,34 +493,20 @@ def evaluate_outcome(
 ) -> tuple[str, float] | None:
     """Resolve a plan against subsequent bars.
 
-    Scans *bars* (oldest-first or newest-first, both accepted) and returns
-    ``(result, pnl_pct)`` for the first bar that touches TP or SL, or ``None``
-    while neither has been reached.
-
-    Within a single bar that spans both levels the **stop is assumed to hit
-    first** — we cannot know the intrabar path from OHLC alone, and assuming the
-    optimistic order would bias the library toward over-optimistic wins.
+    Returns ``(result, pnl_pct)`` for the first bar that touches TP or SL, or
+    ``None`` while neither has been reached. Thin wrapper over :func:`resolve_exit`
+    so the excursion maths can never drift from the exit rule.
     """
-    if not bars or entry_price <= 0:
+    info = resolve_exit(
+        bars, entry_price=entry_price, take_profit_price=take_profit_price,
+        stop_loss_price=stop_loss_price, is_long=is_long,
+    )
+    if info is None or not info["touched"]:
         return None
-    ordered = sorted(bars, key=lambda b: b.get("ts_open", 0))
-    for bar in ordered:
-        high = bar.get("high")
-        low = bar.get("low")
-        if high is None or low is None:
-            continue
-        hit_tp = high >= take_profit_price if is_long else low <= take_profit_price
-        hit_sl = low <= stop_loss_price if is_long else high >= stop_loss_price
-        if hit_tp and hit_sl:
-            return ("loss", -abs(stop_loss_price - entry_price) / entry_price * 100.0)
-        if hit_sl:
-            return ("loss", -abs(stop_loss_price - entry_price) / entry_price * 100.0)
-        if hit_tp:
-            return ("win", abs(take_profit_price - entry_price) / entry_price * 100.0)
-    return None
+    return info["result"], info["pnl_pct"]
 
 
-__all__ = ["ExperienceWriter", "evaluate_outcome", "_KNOWN_CYCLES"]
+__all__ = ["ExperienceWriter", "evaluate_outcome", "resolve_exit", "_KNOWN_CYCLES"]
 
 def save_pending_if_resolvable(
     *,

@@ -1966,6 +1966,7 @@ class PromptAssembler:
         entries: list[Any],
         *,
         max_chars_per_entry: int = 400,
+        user_id: str = "",
     ) -> str:
         """Render experience library entries as a text block."""
         lines = [
@@ -1982,27 +1983,95 @@ class PromptAssembler:
             blob = json.dumps(head, ensure_ascii=False, indent=2)
             # 复盘结论单独追加：它不在 content 里，而是挂在 experience_reviews。
             # 不单独抽出来就永远挤不进提示词 —— 复盘写得再好也只是躺在库里。
-            review = cls._latest_review(entry)
-            extra = ""
-            if review:
-                crit = str(review.get("reusable_criteria") or "").strip()
-                verdict = str(review.get("verdict") or "").strip()
-                if crit or verdict:
-                    extra = (
-                        "\n该案例的复盘要点（供参考，不得凌驾于本次独立判断）："
-                        + (f"\n- 结论: {verdict}" if verdict else "")
-                        + (f"\n- 下次同类 setup 的判据: {crit}" if crit else "")
-                    )
+            extra = cls._render_review(
+                cls._program_review(entry, user_id),
+                cls._llm_review(entry, user_id),
+            )
             if len(blob) > max_chars_per_entry:
                 blob = blob[: max_chars_per_entry - 3] + "..."
             lines.append(f"\n### 案例 {i}\n```json\n{blob}\n```{extra}")
         return "\n".join(lines)
+
+    #: 注入提示词的复盘文本**硬上限**。LLM 复盘是自由文本，没有上限就能把
+    #: Stage 2 提示词撑爆 —— 这段曾整个在 ``max_chars_per_entry`` 预算之外直插。
+    _REVIEW_MAX_CHARS = 300
+
+    @classmethod
+    def _render_review(
+        cls, program: dict | None, llm: dict | None = None
+    ) -> str:
+        """把复盘渲染成注入块。
+
+        **事实与推测分开取**：``program`` 提供结论与机械观察（确定性），
+        ``llm`` 只额外提供它那条判据。LLM 版**不能覆盖**程序层的结论 ——
+        MFE/MAE/触及时机是算术事实，模型对它们的解读只是推测。
+
+        三重约束：① 结论必须在闭词表内（否则丢弃）；② 判据经
+        :func:`sanitize_for_prompt` 逐行剔除疑似指令句；③ 两个字段都封顶。
+        不注入 ``content`` 全文 —— 那是给人读的 Markdown。
+        """
+        from pa_agent.records.review_program import VERDICTS
+        from pa_agent.records.review_spec import sanitize_for_prompt
+
+        facts = program or {}
+        extra = llm or {}
+        verdict = str(facts.get("verdict") or extra.get("verdict") or "").strip()
+        if verdict not in VERDICTS:
+            # 闭词表是这层的最后一道闸：词表外的取值一律不进提示词。
+            verdict = ""
+        crit = sanitize_for_prompt(
+            str(extra.get("reusable_criteria") or ""), max_chars=cls._REVIEW_MAX_CHARS
+        ) or sanitize_for_prompt(
+            str(facts.get("reusable_criteria") or ""), max_chars=cls._REVIEW_MAX_CHARS
+        )
+        if not verdict and not crit:
+            return ""
+
+        def _cap(t: str, n: int) -> str:
+            t = " ".join(t.split())
+            return t if len(t) <= n else t[: n - 1] + "…"
+
+        verdict = _cap(verdict, 40)
+        crit = _cap(crit, cls._REVIEW_MAX_CHARS)
+        tag = "程序化统计" if facts else "模型复盘"
+        crit_tag = "模型复盘" if extra and crit and extra.get("reusable_criteria") else tag
+        return (
+            "\n该案例的复盘要点（结算事实，供参考，不得凌驾于本次独立判断）："
+            f"\n- 结论[{tag}]: {verdict}"
+            + (f"\n- 同类 setup 的后续判据[{crit_tag}]: {crit}" if crit else "")
+        )
 
     @staticmethod
     def _entry_content(entry: Any) -> dict:
         if isinstance(entry, dict):
             return entry
         return getattr(entry, "content", None) or {}
+
+    @staticmethod
+    def _program_review(entry: Any, user_id: str) -> dict | None:
+        from pa_agent.storage.experience_repo import program_review
+
+        return program_review(PromptAssembler._entry_id(entry), user_id=user_id or "admin")
+
+    @staticmethod
+    def _llm_review(entry: Any, user_id: str) -> dict | None:
+        from pa_agent.storage.experience_repo import latest_llm_review
+
+        return latest_llm_review(PromptAssembler._entry_id(entry), user_id=user_id or "admin")
+
+    @staticmethod
+    def _entry_id(entry: Any) -> str:
+        """取出条目的 entry_id。
+
+        ``ExperienceEntry.filename`` 存的就是 entry_id —— 字段名沿用文件布局
+        时代的叫法，内容早已换成主键。漏掉它会导致渲染期查不到复盘，
+        而症状只是「复盘不进提示词」，极难归因。
+        """
+        for key in ("entry_id", "filename", "id"):
+            v = entry.get(key) if isinstance(entry, dict) else getattr(entry, key, None)
+            if v:
+                return str(v)
+        return ""
 
     @staticmethod
     def _latest_review(entry: Any) -> dict | None:

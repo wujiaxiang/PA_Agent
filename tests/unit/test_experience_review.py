@@ -51,8 +51,10 @@ def entry_id(writer):
     )
 
 
+#: 词表已统一到 ``review_program.VERDICTS``（程序层那份）—— 两处各写一套时，
+#: 同一个提示词字段会出现两种措辞，而 LLM 那套从未被闭词表校验过。
 _REVIEW = {
-    "verdict": "判断对了但运气不好",
+    "verdict": "判断成立但运气不佳",
     "reusable_criteria": "顺大周期方向，等回踩不追高",
 }
 
@@ -163,10 +165,26 @@ def test_entry_with_review_of_other_user_is_not_exposed(writer):
 def test_review_reaches_the_prompt(entry_id):
     """**回归守卫**：落库却不渲染 = 复盘白做。
 
-    渲染曾经是「整条 content_json 盲截 400 字符」，而复盘根本不在 content 里；
-    且 ``analysis_context`` 从第 471 字符才开始，默认 cap 下完全不可见。
+    原版本直接调 ``attach_review(..., verdict=...)`` —— 那条分支只有测试会走，
+    而生产路径压根不传这两个参数，于是复盘**从未进过任何提示词**而测试全绿。
+    现在一律走生产路径 ``_persist_review``。
     """
-    attach_review({**_REVIEW, "content": "复盘正文"}, entry_id=entry_id, **_REVIEW)
+    from web.api import routes_experience_review as rv
+
+    class _R:
+        content = (
+            "## 结论\n判断成立但运气不佳\n\n## 归因\n- 对的部分: 形态正确\n"
+            "- 错的部分: 止损太紧\n\n## 当时能否预见\n- 动能衰减\n\n"
+            "## 改进建议\n- 止损放到结构位\n\n## 下次同类 setup 的判据\n顺大周期方向，等回踩不追高"
+        )
+        reasoning_content = "r"
+
+    class _C:
+        class _P:
+            model = "m"
+        settings = type("S", (), {"provider": _P()})()
+
+    rv._persist_review(entry_id, "admin", _R(), _C())
 
     from pa_agent.ai.prompt_assembler import PromptAssembler
 
@@ -174,8 +192,8 @@ def test_review_reaches_the_prompt(entry_id):
                                               patterns=["均线多头排列"])
     out = PromptAssembler._render_experience(hits, max_chars_per_entry=400)
 
-    assert _REVIEW["reusable_criteria"] in out, "复盘判据必须出现在提示词里"
-    assert _REVIEW["verdict"] in out
+    assert "顺大周期方向" in out, "复盘判据必须出现在提示词里"
+    assert "判断成立但运气不佳" in out
     assert len(out) < 900, "复盘不得把提示词撑爆"
 
 
@@ -212,7 +230,11 @@ def test_successful_review_is_persisted_by_the_route(entry_id):
     from web.api import routes_experience_review as mod
 
     class _Reply:
-        content = "这是一次正常的复盘正文"
+        content = (
+            "## 结论\n判断成立但运气不佳\n\n## 归因\n- 对的部分: a\n- 错的部分: b\n\n"
+            "## 当时能否预见\n- c\n\n## 改进建议\n- d\n\n"
+            "## 下次同类 setup 的判据\n顺大周期方向"
+        )
         reasoning_content = "推理过程"
 
     class _Ctx:
@@ -220,8 +242,12 @@ def test_successful_review_is_persisted_by_the_route(entry_id):
 
     mod._persist_review(entry_id, "admin", _Reply(), _Ctx())
 
-    got = latest_review(entry_id)
-    assert got is not None, "正常复盘必须落库"
-    assert got["payload"]["content"] == "这是一次正常的复盘正文"
+    # 取用走 latest_llm_review：解析失败（verdict 为空）的版本刻意**不可取用**，
+    # 它会把该有的确定性事实整个顶掉。
+    from pa_agent.storage.experience_repo import latest_llm_review
+
+    got = latest_llm_review(entry_id, user_id="admin")
+    assert got is not None, "正常复盘必须落库且可取用"
+    assert "顺大周期方向" in got["payload"]["content"]
     assert got["payload"]["reasoning"] == "推理过程"
     assert got["model"] == "m-x", "必须记下当时用的模型，否则复盘不可追溯"

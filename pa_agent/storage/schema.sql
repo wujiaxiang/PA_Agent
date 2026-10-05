@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS experience_reviews (
         entry_id     TEXT NOT NULL,
         user_id      TEXT NOT NULL,
         model        TEXT NOT NULL DEFAULT '',
+        source       TEXT NOT NULL DEFAULT 'llm',   -- 'program' | 'llm'
         verdict      TEXT NOT NULL DEFAULT '',
         reusable_criteria TEXT NOT NULL DEFAULT '',
         payload_json TEXT NOT NULL,
@@ -151,6 +152,7 @@ CREATE INDEX IF NOT EXISTS ix_sessions_expiry ON sessions (expires_at);
 -- [experience_entries] drop_default_user_id;
 -- [trade_records] drop_default_user_id;
 -- [experience_reviews] drop_default_user_id;
+-- [experience_reviews] ALTER TABLE experience_reviews ADD COLUMN source TEXT NOT NULL DEFAULT 'llm';
 
 -- schema 版本: 1
 -- 表: users, global_config, user_prefs, analysis_records, experience_entries, experience_reviews, trade_records, chat_turns, sessions

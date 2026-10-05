@@ -22,6 +22,91 @@
 
 ## 🔴 进行中（有人正在改这些文件，不要动）
 
+### 2026-10-06 · 鉴权后端（登录/登出/身份/改密 + 强制鉴权开关翻 False）
+
+**状态**：已完工（后端侧）
+
+> 与下方「2026-10-05 · 登录界面 + 强制鉴权」是**同一件事的两半**：那条负责
+> `web/static/*` 与初始口令播种，本条负责 `web/api/*` 的鉴权本体。两边的文件
+> 已被 `2e9418e` 一并提交（共享暂存区把两条会话的改动合进了一个 commit，
+> 第二次踩同一个坑）。本条只补记**后端侧**那些不在那条里的决策与坑。
+
+#### 改动文件（本会话独占写集）
+`web/api/routes_auth.py`（新）、`web/api/auth_ctx.py`、`web/server.py`、
+`pa_agent/storage/users.py`、`tests/unit/test_auth_routes.py`（新 45 项）、
+`README.md`（登录与播种说明）、`CHANGELOG.md`
+
+#### 端点形状与理由
+| 端点 | 鉴权 | 形状 |
+|---|---|---|
+| `POST /api/auth/login` | **免** | `{token, token_type, expires_at, expires_in, user}` |
+| `POST /api/auth/logout` | 需 | `{ok, revoked}` |
+| `GET /api/auth/me` | 需 | `{authenticated, user_id, display_name, role, is_admin, token_expires_at, auth_required}` |
+| `POST /api/auth/password` | 需 | `{ok}` |
+
+- **不做注册**：一旦开放就同时引入「谁能建号 / 口令强度策略 / 建号频率限制」
+  三个产品决策，不该由一个路由文件替用户默认
+- **`/me` 未认证时返 401 而不是 `200 + authenticated:false`**：回落上下文的
+  `user_id` 恒为 `admin`，把它回给未登录者等于白送一个用户名 —— 而我们费劲在
+  登录失败上抹平的正是这类泄露。顺带让前端只需一条规则「401 就回登录页」
+- **`/me` 返顶层 `user_id` 而 `login` 返嵌套 `user`**：两个形状不一致是既成事实
+  （前端 `app.js` 两种都兼容），本轮未强行统一，避免与前端会话抢改
+
+#### 放行清单（逐条带理由，别乱加）
+1. **非 `/api` 路径**（`/`、`/js/*`、`/docs`）—— 登录页**本身**；结构性保证，
+   不依赖白名单登记
+2. **OPTIONS 预检** —— 预检按规范**不带** `Authorization`，放行不可能泄露；
+   真正的请求仍会被拦
+3. `POST /api/auth/login` —— 不放行就是**死锁**
+4. `GET /api/health` —— liveness 探针不带令牌，401 会让编排系统判定容器不健康
+   并反复重启（一次鉴权配置问题被升级成宕机）。**放行但降级**：匿名时不再返回
+   `storage.default_user` / `storage.users`
+5. `GET /api/health/check` **不放行** —— 它真去 ping 模型 API 与数据源，
+   能看出上游地址与延迟，是诊断接口不是探针
+
+#### 中间件顺序（Starlette 反向包裹 ⇒ 最后注册的最外层）
+`CORS` → **`enforce_auth`** → `session_lifecycle` → `bind_user_settings` →
+`trace_id` → `no_cache`
+
+- 鉴权必须在最外层：未认证流量要在 `session_lifecycle` 的 SQLite 写与
+  `bind_user_settings` 的读**之前**被挡，否则「前端忘带令牌」= 每请求一次库读
+- CORS 必须在鉴权**再外一层**：否则「令牌过期」这个最需要前端处理的响应没有
+  `Access-Control-Allow-Origin`，浏览器报成 CORS 错误，前端只看到无 body 的
+  网络失败
+- 代价：401 上**没有** `X-Trace-Id`（`trace_id_middleware` 在它里面）
+
+#### 顺手修掉的两个真问题（`pa_agent/storage/users.py`）
+1. **`authenticate("", <admin 口令>)` 会登录成功并返回 `admin`** ——
+   `get_user("")` 因 `user_id or ADMIN_USER_ID` 返回 admin 行
+2. **「抹平时序差异」是空承诺** —— 未知用户走 `verify_password(pw, "")`，
+   在 `.split("$", 3)` 处就 ValueError 返回 False，**一次 PBKDF2 都不跑**。
+   改为对格式完好的诱饵散列跑完整 PBKDF2（进程内懒生成一次）
+
+#### ⚠️ 已知边界（刻意不做，别当成已解决）
+- **吊销表在进程内，进程重启即失效** —— 登出只在本进程生命周期内真正生效
+- **改密无法吊销同一用户的其它令牌**（名单按令牌记，不按用户记）
+- **登录无失败次数限制**。PBKDF2 240k 轮是天然减速带，但 uvicorn 的端点跑在线程池里，
+  并发猜测不受阻
+- 以上三条都要持久化存储才能解决，本轮刻意不引入
+
+#### 测试与反向验证
+`tests/unit/test_auth_routes.py` 45 项全绿。**12 项反向验证**逐条回退改动
+确认变红（开关翻回 True / 白名单删两条 / 不装 CORS / allow_headers 漏
+Authorization / health 不降级 / 路由层拆枚举 / 登出不吊销 / 空用户名回落 admin /
+时序抹平退回空串 / 中间件与路由不挂 / health 硬放行绕过白名单）。
+`tests/unit` 全量：基线 26 failed → 本轮 25 failed，**新增失败 0**。
+`records/pa_agent.db` 前后 `stat` 一致（`1791223591:30482432`），未污染生产库。
+
+#### 冲突风险
+- 本会话**未执行任何 `git add` / `git commit`**。文件是被另一会话的
+  `2e9418e` / `98b3e06` 连带提交的（共享暂存区事故，AGENTS.md 已记）
+- 未触碰 `web/static/*`（另一会话所有）、`routes_analyze.py`、`routes_data.py`、
+  `routes_chat.py`、`session_ctx.py`、`storage_gc.py`、`storage/sessions.py`、
+  `storage/ephemeral.py`
+- 工作区里 `pa_agent/storage/{db,schema,schema.sql}.py`、`pa_agent/records/`、
+  `docs/EXPERIENCE_READ_CUTOVER.md` 等未提交改动属**第三条会话**（复盘重构），
+  本会话一律未碰
+
 ### 2026-10-05 · 登录界面 + 强制鉴权
 
 **状态**：已完工

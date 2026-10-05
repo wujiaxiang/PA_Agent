@@ -1,17 +1,21 @@
-"""ExperienceReader — read-only access to the experience library.
+"""ExperienceReader — 经验库的**只读**入口，**只查库**。
 
-Scans ``success_cases/`` and ``failure_cases/`` subdirectories under
-``EXPERIENCE_DIR / cycle_position /``, sorts files by the timestamp
-embedded in their filenames (descending, newest first), and returns
-the top 5 entries across both directories combined.
+2026-10-05 起经验库完全落库，文件布局废弃：读端不再遍历目录，也没有文件
+回落。检索流程是
 
-File naming convention (timestamp portion):
-    YYYY-MM-DD_HH-mm-ss   (minutes use '-', not ':')
+    read_top5(cycle_position)          # 只取 win/loss（RETRIEVABLE_STATUSES）
+      └─► read_for_stage2(cycle, direction, patterns, max_entries)
+            └─► 在 Python 里按 direction / 形态交集打分，取前 N 条
 
-Example filename:
-    2026-05-18_14-30-45_XAUUSD_1h.json
+两次查询都在 ``read_top5`` 内部完成 —— 它是唯一漏斗，在别处改会绕过它，
+并让既有 mock 测试点失效。检索失败（库不可读）时返回空列表并降级，
+绝不抛进分析主流程。
 
-This module is strictly read-only — it never writes or deletes files.
+``direction`` 比较前会归一（``_normalize_direction``）：三个来源各说各话
+——阶段一输出 bullish/bearish、阶段二输出「做多/做空」、历史落盘是 up/down。
+直接比字符串则永远不等，方向加权恒为 0，检索退化成只看形态交集且毫无报错。
+
+``experience_dir`` 是兼容形参，已为空壳，不再有作用。
 """
 from __future__ import annotations
 

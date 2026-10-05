@@ -47,7 +47,7 @@ from pa_agent.records.experience_writer import (
     STATUS_UNRESOLVED,
     STATUS_WIN,
     ExperienceWriter,
-    evaluate_outcome,
+    resolve_exit,
 )
 
 logger = logging.getLogger("pa_agent.web.experience_verifier")
@@ -185,6 +185,7 @@ def settle_record(
     bars: list[dict[str, Any]],
     *,
     verify_bars: int,
+    user_id: str = "",
 ) -> tuple[str, int]:
     """Apply the N-bar rule to one record. Returns ``(status, bars_seen)``.
 
@@ -195,25 +196,63 @@ def settle_record(
     after = _bars_after(int(content.get("entry_ts_open_ms") or 0), bars)
     seen = len(after)
 
-    outcome = evaluate_outcome(
+    info = resolve_exit(
         after,
         entry_price=float(content.get("entry_price") or 0.0),
         take_profit_price=float(content.get("take_profit_price") or 0.0),
         stop_loss_price=float(content.get("stop_loss_price") or 0.0),
         is_long=bool(content.get("is_long", True)),
     )
-    if outcome is not None:
-        result, pnl = outcome
-        status = STATUS_WIN if result == "win" else STATUS_LOSS
-        writer.finalize(entry_id, status=status, pnl_pct=pnl, bars_seen=seen)
+    if info is not None and info["touched"]:
+        status = STATUS_WIN if info["result"] == "win" else STATUS_LOSS
+        writer.finalize(entry_id, status=status, pnl_pct=info["pnl_pct"], bars_seen=seen)
+        _attach_program_review(writer, entry_id, status, content, info, user_id)
         return status, seen
 
     if seen >= max(1, int(verify_bars)):
         writer.finalize(entry_id, status=STATUS_UNRESOLVED, bars_seen=seen)
+        _attach_program_review(writer, entry_id, STATUS_UNRESOLVED, content, info, user_id)
         return STATUS_UNRESOLVED, seen
 
     writer.update_pending_progress(entry_id, bars_seen=seen)
     return STATUS_PENDING, seen
+
+
+def _attach_program_review(writer, entry_id, status, content, info, user_id) -> None:
+    """结算即生成程序化复盘。
+
+    **归属必须与 :meth:`finalize` 完全一致**。``content["user_id"]`` 只有
+    ``save_pending`` 之后的新记录才有；存量行没有这个键 → 空串 → 回落默认用户。
+    于是同一次结算里，紧挨着的两个调用给出**不同的归属答案**：``finalize``
+    会先不过滤地读出记录再取记录自带的 owner（条目归属对了），而复盘侧不读，
+    直接回落 admin —— 复盘挂到 admin 名下，carol 看不到自己的，admin 却读到
+    一条不属于自己的。**修法就是让复盘也走同一条解析路径。**
+
+    **失败绝不影响结算** —— 复盘是附加产物，一个附加产物挂掉不该让 TP/SL
+    的判定结果丢失。
+    """
+    if not user_id:
+        try:
+            from pa_agent.storage.experience_repo import get_entry
+
+            row = get_entry(entry_id, user_id=None)
+            if row is not None:
+                user_id = str(row.get("user_id") or "")
+        except Exception:  # noqa: BLE001
+            logger.warning("cannot resolve owner for program review: %s", entry_id)
+    try:
+        from pa_agent.records.review_program import build_program_review
+
+        built = build_program_review(status=status, content=content, exit_info=info)
+        # verdict / criteria 必须从 built 里取出来单独传 —— 列是取用时的热路径，
+        # 只写进 payload_json 的话渲染层读不到（曾因此复盘静默地从未进提示词）。
+        writer.attach_review(
+            entry_id, built, model="", source="program",
+            verdict=built["verdict"], reusable_criteria=built["reusable_criteria"],
+            user_id=user_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("program review attach failed for %s: %s", entry_id, exc)
 
 
 def verify_pending(
@@ -298,8 +337,11 @@ def verify_pending(
 
         summary["checked"] += 1
         try:
-            status, _seen = settle_record(w, entry_id, content, bars,
-                                          verify_bars=n_bars)
+            status, _seen = settle_record(
+                w, entry_id, content, bars, verify_bars=n_bars,
+                # 归属从记录本身取（content["user_id"]，由 save_pending 写入）
+                user_id=str(content.get("user_id") or ""),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("experience verify: settle failed for %s: %s",
                            entry_id, exc)

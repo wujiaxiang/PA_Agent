@@ -286,41 +286,77 @@ def attach_review(
     model: str = "",
     verdict: str = "",
     reusable_criteria: str = "",
+    source: str = "llm",
 ) -> bool:
     """写一条复盘。
 
     **独立表而非 ``content_json`` 里的一个字段**：复盘会重跑（同一交易可能出
     多版结论），独立表才留得住历史与「当时用的是哪个模型」。``content_json``
     是给检索/渲染读的原始档案，不该被复盘反复改写。
+
+    ``source`` 区分 ``program``（结算时程序算的，始终存在、确定性）与
+    ``llm``（用户主动触发的语义加深，可重跑）。取用时优先 LLM 版 —— 它是在
+    确定性事实之上再加的判断，不是替代。
     """
     return get_hub().execute(
         """
         INSERT INTO experience_reviews
-            (entry_id, user_id, model, verdict, reusable_criteria, payload_json, created_at)
-        VALUES (?,?,?,?,?,?,?)
+            (entry_id, user_id, model, source, verdict, reusable_criteria,
+             payload_json, created_at)
+        VALUES (?,?,?,?,?,?,?,?)
         """,
         (
-            entry_id, user_id, str(model or ""), str(verdict or ""),
-            str(reusable_criteria or ""),
+            entry_id, user_id, str(model or ""), str(source or "llm"),
+            str(verdict or ""), str(reusable_criteria or ""),
             json.dumps(payload, ensure_ascii=False),
             now(),
         ),
     )
 
 
-def latest_review(
+def program_review(
     entry_id: str, *, user_id: str = DEFAULT_USER_ID
 ) -> dict | None:
-    """该条目最新一版复盘（载荷已解析）。没有则 ``None``。"""
+    """该条目的**程序化**复盘（结算时算出的确定性事实）。
+
+    与 :func:`latest_llm_review` 分开取，而不是二选一：MFE / MAE / 触及时机
+    是不可辩驳的算术结果，LLM 的结论是**推测**。曾用单条「取最新」且 LLM 优先，
+    结果确定性层算出的事实会被猜测层整体覆盖 —— 一个全程未浮盈的单子（MFE=0，
+    程序层判「判断与走势相悖」）会因模型写了「判断对了但运气不好」而被采信。
+    """
     row = _run(
         """
-        SELECT payload_json, model, verdict, reusable_criteria, created_at
+        SELECT payload_json, model, source, verdict, reusable_criteria, created_at
         FROM experience_reviews
-        WHERE entry_id = ? AND user_id = ?
+        WHERE entry_id = ? AND user_id = ? AND source = 'program'
         ORDER BY created_at DESC, review_id DESC LIMIT 1
         """,
         (entry_id, user_id),
     )
+    return _review_payload(row, entry_id)
+
+
+def latest_llm_review(
+    entry_id: str, *, user_id: str = DEFAULT_USER_ID
+) -> dict | None:
+    """该条目**最新一版可用**的 LLM 复盘。
+
+    只看**解析成功**的（``verdict <> ''``）：一份不合规格的复盘若被取用，
+    它的空 verdict 加上空判据，等于把该有的程序化事实整个顶掉。
+    """
+    row = _run(
+        """
+        SELECT payload_json, model, source, verdict, reusable_criteria, created_at
+        FROM experience_reviews
+        WHERE entry_id = ? AND user_id = ? AND source = 'llm' AND verdict <> ''
+        ORDER BY created_at DESC, review_id DESC LIMIT 1
+        """,
+        (entry_id, user_id),
+    )
+    return _review_payload(row, entry_id)
+
+
+def _review_payload(row: Any, entry_id: str) -> dict | None:
     if not row:
         return None
     try:
@@ -328,13 +364,28 @@ def latest_review(
     except (json.JSONDecodeError, KeyError, TypeError):
         logger.warning("experience review %s has corrupt payload", entry_id)
         return None
+    keys = row[0].keys()
     return {
         "model": row[0]["model"],
+        "source": row[0]["source"] if "source" in keys else "llm",
         "verdict": row[0]["verdict"],
         "reusable_criteria": row[0]["reusable_criteria"],
         "created_at": row[0]["created_at"],
         "payload": payload if isinstance(payload, dict) else {},
     }
+
+
+def latest_review(
+    entry_id: str, *, user_id: str = DEFAULT_USER_ID
+) -> dict | None:
+    """兼容入口：程序化优先（确定性事实），LLM 版作为兜底。
+
+    新代码请分别调 :func:`program_review` 与 :func:`latest_llm_review` ——
+    本函数返回**单份**记录，不表达「事实 + 推测」的合并语义。
+    """
+    return program_review(entry_id, user_id=user_id) or latest_llm_review(
+        entry_id, user_id=user_id
+    )
 
 
 def delete_reviews(entry_id: str, *, user_id: str = DEFAULT_USER_ID) -> bool:

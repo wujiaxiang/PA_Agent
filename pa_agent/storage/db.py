@@ -88,7 +88,12 @@ class _ConnectionHub:
         self._initialized = False
         # 最近一次**本线程**读失败的原因；空串=读正常。存 threading.local
         # 而非实例属性，理由见 :attr:`read_failed`。
-        self._all_conns: list[sqlite3.Connection] = []
+        # thread ident → (Thread, Connection)。**必须能回收**：
+        # 本系统每次分析起一个 followup 线程取一次数据源，每次就会新建一条
+        # SQLite 连接，而线程结束不会自动关它。原先只 append 不回收，
+        # 分析 200 次 ≈ 200 条永不关闭的连接 —— 经验库的写入路径每次分析
+        # 都在这条链上。
+        self._conns: dict[int, tuple[threading.Thread, sqlite3.Connection]] = {}
 
     # ── 连接获取 ──────────────────────────────────────────────────────────────
     def connect(self) -> sqlite3.Connection | None:
@@ -101,6 +106,7 @@ class _ConnectionHub:
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             return conn
+        self._reap_dead_threads()
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(
@@ -126,8 +132,35 @@ class _ConnectionHub:
 
         self._local.conn = conn
         with self._lock:
-            self._all_conns.append(conn)
+            self._conns[threading.get_ident()] = (threading.current_thread(), conn)
         return conn
+
+    def _reap_dead_threads(self) -> None:
+        """关掉**已结束**线程留下的连接。
+
+        判据用 ``threading.enumerate()``（只含存活线程）而不是超时 —— 后者会
+        关掉还在跑长任务的线程的连接，而这里每轮分析可能跑几十秒。
+        只在 ``connect()`` 里调用：新建连接是唯一会让计数增长的时刻，
+        在那里回收即可，不必每个读操作都付出 enumerate 的代价。
+        """
+        with self._lock:
+            if not self._conns:
+                return
+            alive = {t.ident for t in threading.enumerate()}
+            dead = [k for k, v in self._conns.items() if k not in alive]
+            for key in dead:
+                try:
+                    self._conns.pop(key)[1].close()
+                except sqlite3.Error:
+                    pass
+            if dead:
+                logger.debug("reaped %d SQLite connection(s) from finished threads", len(dead))
+
+    @property
+    def connection_count(self) -> int:
+        """当前存活连接数（health 面板用）。读取时顺带回收已结束线程的。"""
+        self._reap_dead_threads()
+        return len(self._conns)
 
     def _disable(self, reason: str) -> None:
         """Latch the DB off for this process. 不可逆 —— 需重启才恢复。"""
@@ -210,18 +243,41 @@ class _ConnectionHub:
         if ddl is None:
             return False
         tmp = f"{table}__new"
-        conn.execute(f"DROP TABLE IF EXISTS {tmp}")
+        # **必须先关外键**。``connect()`` 开了 ``PRAGMA foreign_keys=ON``，
+        # 而重建要 ``DROP TABLE {table}`` —— SQLite 把 DROP TABLE 当作删除
+        # 全部行，于是 ``ON DELETE CASCADE`` 会把引用该表的子表**整个清空**。
+        # 实测：重建 experience_entries 会静默删光 experience_reviews 全部行，
+        # 而 migrate() 照样返回 True —— 数据没了，没有任何报错。
+        fk_was_on = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+        if fk_was_on:
+            # PRAGMA foreign_keys 在事务内是 no-op，必须在事务外设置。migrate()
+            # 用 ``with conn:`` 包着，这里借 SQLite 的自动提交边界显式重来一次。
+            conn.commit()
+            conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {tmp}")
         # DDL 里的表名是硬编码字面量，必须换成临时表名 —— 否则建出来的还是原表，
         # 紧接着 DROP TABLE {table} 会把刚建的那张一起删掉（实测报
         # "no such table: sessions__new"）。用前缀精确匹配，避免误伤
         # 列名/索引名里恰好含同名字符串的地方。
-        conn.execute(ddl.replace(table, tmp, 1))
-        col_list = ", ".join(cols)
-        conn.execute(f"INSERT INTO {tmp} ({col_list}) SELECT {col_list} FROM {table}")
-        conn.execute(f"DROP TABLE {table}")
-        conn.execute(f"ALTER TABLE {tmp} RENAME TO {table}")
-        for stmt in idx:
-            conn.execute(stmt)
+            conn.execute(ddl.replace(table, tmp, 1))
+            col_list = ", ".join(cols)
+            conn.execute(f"INSERT INTO {tmp} ({col_list}) SELECT {col_list} FROM {table}")
+            conn.execute(f"DROP TABLE {table}")
+            conn.execute(f"ALTER TABLE {tmp} RENAME TO {table}")
+            for stmt in idx:
+                conn.execute(stmt)
+        finally:
+            if fk_was_on:
+                # 与关闭时同理：PRAGMA foreign_keys 在事务内是 no-op，必须先
+                # commit 让它落到事务外，否则这句**静默无效**，全局会一直停在
+                # OFF —— 等于悄悄失去级联删除保护。
+                conn.commit()
+                conn.execute("PRAGMA foreign_keys=ON")
+                if not conn.execute("PRAGMA foreign_keys").fetchone()[0]:
+                    logger.error(
+                        "failed to restore PRAGMA foreign_keys after rebuilding %s; "
+                        "CASCADE protection is off for this connection", table)
         return True
 
     def schema_version(self) -> int:
@@ -333,14 +389,15 @@ class _ConnectionHub:
             "path": str(self._path),
             "schema_version": self.schema_version(),
             "disabled_reason": self._disabled_reason,
-            "connections": len(self._all_conns),
+            "connections": self.connection_count,
             "db_size_bytes": self._path.stat().st_size if self._path.exists() else 0,
         }
 
     def close_all(self) -> None:
         """Close every connection handed out. 仅测试与优雅停机使用。"""
         with self._lock:
-            conns, self._all_conns = self._all_conns, []
+            conns = [c for _, c in self._conns.values()]
+            self._conns = {}
         self._local = threading.local()   # 丢弃本线程缓存的失效连接
         for c in conns:
             try:

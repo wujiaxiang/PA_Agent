@@ -14,6 +14,8 @@ reasoning/content into the same bubble component the 追问 tab already uses.
 """
 from __future__ import annotations
 
+from pa_agent.records.review_spec import parse_review, spec_hint
+
 import asyncio
 import json
 import logging
@@ -62,6 +64,8 @@ _SYSTEM = """你是一位交易复盘分析师。你会拿到一条交易计划�
 - unresolved（未触及任一价位）是正常结局，不代表判断错误 —— 它只说明在给定的
   N 根 K 线窗口内价格没走到。评估它时要评价的是「这个窗口长度设置是否合理」。
 - 不要给出投资建议，只做推理质量评估。"""
+
+_SYSTEM += spec_hint()
 
 
 def _find_entry(record_id: str, *, user_id: str) -> dict[str, Any]:
@@ -176,17 +180,33 @@ def _persist_review(
     独立表 → 可以重跑并留历史，且**不改**经验条目本身的状态与时序。
     失败只记 warning：复盘是附加产物，丢一次不该让用户看到报错。
     """
-    content = getattr(reply, "content", None) or ""
-    if not str(content).strip():
+    content = str(getattr(reply, "content", None) or "")
+    if not content.strip():
         logger.warning("experience review produced empty content; not persisted (%s)", record_id)
         return
+
+    # 按规格解析成结构化字段。**解析失败必须显式失败** —— 曾把 verdict/criteria
+    # 留成空串，而渲染层 `if crit or verdict` 恒为假，于是复盘静默地从未进入
+    # 任何提示词，且没有任何报错。解析失败照样存全文（人还能读），但 verdict
+    # 与 criteria 留空 —— 半截复盘的判据没有意义，放它进提示词等于用垃圾换真值。
+    spec = parse_review(content)
+    if not spec["parsed"]:
+        logger.warning(
+            "LLM review does not match spec; stored read-only, verdict left empty "
+            "(entry=%s missing=%s)", record_id, spec["missing"],
+        )
+
     try:
         from pa_agent.records.experience_writer import ExperienceWriter
 
         ok = ExperienceWriter(logger=logger).attach_review(
             record_id,
-            {"content": str(content), "reasoning": str(getattr(reply, "reasoning_content", "") or "")},
+            {"content": content, "spec": spec,
+             "reasoning": str(getattr(reply, "reasoning_content", "") or "")},
             model=str(getattr(ctx.settings.provider, "model", "") or ""),
+            verdict=spec["verdict"],
+            reusable_criteria=spec["reusable_criteria"],
+            source="llm",
             user_id=user_id,
         )
         if not ok:

@@ -130,6 +130,7 @@ DDL_EXPERIENCE_REVIEWS = (
         entry_id     TEXT NOT NULL,
         user_id      TEXT NOT NULL,
         model        TEXT NOT NULL DEFAULT '',
+        source       TEXT NOT NULL DEFAULT 'llm',   -- 'program' | 'llm'
         verdict      TEXT NOT NULL DEFAULT '',
         reusable_criteria TEXT NOT NULL DEFAULT '',
         payload_json TEXT NOT NULL,
@@ -273,6 +274,13 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("experience_entries", "drop_default_user_id"),
     ("trade_records", "drop_default_user_id"),
     ("experience_reviews", "drop_default_user_id"),
+    # ``source`` 区分程序化复盘与 LLM 复盘。**这条 ALTER 不是可选的**：
+    # ``CREATE TABLE IF NOT EXISTS`` 对**已存在的表完全无效**，加进去的列不会
+    # 出现在老库上。没有这条迁移时，INSERT 报 "no column named source"，而
+    # ``db.execute`` 把它当「transient error (not latching)」吞掉 —— 结算照常
+    # 成功、复盘却一条都没写进去，日志里只有一行 warning。
+    ("experience_reviews",
+     "ALTER TABLE experience_reviews ADD COLUMN source TEXT NOT NULL DEFAULT 'llm'"),
 )
 
 def create_table_ddl(table: str) -> str | None:
