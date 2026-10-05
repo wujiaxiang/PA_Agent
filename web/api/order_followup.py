@@ -148,6 +148,7 @@ def spawn_post_order_followup(
     settings: Any,
     symbol: str,
     timeframe: str,
+    exchange: str = "",
     data_source: Any = None,
     user_id: str = "",
 ) -> bool:
@@ -158,6 +159,14 @@ def spawn_post_order_followup(
     ``user_id`` 必须在**派发时**（请求线程里）取好传进来：下面的
     ``save_pending_if_resolvable`` 是同步执行的，理论上还能问 ``request``，
     但线程一旦起来就没有请求上下文了，经验记录的归属就成了猜的。
+
+    ``exchange`` 同样必须由调用方传**本次分析用的那个**：交易所若在函数内部
+    从 ``settings.general.last_tradingview_exchange`` 读，就与同一次调用里的
+    ``symbol`` / ``timeframe``（来自本次分析）**取自两个不同的真相源** ——
+    前者是「每次请求从会话游标派生」的只读冻结字段，已不被 ``/api/subscribe``
+    更新。两者不一致就会写出**永远结算不了**的经验条目：真机实测出现过一条
+    ``GATEIO/NVDA``（美股挂在加密交易所下），TradingView 永远无数据，
+    取数失败累计 6 次仍停在 pending。
     """
     if settings is None:
         return False
@@ -199,7 +208,9 @@ def spawn_post_order_followup(
         staged = save_pending_if_resolvable(
             writer=ExperienceWriter(logger=logger),
             settings=settings,
-            exchange=str(getattr(settings.general, "last_tradingview_exchange", "") or ""),
+            # 优先用调用方传来的**本次分析的交易所**；缺失时才回落全局字段。
+            exchange=str(exchange or getattr(
+                settings.general, "last_tradingview_exchange", "") or ""),
             symbol=symbol,
             timeframe=timeframe,
             stage1=dict(getattr(record, "stage1_diagnosis", None) or {}),
@@ -209,8 +220,12 @@ def spawn_post_order_followup(
             user_id=user_id,
         )
         if staged is not None:
+            # 返回的是 entry_id（str），不是条目对象。此前这里写 ``staged.name``，
+            # 于是**每次成功写入都在这一行抛 AttributeError**，掉进下面的 except
+            # 报成「experience stage-1 failed」—— 写入其实成功了，日志却说失败，
+            # 排查时会被直接带偏。
             logger.info("experience stage-1 pending written: %s %s -> %s",
-                        symbol, timeframe, staged.name)
+                        symbol, timeframe, staged)
     except Exception as exc:  # noqa: BLE001
         logger.warning("experience stage-1 failed: %s", exc)
 

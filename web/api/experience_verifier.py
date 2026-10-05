@@ -384,7 +384,10 @@ def verify_pending(
         return summary
 
     try:
-        pending = w.list_pending(limit=max(limit * 5, 50))
+        # ``user_id=None`` → 遍历**所有用户**的待验证记录。
+        # 结算跑在调度器线程上没有请求上下文，空串会被 _owner 回落成
+        # DEFAULT_USER_ID，于是只剩 admin 的记录会被结算。
+        pending = w.list_pending(limit=max(limit * 5, 50), user_id=None)
     except Exception as exc:  # noqa: BLE001
         logger.warning("experience verify: listing failed: %s", exc)
         return summary

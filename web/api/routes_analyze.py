@@ -479,6 +479,13 @@ def _run_analysis(
                         )
                     else:
                         # 阈值保护：超过 incremental_max_new_bars 则降级为完整分析
+                        #
+                        # **刻意保留读全局 settings**（它不是游标字段）：这是用户
+                        # 偏好的调参项（L1 用户级），语义是「增量最多跨几根新
+                        # K 线」，与「本 tab 在看哪个标的」无关。游标三件套
+                        # （last_symbol/last_timeframe/last_tradingview_exchange）
+                        # 才是会话级、必须走 resolve_view —— 见
+                        # `routes_settings._CURSOR_FIELDS` 与下方增量 POST 端点。
                         max_new = int(
                             getattr(
                                 ctx.settings.general,
@@ -514,6 +521,13 @@ def _run_analysis(
             incremental=incremental,
             continuous=continuous,
             user_id=user_id,
+            # **落库的 exchange 只能来自本次会话游标**。KlineFrame 没有
+            # exchange 字段（pa_agent/data/base.py），build_display_frame 也不收
+            # 该参数，所以 view_exchange 到 record.meta.exchange 的唯一通道就是
+            # 这里。以前不传 → _build_empty_record 回落全局冻结值
+            # `settings.general.last_tradingview_exchange` → 用户订阅
+            # NASDAQ/NVDA 却被记成 GATEIO，历史弹窗按三元组过滤一条都查不到。
+            exchange=view_exchange,
             **callbacks,
         )
         record_payload = _serialize_record(record)
@@ -545,6 +559,9 @@ def _run_analysis(
                 # 分析对了而落盘/推送用错标的，用户看到的通知与记录会对不上。
                 symbol=view_symbol,
                 timeframe=view_timeframe,
+                # 交易所必须与 symbol/timeframe 同源：内部回落的是**冻结**的
+                # 全局字段，三轴不一致会写出永远结算不了的经验条目。
+                exchange=view_exchange,
                 data_source=ctx.data_source,
                 user_id=user_id,
             ):
@@ -709,14 +726,18 @@ async def analyze_incremental_post(request: Request):
     ``GET /api/analyze/incremental/stream`` instead.
     """
     ctx = request.app.state.ctx
-    try:
-        symbol = ctx.settings.general.last_symbol
-        timeframe = ctx.settings.general.last_timeframe
-        exchange = getattr(ctx.settings.general, "last_tradingview_exchange", "") or ""
-    except AttributeError:
-        symbol = ""
-        timeframe = ""
-        exchange = ""
+    # **必须走 resolve_view，不能读 settings.general.last_***。
+    # `last_symbol/last_timeframe/last_tradingview_exchange` 是
+    # `routes_settings._CURSOR_FIELDS` 标注的**只读冻结值**：每次请求由
+    # `_apply_session_cursor()` 从会话游标派生后**只回给前端**，而
+    # `POST /api/subscribe`（routes_data.py:223-248）早已改为只写会话游标、
+    # **不再更新这三个字段**。读它们拿到的是上一次某人订阅时的残留值 ——
+    # 本会话明明在看 NASDAQ/NVDA，却按冻结的 GATEIO 去查上一轮记录：
+    # 该 404 的不 404，或捞到别的标的当增量锚点（跨标的串味）。
+    # 取法与同文件 :647/:603 的 SSE 端点保持逐字一致。
+    from web.api.session_ctx import resolve_view, session_id_of
+
+    symbol, timeframe, exchange = resolve_view(ctx, session_id_of(request))
     if not symbol or not timeframe:
         raise HTTPException(status_code=400, detail="缺少品种/周期")
     previous_record = find_latest_successful_record(

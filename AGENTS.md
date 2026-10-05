@@ -381,6 +381,27 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
   的语义是「窗口内未触及价位」，与「压根取不到行情」不是一回事
 - **`_no_data_attempts` 必须从库里读当前值**，不能用调用方传的 `content` ——
   那是 `list_pending` 在本轮开始时的快照，每轮都是同一个值，计数器永远停在 1
+- **经验条目的交易所必须与 symbol/timeframe 同源**：`routes_analyze` 刻意用
+  **本次分析**的 `view_symbol`/`view_timeframe`（不能用全局订阅），而交易所若
+  在 `spawn_post_order_followup` 内部从 `settings.general.last_tradingview_exchange`
+  读，就与前两者**取自两个真相源** —— 三轴不一致会写出**永远结算不了**的条目。
+  真机实测：`GATEIO/NVDA`（美股挂在加密交易所下），取数失败累计 6 次仍 pending
+- **后台结算必须遍历所有用户**：`list_pending(user_id="")` 会经 `_owner("")`
+  回落成 `DEFAULT_USER_ID`，而 `list_entries` 原本恒为 `user_id = ?` —— 结算
+  跑在调度器线程上没有请求上下文，于是**只有 admin 的记录会被结算**，其他用户
+  的经验写进去了却永远停在 pending、永远进不了检索端。三档必须分开：
+  `None` = 不过滤（结算用），`""` = 回落默认用户，`有值` = 按该用户
+- **成功路径的日志也会撒谎**：`save_pending_if_resolvable` 返回 entry_id（str），
+  调用点却写 `staged.name` → **每次成功写入都抛 AttributeError** 并被外层
+  except 报成「experience stage-1 failed」。记录写进去了，日志说失败，排查直接
+  被带偏。**写入成功与否不能只看日志**
+- **测试 fixture 不得 `close_all()` 全局 hub**：早先某用例自建 hub 后
+  `close_all()`，同进程后续测试拿到已关闭的连接，一批无关用例随机变红
+  （实测 `test_record_user_isolation` 5 条）。复用 `conftest` 的
+  `db_path_isolated` 就没这问题
+- **反向验证要看「撤掉后哪条变红」，而不是「全部都红」**：断言写成
+  `"exchange=view_exchange" in getsource(module)` 时，删掉出问题的那一处仍绿 ——
+  因为该串在文件里出现 3 次。必须断言**那一个调用块**
 - **重建表必须先 `PRAGMA foreign_keys=OFF`**：`connect()` 开着 FK，而重建要
   `DROP TABLE`，SQLite 视为删全部行 → `ON DELETE CASCADE` **静默清空子表**，
   `migrate()` 还返回 True（实测重建 `experience_entries` 会删光

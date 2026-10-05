@@ -153,8 +153,18 @@ class ExperienceWriter:
         )
 
     @staticmethod
-    def _owner(user_id: str) -> str:
-        """归属用户。留空回落存储层默认用户（单机部署下它就是正确答案）。"""
+    def _owner(user_id: str | None) -> str | None:
+        """归属用户。
+
+        - 给了名字 → 用它
+        - ``None`` → **不过滤**（后台结算要遍历所有用户）
+        - 空串 ``""`` → 回落存储层默认用户（单机部署下它就是正确答案）
+
+        这三档必须分开：结算若回落成默认用户，就只结算 admin 的记录，
+        其他用户的经验永远停在 pending（真机/单测都验证过这个失效）。
+        """
+        if user_id is None:
+            return None
         if user_id:
             return str(user_id)
         from pa_agent.storage.db import DEFAULT_USER_ID
@@ -380,7 +390,7 @@ class ExperienceWriter:
             return False
 
     def list_pending(
-        self, limit: int = 100, *, user_id: str = ""
+        self, limit: int = 100, *, user_id: str | None = ""
     ) -> list[tuple[str, dict[str, Any]]]:
         """返回 ``(entry_id, content)``，按创建时间**由旧到新**。
 

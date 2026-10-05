@@ -152,7 +152,7 @@ def _run(sql: str, params: tuple = ()) -> QueryResult:
 
 def list_entries(
     *,
-    user_id: str = DEFAULT_USER_ID,
+    user_id: str | None = DEFAULT_USER_ID,
     status: str | None = None,
     statuses: Sequence[str] | None = None,
     symbol: str = "",
@@ -173,8 +173,18 @@ def list_entries(
     读取端默认只应取 ``success``/``failure`` —— 未决的 ``pending``/``unresolved``
     不是已验证经验，不得当失败经验喂回提示词（AGENTS.md「两阶段状态机」）。
     """
-    where = ["user_id = ?"]
-    params: list[Any] = [user_id]
+    # ``user_id=None`` → **不做用户过滤**（后台结算要用）。
+    # 此前这里恒为 ``user_id = ?``，而结算跑在调度器线程上、没有请求上下文，
+    # 传空串又被 ``ExperienceWriter._owner`` 回落成 DEFAULT_USER_ID ——
+    # 于是**只有 admin 的经验条目会被结算**，其他用户的记录写进去了却永远停在
+    # pending，也就永远进不了检索端。多用户部署下这是静默的能力缺失。
+    where: list[str] = []
+    params: list[Any] = []
+    if user_id is not None:
+        where.append("user_id = ?")
+        params.append(user_id)
+    if not where:
+        where.append("1 = 1")
     if statuses:
         wanted = [s for s in statuses if s]
         if wanted:

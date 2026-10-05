@@ -22,6 +22,73 @@
 
 ## 🔴 进行中（有人正在改这些文件，不要动）
 
+### 2026-10-05 · 修「全部品种」历史列表被过期响应覆盖 + 记录读写/用户隔离测试
+
+**状态**：已完工（**未 commit**，按上级指示保留工作区改动）
+
+#### 需求
+1. 「全部品种」历史列表显示为空（接口 200、数据完整、前端空态）
+2. 测全「用户记录查询与写入」：写入→查询往返、用户隔离、已知行为固化
+
+#### 根因（实测，非猜测）
+`app.js::loadHistoryList()` 有 4 个触发点（boot / popover 打开 / 刷新 / 勾选框），
+**全都不 await**；`renderHistoryList` 是**就地覆写** `#history-list`。
+于是先发的「当前品种」请求若晚于后发的「?limit=50」返回，
+它的 0 行结果会把已渲染的 25 条抹成「暂无历史记录」。
+
+实测（真实容器 `pa-agent-web` + 真实 Chromium，游标 NVDA/5m/NASDAQ 零行）：
+`T+3s` 渲染 25 条 → `T+7s` 过期响应落地 → 勾选态=True、空态=True、条目=0。
+
+**排除的假设**（都实测过）：`API.get` 返回裸数组（不是 `{data:[...]}`）、
+`#history-list` 是静态 HTML 在脚本前就存在、函数声明有提升。
+**父任务的前提有误**：日志里那条带过滤的 `limit=50` 不是 app.js:1888 的增量探针
+（探针是 `limit=1` 且不渲染列表），而是 `loadHistoryList` **自己**的过滤分支。
+
+#### 改动文件
+- `web/static/js/app.js` — `loadHistoryList` 加 `_historyListSeq` 序号守卫
+  （只有最新一次调用有资格渲染）；读失败不再渲染成「暂无历史记录」，
+  新增 `renderHistoryError()` 独立空态
+- `web/static/index.html` — `app.js?v=69`（随后被并行会话推到 70）
+- `tests/js/test_history_list.test.js`（新，5 条）
+- `tests/unit/test_record_user_isolation.py`（新，22 条）
+
+#### 接口变更
+无。`GET /api/records`、`DELETE /api/records/{id}`、`#history-list`
+等 DOM id 与字段均未变；只新增内部变量 `_historyListSeq` 与内部函数
+`renderHistoryError`。
+
+#### 发现的两个真实隔离缺口（**未修，已写成「提醒灯」用例，越修越红**）
+1. `PendingWriter._mirror_to_sqlite` 调 `upsert_record(...)` **不传 user_id**
+   ⇒ 所有分析记录恒落 `DEFAULT_USER_ID`("admin")，而读端按
+   `current_user_id` 过滤 ⇒ 非 admin 用户「写入成功、列表永远为空」
+2. `routes_records.delete_record(record_id)` 签名里**没有 request**
+   ⇒ 跨用户删除：受害者的**文件被删**，索引行因 user_id 不匹配留下，
+   而 `hub.execute()` 返回「SQL 执行成功」而非行数 ⇒ 仍回报 `db_deleted: true`
+
+两者都在 `pa_agent/records/pending_writer.py` / `web/api/routes_records.py`，
+**不在本会话写集内**，故只报告不改。
+
+#### 「部分过滤」的真实行为（测出来的，别再猜）
+既不拒绝、也不是全表扫：`?symbol=X` 单独给时 `ix_rec_lookup`
+（前导列 user_id,exchange,symbol,timeframe）对不上前缀，SQLite 改用
+`ix_rec_recent(user_id)` —— **该用户的每一行都会被读到**，结果仍正确。
+「全部品种」与部分过滤走**同一条索引、同样代价**。
+另：`GET /api/records` **没有 offset**（只有 limit），无法翻页；
+`include_partial=true` 会连 `status='error'` 一起放行（12+5+3=20，不是 17）。
+
+#### 反向验证
+- Node：撤守卫 → C 红；恢复成 `renderHistoryList([],…)` → D 红
+- pytest：去掉 `list_records` 的 user_id 过滤 / `get_record_detail` 的过滤 /
+  partial 过滤 / 改删除顺序 / 降级改 500 / 改默认用户 / 去掉 chat 过滤
+  ⇒ 对应用例逐条变红
+
+#### 冲突风险 ⚠️
+**`web/static/js/app.js` 与 `web/static/index.html` 同时被并行会话改动**
+（对方在做「历史交易所」，新增 `tests/js/test_history_exchange.test.js`、
+`tests/unit/test_record_exchange_binding.py`，并把 `app.js?v` 推到 70、
+`style.css?v=43`）。两边的改动当前共存且都能跑通，但**归属混乱**，
+提交前必须 `git commit -- <显式文件列表>` 逐条核对。
+
 ### 2026-10-05 · 改密作废该用户全部令牌（登出仍只限本枚）
 
 **状态**：已完工

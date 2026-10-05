@@ -48,6 +48,35 @@
 
 ## 2026-10-05
 
+### 15. 补测「自然产生案例」全链路，又查出四处
+
+之前只验证过「已存在的条目能否结算」，**没验证过「下单信号能否自动产生条目」**
+——真机上分析给的是「不下单」，门控正确拦下，于是这条最核心的链路无人验证。
+新增 `tests/unit/test_experience_natural_loop.py`（9 例）走**生产入口**，查出：
+
+- 🔴 **后台结算只结算 admin 的记录**：`list_pending(user_id="")` 经 `_owner("")`
+  回落成 `DEFAULT_USER_ID`，且 `list_entries` 恒为 `user_id = ?`。结算跑在调度器
+  线程上没有请求上下文 → 其他用户的经验条目写进去了却**永远停在 pending**，
+  也就永远进不了检索端。多用户部署下这是静默的能力缺失
+- 🔴 **交易所与品种不同源**：调用方刻意用本次分析的 `view_symbol`/`view_timeframe`，
+  交易所却在函数内部从**冻结**的 `last_tradingview_exchange` 读。这正是真机上
+  那条 `GATEIO/NVDA` 的成因
+- 🟠 **成功写入被报成失败**：调用点写 `staged.name`，而返回值是 entry_id（str）
+  → 每次成功写入都抛 AttributeError 并被外层 except 报成「stage-1 failed」。
+  记录写进去了，日志说失败
+- 🟠 **测试 fixture 关掉了全局 hub**：自建 hub 后 `close_all()`，同进程后续测试
+  拿到已关闭连接，`test_record_user_isolation` 5 条随机变红。改用 conftest 的
+  `db_path_isolated`
+
+**测试自身的两个坑**（都导致「看起来测到了、其实没测到」）：
+
+- 假 bar 用自造 stub，缺 `open` 字段 → 结算阶段 AttributeError。改用真实的
+  `KlineBar` 数据类：替身掩盖的正是「生产代码到底读 bar 的哪些字段」
+- 断言写成 `"exchange=view_exchange" in getsource(module)`，而该串在文件里出现
+  3 次，删掉出问题的那一处照样绿。改为断言**那一个调用块**
+
+四处修复逐条反向验证，确认各自变红。全量回归两次：新增失败 0、error 0。
+
 ### 14. 结算 scope 改预算 + 取不到数据要计数告警
 
 - **后台结算不再按品种过滤**：`settings.general.last_*` 是只读的会话游标派生
