@@ -139,126 +139,6 @@ SQLite / 另一个进程改同一文件」。写配置是人工点击级低频�
 
 ---
 
-### 2026-10-05 · E2E 接入 CI（当前）
-
-**状态**：进行中
-
-#### 方案（施工中发现的硬约束）
-
-自播种原本写成「测试进程直接写文件 + `upsert_record()` 写 DB」，本地能跑通，
-但**在容器化部署下必然错位**，连续踩了三个坑：
-
-1. `experience_loaded` 写成 `False`，schema 要求 `list` → 记录被列表接口静默过滤
-2. 只写文件不写 DB → API 查不到。`routes_records._list_records()` 明确
-   「**数据库是唯一真源**，磁盘文件只是补种来源」
-3. 补上 `upsert_record()` 仍查不到 → DB 校验 `f.resolve().relative_to(RECORDS_DIR)`
-   失败。**根因是宿主机与容器是两套文件系统视图**：
-   宿主 `/root/shared-workspace/PA_Agent/records/pending`
-   vs 容器 `/app/records/pending`（同一目录、不同挂载点）
-   同一 inode，但 `relative_to` 必然失败
-
-**结论**：任何「测试进程自己写库」的方案在容器下都不成立。必须让**服务端自己
-播种** —— 由服务端进程写盘、用它自己的 `RECORDS_DIR`、走它自己的 `upsert_record`。
-因此新增一个**默认关闭、仅显式开启时可用**的 E2E 播种端点。
-
-
-#### 需求
-用户批准把 `tests/e2e/` 接入 CI。此前 E2E 只在本地跑，`ci.yml` 中 0 处引用 ——
-测试写了但不接流水线，等于没写。
-
-#### 方案
-（施工中）
-
-#### 改动文件（写入范围）
-
-| 文件 | 改动 |
-|---|---|
-| `tests/e2e/test_modes_e2e.py` | BASE_URL 走环境变量；空库时请求服务端播种 |
-| `web/api/routes_records.py` | **新增** E2E 播种端点（默认关闭，需环境变量开启） |
-| `tests/e2e/conftest.py` | 新增：服务就绪等待 |
-| `.github/workflows/ci.yml` | 新增 `e2e` job |
-| `SESSION_CHANGES.md` / `CHANGELOG.md` / `AGENTS.md` | 记录 |
-
-#### 接口变更
-新增端点 `POST /api/records/__e2e_seed__`，**仅在 `PA_AGENT_E2E=1` 时注册**
-（默认不注册，生产环境不存在该路由）。
-新增环境变量：`PA_AGENT_E2E_BASE_URL`（E2E 目标地址）、`PA_AGENT_E2E=1`（服务端开关）。
-
-#### 冲突风险
-- `.github/workflows/ci.yml` 是共享基础设施，开工前已确认「进行中」区无占用
-- 关键风险：CI 是**空库**，`_records()` 返回空会让核心测试**静默 skip**，
-  CI 全绿但什么都没测。必须让 E2E 在无历史记录时自播种
-
-
-### 2026-10-05 · 经验库读端切库（P-1 → P4）
-
-**状态**：P-1 / P-2 / P0 / P1 / P2 **已完工**（待 commit）；P3 复盘回写、P4 字段感知渲染**未做**
-
-#### 需求
-身份/鉴权层已由 `650fc8f` 落地（`storage/auth.py` + `web/api/auth_ctx.py`），但经验库
-**读端一行未动**：三条读路径（提示词注入 / 浏览 API / 复盘取档）全在文件系统。
-`experience_repo.list_entries`/`get_entry`/`count_by_status` 除测试外零生产调用者，
-`current_user_id` 零调用者 —— `experience_entries` 表自建起是死索引，`user_id` 列从未生效。
-用户要求：做计划 → 评审 → 再并线开发。
-
-#### 方案
-照搬 `docs/SESSION_STORAGE_DESIGN.md` §7 的 **C 阶段切读**（SQLite 读，miss 回退文件），
-不做 D 阶段（SQLite only，风险高收益零）。分 P-1…P4，见方案文档。
-
-**v1 经两轮独立评审后被推翻**，5 处错误（详见方案 §7），关键三条：
-- **`hub.read_failed` 是进程级共享标志**（`_read_error` 非 thread-local，且成功读会清它），
-  v1 的降级契约在并发下是死代码 → 已实测复现，提为 P-1
-- **漏了 reader 异常会连同已付费的 Stage 1 一起毁掉整次分析**
-  （`two_stage.py:678` 无 try/except，下一次落盘在 703）→ P-1
-- **P1 伪代码绕过 `read_top5()`**，会**静默废掉 12 个 Mock 测试点**（不红，只是没测）
-
-**被否决的方案**：
-- **不做「顺手补写」** —— 读路径不写。会顶住 `max_workers=2` 的分析池
-  （`busy_timeout=5000`），且破坏 AGENTS「写入方唯一入口」；回填交给 importer
-- **DB 优先逻辑放进 `read_top5()` 内部**，不改 `read_for_stage2` —— 保住 14 个测试点
-- **`entry_id` 改取值而非改主键** —— SQLite 不能 ALTER 主键，改取值零迁移成本
-- **复盘回写进条目文件，不新增只存 DB 的表** —— 保住「文件是权威副本」与可追溯性，
-  且免 schema 迁移（`db.migrate()` 每次启动无条件跑 `all_statements()`）
-- **不上 PostgreSQL** —— `db.py:20` 是 `sqlite3`，依赖 `ON CONFLICT`/`AUTOINCREMENT`/
-  `threading.local`
-- **打分逻辑不搬 SQL** —— `_score` 只有方向 +2、形态交集两项，数据量百级，留在 Python
-
-#### 改动文件（写入范围）
-
-| 文件 | 改动 |
-|---|---|
-| `docs/EXPERIENCE_READ_CUTOVER.md` | 新增（方案文档，含评审推翻记录） |
-| `pa_agent/storage/db.py` | **P-1** `_read_error` 移入 `threading.local` |
-| `pa_agent/storage/experience_repo.py` | **P-1** 查询显式回传失败标志；**P-2** 增 `statuses`、`entry_id` 按 user 分区 |
-| `pa_agent/orchestrator/two_stage.py` | **P-1** reader 包 try/except + `save_partial` 前移 |
-| `web/api/session_ctx.py` | **P0** `bind_session` 改走 `current_user_id(request)` |
-| `pa_agent/records/schema.py` | **P0** `RecordMeta` 增 `user_id` |
-| `pa_agent/records/experience_writer.py` | **P0** 全链透传 `user_id`（含 `save()` 补镜像）；**P3** `attach_review()` |
-| `pa_agent/records/experience_reader.py` | **P1** DB 优先（塞进 `read_top5`）+ 文件回落 + direction 枚举修复 + 死参数清理 |
-| `web/api/routes_data.py` | **P2** 浏览 API 切读 repo |
-| `web/api/routes_experience_review.py` | **P3** `_find_entry` 切 `get_entry`；复盘结果回写 |
-| `web/api/order_followup.py` | **P0** 派发线程时透传 `user_id` |
-| `web/api/experience_verifier.py` | **P0** 结算用记录自身的 `user_id` |
-| `pa_agent/ai/prompt_assembler.py` | **P4** `_render_experience` 字段感知渲染 |
-| `tests/unit/test_storage_*.py`、`test_experience_*.py`、`tests/integration/`、`tests/e2e/` | 新增/调整测试 |
-| `SESSION_CHANGES.md`、`CHANGELOG.md`、`AGENTS.md` | 记录 |
-
-#### 接口变更
-- **P0**：`/api/records` 响应中 legacy 记录的 `meta.user_id` 为 `""`（多一个 key）
-- **P-2**：`experience_repo.list_entries` 增 `statuses: list[str] | None`（`status` 保留兼容）
-- **P-1**：`hub.read_failed` 语义改为线程局部（调用方行为不变，但并发下不再互相清标志）
-- 其余待实施后补
-
-#### 冲突风险
-- `web/api/routes_data.py` 近期被其它会话改过（mtime 10-05 10:13），但其改动
-  不在经验库段内；提交时按 AGENTS「`git commit -- <显式文件列表>`」避免捎走他人改动
-- 既有失败/不稳定测试：**无**。开工前基线
-  `test_experience_library_loop / two_stage / watch_integrity / storage_dualwrite /
-  session_ctx / auth_placeholder` = **107 passed, 1 skipped**
-- **已知既有缺陷（本次只登记不修）**：`spawn_post_order_followup` 每次分析新建线程，
-  经双写链每次 +1 条永不关闭的 SQLite 连接（实测 20 线程 → 21 连接）。P1 放大泄漏面
-- 本机 8000 端口是 **docker-proxy**（非本仓库进程），404；最终验收需另行起 uvicorn
-
 ## ✅ 已提交（本条改动待 commit；条目已不再占用写入范围）
 ### 2026-10-05 · 多会话推理收尾（P1 SSE下线 / P2a 追问隔离 / P3 交易域 / P4 配置层）
 
@@ -445,6 +325,156 @@ SQLite / 另一个进程改同一文件」。写配置是人工点击级低频�
 ---
 
 ## ✅ 已提交
+
+### 2026-10-05 · E2E 接入 CI（当前）
+
+**状态**：已提交 `（本提交）`
+
+#### 方案（施工中发现的硬约束）
+
+自播种原本写成「测试进程直接写文件 + `upsert_record()` 写 DB」，本地能跑通，
+但**在容器化部署下必然错位**，连续踩了三个坑：
+
+1. `experience_loaded` 写成 `False`，schema 要求 `list` → 记录被列表接口静默过滤
+2. 只写文件不写 DB → API 查不到。`routes_records._list_records()` 明确
+   「**数据库是唯一真源**，磁盘文件只是补种来源」
+3. 补上 `upsert_record()` 仍查不到 → DB 校验 `f.resolve().relative_to(RECORDS_DIR)`
+   失败。**根因是宿主机与容器是两套文件系统视图**：
+   宿主 `/root/shared-workspace/PA_Agent/records/pending`
+   vs 容器 `/app/records/pending`（同一目录、不同挂载点）
+   同一 inode，但 `relative_to` 必然失败
+
+**结论**：任何「测试进程自己写库」的方案在容器下都不成立。必须让**服务端自己
+播种** —— 由服务端进程写盘、用它自己的 `RECORDS_DIR`、走它自己的 `upsert_record`。
+因此新增一个**默认关闭、仅显式开启时可用**的 E2E 播种端点：
+`POST /api/records/__e2e_seed__`，仅在 `PA_AGENT_E2E=1` 时**注册路由**
+（生产环境该路由根本不存在，404）。播种走服务端自己的 `RECORDS_DIR` +
+自己的 `upsert_record`，并用服务端同一套 `AnalysisRecord` schema 先自检 ——
+不过就 500，免得「播种成功但被列表接口静默过滤」，在 CI 上表现为
+「什么都没测到」。
+
+#### 验证
+- 播种端点返回 `{"seeded": true, "record_id": ...}`，
+  `GET /api/records` 随即能查到（`order_type=限价单`），详情端点可取
+- 清空全部 e2e 记录后重跑 E2E：**5 passed / 63s**，核心用例未 skip
+- `pytest tests/e2e` 与 `pytest tests/unit` 分开跑；CI 新增独立 `e2e` job，
+  与 `test` 并行、失败必须红，另配「失败时打印 server.log」便于定位
+
+#### 踩坑记录（4 个，全是「本地能跑、容器里必错」类）
+1. `experience_loaded` 写成 `False`，schema 要求 `list` → 被列表接口静默过滤
+2. 只写文件不写 DB → API 查不到（`_list_records` 明确「数据库是唯一真源」）
+3. 补上 `upsert_record()` 仍查不到 → `f.resolve().relative_to(RECORDS_DIR)`
+   失败。**根因：宿主机与容器是两套文件系统视图**（`/root/.../records/pending`
+   vs `/app/records/pending`，同一 inode、不同挂载点）。任何「测试进程自己写库」
+   的方案在容器下都不成立
+4. `_safe_path_segment()` 返回 `str` 不是 `Path`，`a / b` 报
+   `TypeError: unsupported operand type(s) for /: 'str' and 'str'`
+
+#### 冲突风险 ⚠️
+- `.github/workflows/ci.yml` 是共享基础设施，开工前已确认「进行中」区无占用
+- **本会话部署时两次把另一会话的半成品代码打进镜像**：一次 `routes_data.py`
+  的 `IndentationError`（编辑中间态被我 tar 快照捕获），一次容器 `pa_agent/`
+  未同步导致 `chat_repo` 缺失。教训：**部署前必须对 `web/` 与 `pa_agent/` 全量
+  语法自检**，且两个目录要么都覆盖、要么都不覆盖
+- `/api/health` 目前为 `degraded`：`model_api` 报 401（网关 API key 无效），
+  属配置层问题，非本会话引入
+
+#### 需求
+用户批准把 `tests/e2e/` 接入 CI。此前 E2E 只在本地跑，`ci.yml` 中 0 处引用 ——
+测试写了但不接流水线，等于没写。
+
+#### 方案
+（施工中）
+
+#### 改动文件（写入范围）
+
+| 文件 | 改动 |
+|---|---|
+| `tests/e2e/test_modes_e2e.py` | BASE_URL 走环境变量；空库时请求服务端播种 |
+| `web/api/routes_records.py` | **新增** E2E 播种端点（默认关闭，需环境变量开启） |
+| `tests/e2e/conftest.py` | 新增：服务就绪等待 |
+| `.github/workflows/ci.yml` | 新增 `e2e` job |
+| `SESSION_CHANGES.md` / `CHANGELOG.md` / `AGENTS.md` | 记录 |
+
+#### 接口变更
+新增端点 `POST /api/records/__e2e_seed__`，**仅在 `PA_AGENT_E2E=1` 时注册**
+（默认不注册，生产环境不存在该路由）。
+新增环境变量：`PA_AGENT_E2E_BASE_URL`（E2E 目标地址）、`PA_AGENT_E2E=1`（服务端开关）。
+
+#### 冲突风险
+- `.github/workflows/ci.yml` 是共享基础设施，开工前已确认「进行中」区无占用
+- 关键风险：CI 是**空库**，`_records()` 返回空会让核心测试**静默 skip**，
+  CI 全绿但什么都没测。必须让 E2E 在无历史记录时自播种
+
+
+### 2026-10-05 · 经验库读端切库（P-1 → P4）
+
+**状态**：P-1 / P-2 / P0 / P1 / P2 **已完工**（待 commit）；P3 复盘回写、P4 字段感知渲染**未做**
+
+#### 需求
+身份/鉴权层已由 `650fc8f` 落地（`storage/auth.py` + `web/api/auth_ctx.py`），但经验库
+**读端一行未动**：三条读路径（提示词注入 / 浏览 API / 复盘取档）全在文件系统。
+`experience_repo.list_entries`/`get_entry`/`count_by_status` 除测试外零生产调用者，
+`current_user_id` 零调用者 —— `experience_entries` 表自建起是死索引，`user_id` 列从未生效。
+用户要求：做计划 → 评审 → 再并线开发。
+
+#### 方案
+照搬 `docs/SESSION_STORAGE_DESIGN.md` §7 的 **C 阶段切读**（SQLite 读，miss 回退文件），
+不做 D 阶段（SQLite only，风险高收益零）。分 P-1…P4，见方案文档。
+
+**v1 经两轮独立评审后被推翻**，5 处错误（详见方案 §7），关键三条：
+- **`hub.read_failed` 是进程级共享标志**（`_read_error` 非 thread-local，且成功读会清它），
+  v1 的降级契约在并发下是死代码 → 已实测复现，提为 P-1
+- **漏了 reader 异常会连同已付费的 Stage 1 一起毁掉整次分析**
+  （`two_stage.py:678` 无 try/except，下一次落盘在 703）→ P-1
+- **P1 伪代码绕过 `read_top5()`**，会**静默废掉 12 个 Mock 测试点**（不红，只是没测）
+
+**被否决的方案**：
+- **不做「顺手补写」** —— 读路径不写。会顶住 `max_workers=2` 的分析池
+  （`busy_timeout=5000`），且破坏 AGENTS「写入方唯一入口」；回填交给 importer
+- **DB 优先逻辑放进 `read_top5()` 内部**，不改 `read_for_stage2` —— 保住 14 个测试点
+- **`entry_id` 改取值而非改主键** —— SQLite 不能 ALTER 主键，改取值零迁移成本
+- **复盘回写进条目文件，不新增只存 DB 的表** —— 保住「文件是权威副本」与可追溯性，
+  且免 schema 迁移（`db.migrate()` 每次启动无条件跑 `all_statements()`）
+- **不上 PostgreSQL** —— `db.py:20` 是 `sqlite3`，依赖 `ON CONFLICT`/`AUTOINCREMENT`/
+  `threading.local`
+- **打分逻辑不搬 SQL** —— `_score` 只有方向 +2、形态交集两项，数据量百级，留在 Python
+
+#### 改动文件（写入范围）
+
+| 文件 | 改动 |
+|---|---|
+| `docs/EXPERIENCE_READ_CUTOVER.md` | 新增（方案文档，含评审推翻记录） |
+| `pa_agent/storage/db.py` | **P-1** `_read_error` 移入 `threading.local` |
+| `pa_agent/storage/experience_repo.py` | **P-1** 查询显式回传失败标志；**P-2** 增 `statuses`、`entry_id` 按 user 分区 |
+| `pa_agent/orchestrator/two_stage.py` | **P-1** reader 包 try/except + `save_partial` 前移 |
+| `web/api/session_ctx.py` | **P0** `bind_session` 改走 `current_user_id(request)` |
+| `pa_agent/records/schema.py` | **P0** `RecordMeta` 增 `user_id` |
+| `pa_agent/records/experience_writer.py` | **P0** 全链透传 `user_id`（含 `save()` 补镜像）；**P3** `attach_review()` |
+| `pa_agent/records/experience_reader.py` | **P1** DB 优先（塞进 `read_top5`）+ 文件回落 + direction 枚举修复 + 死参数清理 |
+| `web/api/routes_data.py` | **P2** 浏览 API 切读 repo |
+| `web/api/routes_experience_review.py` | **P3** `_find_entry` 切 `get_entry`；复盘结果回写 |
+| `web/api/order_followup.py` | **P0** 派发线程时透传 `user_id` |
+| `web/api/experience_verifier.py` | **P0** 结算用记录自身的 `user_id` |
+| `pa_agent/ai/prompt_assembler.py` | **P4** `_render_experience` 字段感知渲染 |
+| `tests/unit/test_storage_*.py`、`test_experience_*.py`、`tests/integration/`、`tests/e2e/` | 新增/调整测试 |
+| `SESSION_CHANGES.md`、`CHANGELOG.md`、`AGENTS.md` | 记录 |
+
+#### 接口变更
+- **P0**：`/api/records` 响应中 legacy 记录的 `meta.user_id` 为 `""`（多一个 key）
+- **P-2**：`experience_repo.list_entries` 增 `statuses: list[str] | None`（`status` 保留兼容）
+- **P-1**：`hub.read_failed` 语义改为线程局部（调用方行为不变，但并发下不再互相清标志）
+- 其余待实施后补
+
+#### 冲突风险
+- `web/api/routes_data.py` 近期被其它会话改过（mtime 10-05 10:13），但其改动
+  不在经验库段内；提交时按 AGENTS「`git commit -- <显式文件列表>`」避免捎走他人改动
+- 既有失败/不稳定测试：**无**。开工前基线
+  `test_experience_library_loop / two_stage / watch_integrity / storage_dualwrite /
+  session_ctx / auth_placeholder` = **107 passed, 1 skipped**
+- **已知既有缺陷（本次只登记不修）**：`spawn_post_order_followup` 每次分析新建线程，
+  经双写链每次 +1 条永不关闭的 SQLite 连接（实测 20 线程 → 21 连接）。P1 放大泄漏面
+- 本机 8000 端口是 **docker-proxy**（非本仓库进程），404；最终验收需另行起 uvicorn
 
 ### 2026-10-05 · 模式切换残留审计 + 端到端测试补强（当前）
 

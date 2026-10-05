@@ -17,7 +17,11 @@ dataset 值、classList、消息条数），没有一个断言「面板当前显
 from __future__ import annotations
 
 import json
+import os
+import time
 import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -27,7 +31,11 @@ playwright_api = pytest.importorskip(
 )
 sync_playwright = playwright_api.sync_playwright
 
-BASE_URL = "http://127.0.0.1:8005"
+import os
+
+# CI 里服务端口由 job 指定，本地默认走容器映射的 8005。
+# 不做成命令行参数：conftest 与各测试都要读，环境变量最省事。
+BASE_URL = os.environ.get("PA_AGENT_E2E_BASE_URL", "http://127.0.0.1:8005").rstrip("/")
 TIMEOUT_MS = 90_000
 
 # 侧边栏分析产出类面板：内容必须随模式切换而重置
@@ -41,13 +49,61 @@ ANALYSIS_PANELS = {
 EMPTY_TEXT = "尚未进行交易分析"
 
 
+# 回看 E2E 用的标的。必须与 _seed_record 写入的位置一致。
+E2E_EXCHANGE = "GATEIO"
+E2E_SYMBOL = "BTCUSDT"
+E2E_TIMEFRAME = "1h"
+
+
 def _records() -> list[dict]:
-    url = f"{BASE_URL}/api/records?exchange=GATEIO&symbol=BTCUSDT&timeframe=1h"
+    url = (f"{BASE_URL}/api/records?exchange={E2E_EXCHANGE}"
+           f"&symbol={E2E_SYMBOL}&timeframe={E2E_TIMEFRAME}")
     try:
         with urllib.request.urlopen(url, timeout=30) as resp:
             return json.loads(resp.read())
     except Exception:
         return []
+
+
+def _seed_record() -> bool:
+    """请求服务端播种一条可回看的合成记录。
+
+    **必须由服务端写盘**，不能由测试进程自己写。踩坑记录（2026-10-05）：
+    最初在测试进程里写文件 + `upsert_record()` 写 DB，本地能跑通，容器里必然
+    查不到 —— 宿主 `/root/.../records/pending` 与容器 `/app/records/pending`
+    是同一 inode 的两套路径视图，`_db_candidates` 的
+    `f.resolve().relative_to(RECORDS_DIR)` 校验必然失败。
+    表现为「文件在、库里有记录、API 就是查不到」，极难定位。
+
+    端点仅在服务端设了 `PA_AGENT_E2E=1` 时才注册，生产环境不存在。
+    """
+    try:
+        req = urllib.request.Request(
+            f"{BASE_URL}/api/records/__e2e_seed__",
+            data=b"",
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read() or b"{}")
+        if not body.get("seeded"):
+            print(f"[e2e] 播种未成功：{body}")
+            return False
+        print(f"[e2e] 已播种记录 {body.get('record_id')}")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[e2e] 播种失败（服务端可能未开启 PA_AGENT_E2E=1）：{exc}")
+        return False
+
+
+def _ensure_records() -> list[dict]:
+    """有记录就用，没有就播种一条再取。返回的列表非空。"""
+    recs = _records()
+    if recs:
+        return recs
+    _seed_record()
+    # 播种后需要让服务端重新扫描目录
+    time.sleep(1.0)
+    return _records()
 
 
 def _read_panels(page) -> dict[str, str]:
@@ -90,9 +146,11 @@ def test_live_to_replay_to_live_resets_all_panels(page):
 
     修复前，预测 / 决策树 / 决策三个面板在返回实时后仍显示回看记录的内容。
     """
-    recs = _records()
-    if not recs:
-        pytest.skip("没有可用于回看的历史记录")
+    recs = _ensure_records()
+    assert recs, (
+        "播种后仍无记录可回看 —— 模式迁移这条主链路根本没被测到。"
+        "检查服务端 records 目录布局或 PA_AGENT_RECORDS_DIR 是否指向正确路径"
+    )
 
     before = _read_panels(page)
     assert before["__mode"] == "live"
