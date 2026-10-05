@@ -90,6 +90,26 @@
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 27. 修复：模式切回实时后侧边栏面板残留上一条记录的内容 + 补内容级 E2E
+
+用户报告「历史切到实时，有的页面数据没有重置清空」。复现确认 `实时 → 回看 → 实时` 后 **预测 / 决策树 / 决策** 三个面板仍显示回看记录内容。
+
+- **根因**：返回实时的处理器只做 `clearOverlays` + `loadBars` + `setDataMode('live')`，**从未重置侧边栏各分析面板的 innerHTML**。模式状态机只管 LED / 染色 / 只读，状态与内容是两套东西
+- **为什么此前没人修**：想用统一空态入口，但 `renderDecision` / `renderFuturePanel` / `renderDecisionTree` 都直接访问 `record.stage2_decision`，**传 null 会抛 TypeError**；`renderStreamFromRecord(null)` 与 `renderTokenUsage(null)` 则是静默 `return`，同样不清内容
+- **修复**
+  1. 三个渲染函数补 `record` 为空的早退分支
+  2. `renderStreamFromRecord(null)` 改为清理 replay-banner / flow-bar / 消息体并刷新追问锚点
+  3. `renderTokenUsage(null)` 改为清空用量行
+  4. 新增 `resetAnalysisPanels()` 统一调用空态分支 —— 不就地拼 innerHTML，空态文案只有一处定义
+  5. 返回实时处理器里的裸 `lastRecord = null` 换成 `resetAnalysisPanels()`
+- **新增 `tests/e2e/test_modes_e2e.py`（5 项）**：断言**面板内容**是否属于当前模式，并把三个模式串成一条完整迁移链
+- **做了「测试能否抓到 bug」的反向验证**：把修复回退后 E2E 精确变红，断言信息直接打印残留内容 —— 证明测试有效而非摆设。该验证**顺带发现第二个 bug**：`Demo → 实时` 走另一分支，同样有残留（原判断只覆盖了回看路径）
+- **关于此前端到端测试的不足（已记入 SESSION_CHANGES.md）**：旧走查断言的全是状态位（面板可见、dataset 值、classList、消息条数），**没有一个断言「面板当前显示的内容是否属于当前模式」**；`replayRecord()` 与 `btn-live` 在旧脚本里是两个独立步骤，从未串成一次状态迁移 —— 因此「机制都触发正确、结果是错的」这类 bug 全部漏网
+- **部署失误记录**：临时验证的 `docker commit` 漏写 `--change CMD`，把 `sleep infinity` 固化成镜像默认启动命令；另一次只覆盖 `web/static` 未覆盖 `pa_agent/`，容器内缺 `persist_patch` 导致 ImportError 起不来。每次 commit 必须显式重设 CMD
+- **文件**：`web/static/js/app.js`、`tests/e2e/test_modes_e2e.py`（新增）、`SESSION_CHANGES.md`、`AGENTS.md`、`CHANGELOG.md`
+- **版本**：app.js?v=63→64
+- **回归**：E2E 5 项全过；单元 FAILED=40 ERROR=30，其中 9 项新增失败全部来自 `tests/unit/test_multisession_contract.py` —— 该文件为**未跟踪的新文件**、属多 Session 会话写入范围，失败原因是其**自身第 180 行 `IndentationError`**，本会话未碰、亦未代为修改
+
 ### 26. 处置配置级联事故：settings.json 被写成默认值 → 分析功能整体不可用
 
 用户指出另一会话已完成「重大多用户配置改造」。重新读代码与文档后确认新架构：**DB（SQLite，用户级 admin）为真源**，`settings.json` 降级为「首次播种源 + 灾备兜底」。

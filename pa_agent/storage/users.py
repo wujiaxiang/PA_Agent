@@ -47,10 +47,11 @@ def ensure_admin_user() -> str:
 
 
 def default_user_id() -> str:
-    """当前请求应当归属的用户。
+    """进程级兜底用户 —— **仅供无请求上下文的场景**（启动初始化、CLI）。
 
-    UI 暂不做登录 → 恒为 admin。接入鉴权时改为从请求上下文取，
-    本函数是唯一的改动点。
+    ⚠️ **请求路径一律不要用它**：那是「不知道用户是谁就猜 admin」的写法，
+    接入鉴权后会导致数据错挂到 admin 名下且无任何报错。请求路径请用
+    ``web.api.auth_ctx.current_user_id(request)``。
     """
     return ADMIN_USER_ID
 
@@ -64,3 +65,85 @@ def get_user(user_id: str = "") -> dict | None:
 
 def list_users() -> list[dict]:
     return [dict(r) for r in get_hub().query("SELECT * FROM users ORDER BY created_at")]
+
+
+# ── 注册 / 登录（占位：原语齐备，接口留给将来的账号服务）───────────────────────
+
+
+def create_user(
+    user_id: str, *, password: str, display_name: str = "", role: str = "user"
+) -> str:
+    """建号并写入口令散列。返回 user_id。
+
+    ``user_id`` 非空且经 :func:`_validate_user_id` 归一 —— 它会进 SQL 与
+    令牌载荷，字符集必须收紧（与 session_id 同理）。
+    已存在则抛 :class:`pa_agent.storage.auth.AuthError`，**不静默覆盖口令**。
+    """
+    from pa_agent.storage.auth import AuthError, hash_password
+
+    uid = _validate_user_id(user_id)
+    if get_user(uid) is not None:
+        raise AuthError(f"user already exists: {uid}")
+
+    hub = get_hub()
+    if hub.disabled:
+        raise AuthError("storage unavailable: cannot create user")
+
+    ts = now()
+    ok = hub.execute(
+        """
+        INSERT INTO users (user_id, display_name, role, password_hash,
+                           is_default, created_at, last_seen)
+        VALUES (?, ?, ?, ?, 0, ?, ?)
+        """,
+        (uid, display_name or uid, role, hash_password(password), ts, ts),
+    )
+    return uid if ok else uid     # execute 只记 warning，不抛；行是否落库由读侧兜底
+
+
+def set_password(user_id: str, password: str) -> bool:
+    """重置口令。不碰其它字段，也不改 role。"""
+    from pa_agent.storage.auth import hash_password
+
+    hub = get_hub()
+    if get_user(user_id) is None:
+        return False
+    return hub.execute(
+        "UPDATE users SET password_hash = ? WHERE user_id = ?",
+        (hash_password(password), user_id),
+    )
+
+
+def authenticate(user_id: str, password: str) -> str | None:
+    """核对口令。**成功返回 user_id，失败返回 None** —— 不抛异常、不区分
+    「用户不存在」与「口令错误」。
+
+    区分这两种情况等于给攻击者一个用户名枚举接口：两者响应时间/文案一致。
+    用户不存在时仍跑一遍 :func:`verify_password` 的开销以抹平时序差异。
+    """
+    from pa_agent.storage.auth import verify_password
+
+    row = get_user(user_id)
+    stored = (row or {}).get("password_hash") or ""
+    ok = verify_password(password, stored) if row else verify_password(password, "")
+    if not ok:
+        logger.info("authenticate failed for user_id=%s", user_id)
+        return None
+    assert row is not None
+    get_hub().execute(
+        "UPDATE users SET last_seen = ? WHERE user_id = ?", (now(), user_id)
+    )
+    return row["user_id"]
+
+
+def _validate_user_id(raw: str) -> str:
+    """归一 user_id：非空、长度上限、只允许安全字符集。
+
+    与 session_id 同规格 —— 它同样进 SQL（走参数化）与令牌载荷。
+    """
+    uid = (raw or "").strip()
+    if not uid or len(uid) > 64:
+        raise ValueError("user_id must be 1..64 characters")
+    if not all(c.isalnum() or c in "-_." for c in uid):
+        raise ValueError("user_id contains unsupported characters")
+    return uid

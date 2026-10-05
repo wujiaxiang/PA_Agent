@@ -204,9 +204,20 @@ DDL_USERS = (
         role         TEXT NOT NULL DEFAULT 'admin',
         is_default   INTEGER NOT NULL DEFAULT 0,
         created_at   REAL NOT NULL,
-        last_seen    REAL NOT NULL
+        last_seen    REAL NOT NULL,
+        password_hash TEXT NOT NULL DEFAULT ''
     )
     """,
+)
+
+#: 旧库的增量迁移。``CREATE TABLE IF NOT EXISTS`` 对**已存在**的表是空操作，
+#: 所以新增列必须靠 ALTER 补。逐条独立执行，且允许「列已存在」失败 ——
+#: 这样重复运行安全，不必维护版本号分支。
+#:
+#: 2026-10-05: 预留给注册登录。旧库一律补空串（表示「未设口令」），
+#: authenticate() 对空散列恒失败，不存在误放行。
+MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("users", "ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''"),
 )
 
 _ALL_DDL: tuple[tuple[str, ...], ...] = (

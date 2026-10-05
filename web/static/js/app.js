@@ -726,7 +726,10 @@ function bindEvents() {
     btnBack.addEventListener('click', async () => {
       const dataModeWas = currentDataMode();
       hideReplayBadge();
-      lastRecord = null;
+      // 重置所有分析产出面板（预测 / 决策树 / 决策 / 流式 / token 用量）。
+      // 只置 lastRecord=null 是不够的：面板的 innerHTML 里仍留着上一条记录
+      // 的渲染结果 —— 实机报告的「切回实时还有页面数据没清空」就是这个。
+      resetAnalysisPanels();
       $$('.sidebar-tabs .tab').forEach(b => b.classList.remove('active'));
       document.querySelector('.sidebar-tabs .tab[data-tab="stream"]')?.classList.add('active');
       $$('.tab-panel').forEach(p => p.classList.remove('active'));
@@ -3183,6 +3186,14 @@ function rrPassColor(rr, passed) {
 // 内容计划：每个区域有清晰的子分组，子分组有小标题；缺失字段（支撑/阻力/置信度）已补全
 // 交互论题：Section 3 每个子区域独立 <details> + 主控按钮；默认仅 3.1 决策理由展开
 function renderDecision(record) {
+  // record 为空 = 当前没有分析结果（模式切回实时 / 尚未分析）。
+  // 此前本函数直接 record.stage2_decision，传 null 会抛 TypeError，
+  // 于是「模式切回实时」只能绕过它 → 决策面板残留上一条记录的内容。
+  if (!record) {
+    const el0 = $('#decision-content');
+    if (el0) el0.innerHTML = '<div class="muted-text">尚未进行交易分析</div>';
+    return;
+  }
   const threshold = Number(currentSettings?.general?.decision_confidence_threshold || 40);
   const d = applyConfidenceThreshold(record?.stage2_decision || {}, threshold);
   const s1 = record.stage1_diagnosis || {};
@@ -3766,7 +3777,14 @@ function updateTokenProgress(usage) {
 }
 
 function renderTokenUsage(usage) {
-  if (!usage) return;
+  // null = 清空。上一轮分析的 token 用量不是当前模式的产物，
+  // 模式切回实时后继续显示会让人以为刚跑过一轮。
+  const usageEl = $('#stream-usage');
+  if (!usage) {
+    if (usageEl) usageEl.textContent = '';
+    return;
+  }
+  if (!usageEl) return;
   const cached = usage.cached_prompt_tokens
     || (usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens) || 0;
   const pct = usage.prompt_tokens > 0 ? (100 * cached / usage.prompt_tokens).toFixed(0) : '0';
@@ -3777,8 +3795,13 @@ function renderTokenUsage(usage) {
 
 // ── 未来走势预期面板 ──────────────────────────────────────────────────
 function renderFuturePanel(record) {
-  const d = record.stage2_decision || {};
   const el = $('#future-content');
+  if (!el) return;
+  if (!record) {
+    el.innerHTML = '<div class="future-empty">尚未进行交易分析</div>';
+    return;
+  }
+  const d = record.stage2_decision || {};
   let html = '';
 
   // 下一根 K 线预期
@@ -4030,6 +4053,13 @@ function renderUnvisitedBranches(payload) {
 // section 用大字标题分组；点击卡片展开高级字段（action / branch / next_node / 程序判定 / 覆盖理由 等）。
 function renderDecisionTree(record) {
   const el = $('#tree-content');
+  // record 为空 = 当前没有分析结果。补此前缺失的空态早退：
+  // 直接传 null 会让本函数抛 TypeError，调用方只能绕过 → 面板残留旧内容。
+  if (!record) {
+    const el0 = $('#tree-content');
+    if (el0) el0.innerHTML = '<div class="muted-text">尚未进行交易分析</div>';
+    return;
+  }
   const payload = record.decision_tree;
   if (!payload) {
     el.innerHTML = '<div class="tree-empty">本轮分析未返回决策树路径</div>';
@@ -5468,6 +5498,32 @@ const READONLY_BLOCKED = [
 
 let _readOnly = false;
 
+/**
+ * 把所有「分析产出类」面板恢复到空态。
+ *
+ * 模式状态机（setDataMode）只负责 LED / 染色 / 只读，**不管面板内容** ——
+ * 状态与内容是两套东西。回到实时时若不重置，预测 / 决策树 / 决策 / 流式
+ * 四个面板会继续显示上一条记录的内容（2026-10-05 用户实机报告）。
+ *
+ * 统一调用各渲染函数的空态分支，而不是就地拼 innerHTML：
+ * 空态文案与结构只有一处定义，改文案不会漏。
+ */
+function resetAnalysisPanels() {
+  lastRecord = null;
+  try { renderStreamFromRecord(null); } catch (e) { console.warn('reset stream:', e); }
+  try { renderDecision(null); } catch (e) { console.warn('reset decision:', e); }
+  try { renderFuturePanel(null); } catch (e) { console.warn('reset future:', e); }
+  try { renderDecisionTree(null); } catch (e) { console.warn('reset tree:', e); }
+  try { renderTreeViz(null); } catch (e) { console.warn('reset tree-viz:', e); }
+  try { renderChatContext(); } catch (e) { console.warn('reset chat ctx:', e); }
+  // Token 进度条 / 流程条 / 用量行同属上一轮分析的产物。
+  // 注意：不要用 `updateFlowBarIdle?.()` —— 未声明的标识符即使加可选链
+  // 仍会抛 ReferenceError（可选链只对「已声明为 undefined」生效）。
+  try { updateTokenProgress(null); } catch (e) { /* 可选元素 */ }
+  try { hideFlowBar(); } catch (e) { /* 可选元素 */ }
+  try { renderTokenUsage(null); } catch (e) { /* 可选元素 */ }
+}
+
 function setPanelsReadonly(ro) {
   _readOnly = !!ro;
   // 用 attribute 而不是 classList：CSS 侧是 body[data-readonly] 属性选择器，
@@ -5898,10 +5954,18 @@ function renderDebug(record) {
 // reasoning_content + content 回显到 #stage1-* / #stage2-* DOM，
 // 并在 stream tab 顶部显示回看 banner 提示「以下为历史记录回显，非实时流」。
 function renderStreamFromRecord(record) {
-  if (!record) return;
-
   const streamTab = $('#tab-stream');
   if (!streamTab) return;
+  // 无记录时也要清理：此前直接 return，回看留下的 banner 与流式内容会一直留着
+  if (!record) {
+    streamTab.querySelectorAll('.replay-banner').forEach(el => el.remove());
+    const flow = $('#flow-bar');
+    if (flow) flow.classList.add('hidden');
+    const body = $('#stream-body') || $('#stream-content');
+    if (body) body.innerHTML = '';
+    renderChatContext();
+    return;
+  }
 
   // 1) 移除已存在的 .replay-banner（避免重复插入）
   streamTab.querySelectorAll('.replay-banner').forEach(el => el.remove());

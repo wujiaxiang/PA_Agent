@@ -297,9 +297,13 @@ async def get_bars(request: Request, count: int = 100):
             "volume": b.volume,
             "closed": bool(b.closed),
         })
+    # 回显的元数据必须与 bars 同一来源。此前这里读全局 settings，而 bars 取自
+    # 会话游标 → 多标签页下响应自相矛盾（symbol 说是 A 标的，bars 是 B 标的），
+    # 而前端正是靠这个字段判断当前图表品种。
     return {
-        "symbol": ctx.settings.general.last_symbol,
-        "timeframe": ctx.settings.general.last_timeframe,
+        "symbol": view_symbol or ctx.settings.general.last_symbol,
+        "timeframe": view_timeframe or ctx.settings.general.last_timeframe,
+        "exchange": view_exchange or ctx.settings.general.last_tradingview_exchange,
         "bars": bars,
     }
 
@@ -328,11 +332,13 @@ async def get_next_close(
     的未来周期边界时间戳，导致休市期间显示错误倒计时。
     """
     ctx = request.app.state.ctx
-    tf = timeframe or getattr(ctx.settings.general, "last_timeframe", "") or ""
-    # symbol / exchange are accepted for symmetry with /api/subscribe but
-    # are not strictly required — we read the forming bar from the
-    # current data source regardless.
+    # 优先级：**显式 query 参数 > 本会话游标 > 全局 settings**。
+    # 此前 tf 直接取 query 或全局，而下面取 bar 用的是会话游标 —— 两者可能
+    # 指向不同标的，于是倒计时按 A 的周期算、bar 取的是 B 的 K 线。
     view_symbol, view_timeframe, view_exchange = _resolve_view(request, ctx)
+    sym = symbol or view_symbol or getattr(ctx.settings.general, "last_symbol", "")
+    tf = timeframe or view_timeframe or getattr(ctx.settings.general, "last_timeframe", "") or ""
+    ex = exchange or view_exchange or getattr(ctx.settings.general, "last_tradingview_exchange", "")
     bars_raw = await asyncio.to_thread(
         ctx.data_source.latest_snapshot, 2,
         exchange=view_exchange or None,
@@ -341,7 +347,7 @@ async def get_next_close(
     )
     if not bars_raw:
         return {
-            "symbol": symbol or getattr(ctx.settings.general, "last_symbol", ""),
+            "symbol": sym,
             "timeframe": tf,
             "next_close_ts": None,
             "seconds_remaining": None,
@@ -351,7 +357,7 @@ async def get_next_close(
     ts_open_ms = int(getattr(forming, "ts_open", 0))
     if ts_open_ms <= 0:
         return {
-            "symbol": symbol or getattr(ctx.settings.general, "last_symbol", ""),
+            "symbol": sym,
             "timeframe": tf,
             "next_close_ts": None,
             "seconds_remaining": None,
@@ -362,7 +368,7 @@ async def get_next_close(
     is_market_closed = bool(getattr(forming, "closed", False))
     if is_market_closed:
         return {
-            "symbol": symbol or getattr(ctx.settings.general, "last_symbol", ""),
+            "symbol": sym,
             "timeframe": tf,
             "next_close_ts": None,
             "seconds_remaining": None,
@@ -375,7 +381,7 @@ async def get_next_close(
 
     next_close_ts = _compute_next_close_ts(ts_open_ms, tf)
     return {
-        "symbol": symbol or getattr(ctx.settings.general, "last_symbol", ""),
+        "symbol": sym,
         "timeframe": tf,
         "next_close_ts": next_close_ts,
         "seconds_remaining": seconds_remaining,

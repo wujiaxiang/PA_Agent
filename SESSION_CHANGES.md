@@ -209,6 +209,80 @@
 
 ## ✅ 已提交
 
+### 2026-10-05 · 模式切换残留审计 + 端到端测试补强（当前）
+
+**状态**：已提交 `（本提交）`
+
+#### 需求
+用户报告「历史切到实时，有的页面数据没有重置清空」。复现确认：
+`实时 → 回看 → 实时` 后 **预测 / 决策树 / 决策** 三个面板仍显示回看记录内容。
+同时用户指出：此前的需求**没有做完整的端到端测试**。
+
+#### 方案
+先修 bug，再补「断言内容」的 E2E —— 顺序不能反，否则测试只是在测刚写的实现。
+
+复现证据（同一浏览器会话内三段快照对比）：
+
+| 面板 | 实时(初始) | 回看中 | 返回实时后 |
+|---|---|---|---|
+| `#future-content` | 尚未进行交易分析 | 回看记录内容 | ❌ 残留 |
+| `#tree-content` | 尚未进行交易分析 | 回看记录内容 | ❌ 残留 |
+| `#decision-content` | 尚未进行交易分析 | 回看记录内容 | ❌ 残留 |
+
+根因：返回实时的处理器只做了 `clearOverlays` + `loadBars` + `setDataMode('live')`，
+**从未重置侧边栏各分析面板的 innerHTML**。模式状态机只管 LED / 染色 / 只读，
+不管面板内容 —— 状态与内容是两套东西，此前只有前者被测过。
+
+关于「没做完整端到端」的复盘：
+此前走查断言的全是**状态位**（面板可见、dataset 值、classList、消息条数），
+**没有一个断言「面板当前显示的内容是否属于当前模式」**。因此
+「实时→回看→实时」这条状态迁移从未被端到端走过 —— `replayRecord()` 与
+`btn-live` 在旧脚本里是两个独立步骤，没有串成一次迁移。
+
+#### 改动文件（写入范围）
+
+| 文件 | 改动 |
+|---|---|
+| `web/static/js/app.js` | 新增 `resetAnalysisPanels()`，回到 live 时统一重置各面板 |
+| `tests/e2e/test_modes_e2e.py` | **新增**：断言面板**内容**的模式正确性 |
+| `SESSION_CHANGES.md` / `CHANGELOG.md` / `AGENTS.md` | 记录 |
+
+#### 接口变更
+无新增 API。新增前端内部函数 `resetAnalysisPanels()`。
+
+#### 修复要点
+1. `renderDecision` / `renderFuturePanel` / `renderDecisionTree` 补 `record` 为空的
+   早退分支 —— 它们此前直接 `record.stage2_decision`，传 null 会抛 TypeError。
+   **这正是此前没人修的原因**：想用统一空态入口，但三个函数根本不支持 null
+2. `renderStreamFromRecord(null)` 此前是静默 `return`，改为清理 replay-banner、
+   flow-bar、消息体并刷新追问锚点
+3. `renderTokenUsage(null)` 同理，此前静默返回导致用量行残留
+4. 新增 `resetAnalysisPanels()` 统一调用上述空态分支 —— 不就地拼 innerHTML，
+   空态文案只有一处定义
+5. 返回实时处理器里的裸 `lastRecord = null` 换成 `resetAnalysisPanels()`
+
+#### 验证（含「测试能否抓到 bug」的反向验证）
+- 修复后：三个面板回到「尚未进行交易分析」
+- **把修复回退，E2E 精确变红**（`test_live_to_replay_to_live_*` 与
+  `test_demo_to_live_*` 两条），断言信息直接打印残留内容 —— 证明测试有效，
+  不是「写完就绿」的摆设
+- 该反向验证**顺带发现第二个 bug**：`Demo → 实时` 走的是另一分支，
+  同样有残留（原判断只覆盖了回看路径）
+- 单元回归：FAILED=40 ERROR=30
+
+#### 冲突风险 ⚠️
+- `web/static/js/app.js` 是多人热点文件；开工前已确认「进行中」区为空
+- **`tests/unit/test_multisession_contract.py` 出现 9 项新增失败，本会话未碰该文件**
+  （未跟踪的新文件，属多 Session 会话写入范围）。失败原因是文件**自身第 180 行
+  `IndentationError: unexpected indent`**，属对方会话尚未完工的在写状态，
+  非本轮引入。已如实登记，**不代为修改**
+- 部署过程中的自身失误（记录以免重犯）：临时验证用的 `docker commit` 漏写
+  `--change CMD`，把 `sleep infinity` 固化成镜像默认启动命令；另一次只覆盖
+  `web/static` 未覆盖 `pa_agent/`，导致容器内 `persist_patch` 缺失、
+  ImportError 起不来。**每次 commit 都必须显式重设 CMD，且静态与后端要么都覆盖
+  要么都不覆盖**
+- 既有 2 项 `test_routes_records.py` 不稳定失败与本轮无关
+
 ### 2026-10-05 · 配置级联事故处置会话（当前）
 
 **状态**：已提交 `2563bb8`

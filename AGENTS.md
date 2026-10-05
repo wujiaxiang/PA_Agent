@@ -131,6 +131,11 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
 - **CSS 属性选择器要用 attribute 设置**：用 `classList.toggle('data-x')` 加类名，CSS 侧 `body[data-x]` 属性选择器选不中，样式静默失效
 - **`#readonly-hint` 必须在 `#sidebar` 内部**：`#main` 是 row flex，放在外面会成为图表与侧边栏之间的第三个 flex item，占掉一整列宽度且不显示任何内容
 - **从 Demo 返回实时必须无条件重载 K 线**：Demo 覆盖主图数据却不改订阅，品种/周期可能与演示内容对不上，只清叠加层不够
+- **模式切换必须重置面板内容**：`setDataMode()` 只管 LED / 染色 / 只读，**不管内容** —— 状态与内容是两套东西。回到实时时必须调 `resetAnalysisPanels()`，它统一走各渲染函数的空态分支。**只置 `lastRecord = null` 是不够的**：面板 innerHTML 里仍留着上一条记录的渲染结果
+- **渲染函数必须能接受空记录**：`renderDecision` / `renderFuturePanel` / `renderDecisionTree` 直接访问 `record.stage2_decision`，传 null 会抛 TypeError；`renderStreamFromRecord(null)` / `renderTokenUsage(null)` 静默 return，同样不清内容。新增/修改任何「渲染某条记录」的函数都要显式处理 `!record`
+- **可选链只对「已声明为 undefined」生效**：写成 `updateFlowBarIdle?.()` 而该函数根本不存在时，仍会抛 ReferenceError。函数是否存在要用 `typeof x === 'function'` 判断，不要靠加 `?.` 蒙混
+- **端到端测试必须断言「内容」而非「状态位」**：面板可见 / dataset 值 / classList / 消息条数只能证明**机制触发**，不能证明**结果正确**。断言要看面板当前显示的内容是否属于当前模式，并把多个操作串成一条**状态迁移链**逐段验证（`replay → 返回实时` 必须是一次连续走查，不能拆成两个独立步骤）
+- **新写的测试要做「能否抓到 bug」的反向验证**：把修复回退，确认测试变红。没做过这一步的测试，无法区分「真的没问题」与「根本没测到」
 - **「分析」按钮自动选路**：有可复用上下文走增量、否则走完整，按钮文案与 tooltip 必须说明它会走哪条路。「强制完整」开关供用户覆盖
 - **按钮按域分组**：工具栏=数据流开关（仅「实时」）；侧边栏=分析控制（分析/等待收盘/持续分析/增量）
 - **持续分析联动规则**：开启时强制勾选并禁用「实时」+「等待收盘」（依赖 bar 收盘判定）；关闭时恢复可编辑

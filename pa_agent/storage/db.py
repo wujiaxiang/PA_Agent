@@ -23,7 +23,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
-from pa_agent.storage.schema import SCHEMA_VERSION, all_statements
+from pa_agent.storage.schema import (  # noqa: E501
+    MIGRATIONS as schema_migrations,
+    SCHEMA_VERSION,
+    all_statements,
+)
 
 logger = logging.getLogger("pa_agent.storage")
 
@@ -142,6 +146,15 @@ class _ConnectionHub:
             with conn:
                 for stmt in all_statements():
                     conn.execute(stmt)
+                # 增量迁移：补 CREATE TABLE IF NOT EXISTS 覆盖不到的新增列。
+                # 「duplicate column」是预期结果（重复运行），不算失败 ——
+                # 不靠版本号分支，保持迁移可重入。
+                for _table, stmt in schema_migrations:
+                    try:
+                        conn.execute(stmt)
+                    except sqlite3.OperationalError as exc:
+                        if "duplicate column" not in str(exc).lower():
+                            raise
                 conn.execute(
                     "INSERT INTO schema_meta (key, value) VALUES ('version', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
