@@ -1,7 +1,19 @@
 """SQLite DDL 与 schema 版本管理。
 
-DDL 以字符串内联而非 ``.sql`` 文件：Docker 镜像按目录 COPY（``web/Dockerfile:26``），
-独立 ``.sql`` 文件需要额外 COPY 步骤并引入打包路径问题，而字符串没有这个问题。
+## 为什么真源是 Python 常量而不是 .sql 文件
+
+运行时读的是本模块的字符串常量。独立 ``.sql`` 文件看着更「正统」，但 Docker
+镜像按目录 COPY（``web/Dockerfile:26``），``.sql`` 需要额外 COPY 步骤并引入
+包内路径解析问题 —— 而这里的 DDL 是**启动期必经路径**，解析失败等于整库不可用。
+拿可用性换一个形式上的统一，不划算。
+
+## 那 schema.sql 是什么
+
+``schema.sql`` 是**派生产物**，由 :func:`render_sql` 从本模块生成，供
+「手工重建 / 换机 / 审阅」使用。``test_storage_layer.py::test_schema_sql_matches_python``
+会逐句比对两者 —— **漂移即测试失败**，所以它不可能悄悄过期。
+
+要改表结构：**只改本模块**，然后跑 ``python -m pa_agent.storage.schema`` 重新生成。
 
 分级语义见 ``docs/SESSION_STORAGE_DESIGN.md`` §2：
 L1 无 user_id；L2 带 user_id 且多会话共享；L3 带 session_id 且为缓存级快照。
@@ -249,3 +261,48 @@ def tables() -> tuple[str, ...]:
         "users", "global_config", "user_prefs", "analysis_records",
         "experience_entries", "trade_records", "chat_turns", "sessions",
     )
+
+
+def render_sql() -> str:
+    """把全部 DDL 渲染成一个可直接执行的 SQL 脚本。
+
+    与 :func:`all_statements` 同源，故不存在「两份定义漂移」的可能。
+    输出含新建库与旧库增量两段，整体幂等。
+    """
+    head = (
+        "-- PA_AGENT 存储层：表结构\n"
+        "-- 由 pa_agent/storage/schema.py::render_sql() 生成，**请勿手改**\n"
+        "-- 改表结构请改 schema.py 后跑 `python -m pa_agent.storage.schema` 重建\n"
+        "-- 用法：sqlite3 records/pa_agent.db < schema.sql\n"
+        "-- 全部 IF NOT EXISTS，可重复执行。\n"
+    )
+    body = ["-- ===== 新建库 ====="]
+    body += [s.strip() + ";" for s in all_statements()]
+    body += [
+        "",
+        "-- ===== 旧库增量：不写进本文件 =====",
+        "-- CREATE TABLE IF NOT EXISTS 对**已存在**的表是空操作，所以老库补列靠",
+        "-- MIGRATIONS 里的 ALTER。那些 ALTER 由应用启动时的 db.py::migrate() 执行",
+        "-- （它显式容忍 duplicate column，可重复运行）。",
+        "--",
+        "-- **刻意不写进本文件**：上面 CREATE 已含这些列，写进来会让空库执行到",
+        "-- ALTER 时立刻报 duplicate column —— 手工重建直接失败。",
+        "--",
+    ]
+    for table, stmt in MIGRATIONS:
+        body += [f"-- [{table}] {stmt.strip()};"]
+    body += [
+        "",
+        f"-- schema 版本: {SCHEMA_VERSION}",
+        f"-- 表: {', '.join(tables())}",
+        "",
+    ]
+    return head + "\n".join(body) + "\n"
+
+
+if __name__ == "__main__":  # pragma: no cover - 维护脚本
+    import pathlib
+
+    out = pathlib.Path(__file__).with_name("schema.sql")
+    out.write_text(render_sql(), encoding="utf-8")
+    print(f"regenerated {out} ({len(tables())} tables, version {SCHEMA_VERSION})")

@@ -508,3 +508,65 @@ def test_snapshot_cache_is_bounded(tmp_path):
     for i in range(_SNAP_CACHE_MAX_ENTRIES + 20):
         s.latest_snapshot(10, symbol=f"SYM{i}")
     assert len(s._snap_cache_by_key) <= _SNAP_CACHE_MAX_ENTRIES
+
+
+# ── schema.sql 与 Python 真源的漂移守护 ────────────────────────────────────────
+
+
+def test_schema_sql_matches_python():
+    """schema.sql 是派生产物，**必须与 Python 真源逐句一致**。
+
+    没有这条，两者会悄悄漂移：改表结构只改了 Python，运维拿到的
+    schema.sql 仍是旧结构，手工重建出来的库缺列，而应用启动时又走
+    Python 定义 —— 两套结构并存，问题极难定位。
+    """
+    from pa_agent.storage.schema import MIGRATIONS, all_statements, render_sql
+
+    sql = render_sql()
+    for stmt in all_statements():
+        assert stmt.strip() + ";" in sql, f"schema.sql 缺少语句：{stmt[:60]}"
+    # 迁移必须以注释形式在册，但不能作为可执行语句 —— 否则空库重建会撞
+    # duplicate column（CREATE 里已经有这些列了）。
+    for _table, stmt in MIGRATIONS:
+        assert stmt.strip() in sql, f"迁移未在 schema.sql 中留档：{stmt[:50]}"
+
+
+def test_schema_sql_file_is_up_to_date():
+    """落盘的 schema.sql 必须等于 render_sql() —— 忘了重新生成就红。"""
+    from pathlib import Path as _P
+
+    from pa_agent.storage.schema import render_sql
+
+    on_disk = _P(__file__).resolve().parents[2] / "pa_agent/storage/schema.sql"
+    assert on_disk.exists(), "schema.sql 缺失；跑 python -m pa_agent.storage.schema 生成"
+    assert on_disk.read_text(encoding="utf-8") == render_sql(), (
+        "schema.sql 已过期；跑 python -m pa_agent.storage.schema 重新生成"
+    )
+
+
+def test_rendered_sql_builds_every_table_on_empty_db():
+    """渲染出的 SQL 能在空库上建出全部表。"""
+    import sqlite3
+
+    from pa_agent.storage.schema import render_sql, tables
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(render_sql())
+    got = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    missing = set(tables()) - got
+    assert not missing, f"渲染的 SQL 未建出这些表：{missing}"
+    conn.close()
+
+
+def test_migrate_tolerates_second_run(tmp_path):
+    """应用启动路径**必须**可重复跑（migrate 容忍 duplicate column）。
+
+    渲染出的裸 SQL 二次执行会报错 —— 这是刻意区分：手工重建跑一次即可，
+    而应用启动每次都要能重跑（容器重启、测试复用同一个库）。
+    """
+    from pa_agent.storage.db import reset_hub_for_tests
+
+    hub = reset_hub_for_tests(tmp_path / "twice.db")
+    assert hub.migrate() is True, "首次迁移失败"
+    assert hub.migrate() is True, "二次迁移失败 —— duplicate column 应当被容忍"
