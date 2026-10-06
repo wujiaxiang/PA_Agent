@@ -667,7 +667,18 @@ async function loadBars() {
 // 仅刷新 K 线数据（用于实时刷新，不重置 overlay）
 async function refreshBarsOnly() {
   try {
+    // ── 模式闸门（非实时模式一律不发请求）──────────────────────────────
+    // 回看 / Demo 下主图显示的是历史回放 / 合成数据，而 /api/bars 取的是
+    // **本会话游标的真实 K 线**：轮询每 5s 跑一次就把它们整片刷掉
+    // （实测：Demo 下 10s 内 lastBars[0].close 从 60500 变回真实的 1.5，
+    //  回看同理 —— applyReplayChart 结束时还主动把轮询重新开了）。
+    // 判据只有一个来源：setDataMode() 写的 dataMode。这里不再另立
+    // `_pollingPaused` 之类的事实源 —— 那样迟早会和模式状态分叉。
+    if (currentDataMode() !== 'live') return;
     const data = await API.get('/api/bars?count=100');
+    // 请求在途期间模式可能已经切走（用户恰好点了 Demo / 回看）：这一包响应
+    // 必须作废，否则它仍会在新模式上把主图刷成真实 K 线。
+    if (currentDataMode() !== 'live') return;
     lastBars = data.bars || [];
     // 分析期间暂停图表 K 线渲染（lastBars 仍然更新，保证持续分析的收盘判定
     // 用的是最新数据；分析结束后的 loadBars() 会把图表一次性刷新到位）
@@ -2014,6 +2025,13 @@ function updateAnalyzeButtonHint() {
 // intervalMs 参数保留给潜在的其它调用方，不传则读设置里的 refresh_interval_ms
 function startLiveRefresh(intervalMs) {
   stopLiveRefresh();
+  // 轮询只属于实时模式：回看 / Demo 下主图不是实时数据，启表等于每 5s 把
+  // 回放画面刷回真实 K 线（refreshBarsOnly 里还有一道同源的闸门兜底，
+  // 这里是让定时器干脆别存在）。判据同样取自 setDataMode() 写的 dataMode。
+  if (currentDataMode() !== 'live') {
+    updateLiveRefreshStatus();
+    return;
+  }
   const interval = intervalMs || (parseInt($('#s-refresh-ms').value) || 1000);
   // 限制最小 500ms，避免压垮后端
   const safeInterval = Math.max(500, interval);
@@ -2901,7 +2919,6 @@ async function startAnalysis(continuousMode = false, triggerSource = 'user') {
 
   setAnalyzeButtonState('analyzing');
   isAnalyzing = true;
-  chartUpdatePaused = true;
   showFlowBar();
 
   // Phase A Task 2.3：清除历史回看 banner，避免与新流式输出混淆
@@ -2925,6 +2942,12 @@ async function startAnalysis(continuousMode = false, triggerSource = 'user') {
   const continuousParam = continuousMode ? '&continuous=true' : '';
 
   try {
+    // 置位放在 try 的第一行，而不是上面：上面的清面板语句全是**无保护**的
+    // DOM 写（$('#future-content').innerHTML 等），其中任何一句抛异常都会
+    // 跳过 finally，把 chartUpdatePaused 永久留在 true —— 图表从此再也不
+    // 刷新，且 isAnalyzing 卡住会让 maybeTriggerContinuousAnalysis 的
+    // `if (isAnalyzing) return` 把后续所有分析一起挡掉。
+    chartUpdatePaused = true;
     const { controller, source } = API.sse(`/api/analyze/stream?bar_count=${barCount}${continuousParam}`);
     currentAnalysisStream = controller;
 
@@ -3274,7 +3297,6 @@ async function startIncrementalAnalysis(continuousMode = false, triggerSource = 
 
   setAnalyzeButtonState('analyzing');
   isAnalyzing = true;
-  chartUpdatePaused = true;
   showFlowBar();
 
   resetStageBlock(1);
@@ -3292,6 +3314,9 @@ async function startIncrementalAnalysis(continuousMode = false, triggerSource = 
   const continuousParam = continuousMode ? '&continuous=true' : '';
 
   try {
+    // 与 startAnalysis 同一处理：置位必须在 try 之内，否则上面那串无保护的
+    // DOM 写一旦抛异常就跳过 finally，chartUpdatePaused 永久卡在 true。
+    chartUpdatePaused = true;
     const { controller, source } = API.sse(`/api/analyze/incremental/stream?bar_count=${barCount}${continuousParam}`);
     currentAnalysisStream = controller;
 
@@ -5998,7 +6023,12 @@ const DATA_MODE_META = {
 
 function setDataMode(mode, subText) {
   const m = DATA_MODE_META[mode] ? mode : 'live';
+  const prev = dataMode;
   dataMode = m;
+  // 轮询的启停**从模式状态派生**，不另立标志位。放在赋值之后、渲染之前：
+  // 下面的 startSSEBarsStream/stopSSEBarsStream 会读 barsStreamPolling，
+  // 必须看到已经落定的 dataMode。
+  syncLiveRefreshWithDataMode(prev, m);
   const bar = $('#data-mode-bar');
   if (bar) bar.dataset.mode = m;
   const lbl = $('#dmb-label');
@@ -6043,6 +6073,45 @@ function setDataMode(mode, subText) {
 }
 
 function currentDataMode() { return dataMode; }
+
+/**
+ * 让「实时 K 线轮询」与数据源模式保持一致 —— 由 setDataMode() 在**模式真正
+ * 发生迁移时**调用，是轮询启停的唯一入口。
+ *
+ * 为什么必须在这里收口（而不是散落在 Demo 按钮 / 回看函数里各写一遍）：
+ *   · Demo：加载演示数据后主图被覆盖，但订阅没动、轮询也没停。实测点击
+ *     Demo 后推进 10s 仍有 2 次 /api/bars + 2 次 applyBarsToChart，
+ *     lastBars[0].close 从演示的 60500 变回真实行情 —— 演示画面 5 秒就没了。
+ *   · 回看：更隐蔽 —— applyReplayChart() 在对齐订阅后**主动**把轮询重新开了
+ *     （`if (wasLive) startSSEBarsStream()`），而它之后的 showReplayBadge()
+ *     才把模式置成 replay，于是回看同样被真实 K 线每 5s 覆盖。
+ * 两处的共同点是：模式状态只驱动 LED / 染色 / 只读，**没人回头管定时器**。
+ *
+ * 「要不要轮询」由两件事决定，都不是新的事实源：
+ *   · 模式（dataMode，唯一写入口是 setDataMode）
+ *   · 用户意图（#cb-live-refresh 勾选框，它是「实时」的数据流开关，
+ *     本来就只在实时模式下可用 —— 非实时模式它会被 setPanelsReadonly 禁用）
+ *
+ * 只在**迁移**时动作：首屏 setDataMode('live') 时 prev 已是 'live'，不动作，
+ * 启动流程保持原样（轮询仍由用户勾选「实时」开关来起）。
+ */
+function syncLiveRefreshWithDataMode(prev, next) {
+  if (prev === next) return;
+  try {
+    if (next !== 'live') {
+      // 无条件停：轮询流本身就是 liveRefreshTimer，两处都清才不会有残留
+      stopSSEBarsStream();
+      stopLiveRefresh();
+      return;
+    }
+    const cbLive = $('#cb-live-refresh');
+    const wantsLive = !!(cbLive && cbLive.checked);
+    if (wantsLive && !liveRefreshTimer) startSSEBarsStream();
+  } catch (e) {
+    console.warn('syncLiveRefreshWithDataMode:', e);
+  }
+}
+
 // 非实时模式（历史回看 / Demo）下，侧边栏是**只读**的。
 // 回看看到的是一份已归档的分析结果，Demo 是合成行情 —— 对着它们追问、
 // 验证经验、重跑分析都没有意义，还会把 Demo 数据写进记录或经验库。
@@ -6053,6 +6122,9 @@ const READONLY_BLOCKED = [
   '#btn-exp-verify', '#btn-exp-refresh',
   '#btn-history-refresh',
   '#cb-force-full', '#cb-wait-close', '#cb-keep-analysis',
+  // 「实时」开关是数据流开关，只在实时模式下有意义：回看 / Demo 下勾它
+  // 只会让状态条谎报「实时轮询」（startLiveRefresh 会拒绝起表）。
+  '#cb-live-refresh',
   '#btn-tree-viz-play',
   '#s-alert-on-order-opportunity',
 ];
