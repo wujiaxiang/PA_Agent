@@ -69,6 +69,48 @@ jobs:
           path: /tmp/pytest.log
           retention-days: 7
 
+  frontend:
+    name: 前端单测（Node / vm 直跑 app.js）
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # 与 unit test 独立：这批用 Node + vm + 最小 DOM 桩**真的执行** app.js/api.js，
+    # 不需要 Python 依赖，跑完是秒级。单独成 job 是为了让「前端测试挂了」在
+    # CI 界面上是一眼能看见的一行，而不是混在 pytest 的失败里。
+    #
+    # 为什么要接进 CI：AGENTS.md「测试必须接进 CI 才算数」。本轮新增的
+    # 历史列表竞态守卫、交易所标注与注入防护、游标回显、轮询模式共 38 条
+    # 前端测试曾一度只存在于仓库里 —— 每次改动照样没人被拦。
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Syntax check
+        run: node --check web/static/js/app.js
+
+      - name: Run frontend tests
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(tests/js/*.test.js)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "没有找到 tests/js/*.test.js —— 用例被删空了吗？"
+            exit 1
+          fi
+          failed=0
+          for f in "${files[@]}"; do
+            echo "::group::$f"
+            node "$f" || failed=1
+            echo "::endgroup::"
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "前端测试失败（见上方各分组）"
+            exit 1
+          fi
+          echo "全部 ${#files[@]} 个前端测试文件通过"
+
   e2e:
     name: 端到端测试（Playwright）
     runs-on: ubuntu-latest
