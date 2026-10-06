@@ -237,6 +237,25 @@ def _get_session(key: str) -> FreeChatSession | None:
     return entry["session"]
 
 
+def _current_user_id(request) -> str:
+    """本次请求的 user_id，取不到就回落默认用户。
+
+    身份判定本身在 ``web.api.auth_ctx.current_user_id``，那里保证「任何情况下
+    都不抛」（无令牌时回落 admin）。这里再包一层 try 是为了**不让身份模块的
+    任何异常冒泡进追问主流程**：追问已经拿到答案了，为一个 user_id 崩掉不值。
+    与 ``routes_analyze._request_user_id`` 同一口径。
+    """
+    try:
+        from web.api.auth_ctx import current_user_id
+
+        return current_user_id(request)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("follow-up anchor: user identity unavailable, using default: %s", exc)
+        from pa_agent.storage.db import DEFAULT_USER_ID
+
+        return DEFAULT_USER_ID
+
+
 def _record_matches_subscription(record, symbol: str, timeframe: str) -> bool:
     """True when *record* was produced for the (symbol, timeframe) this tab is on.
 
@@ -488,6 +507,9 @@ async def _resolve_anchor(request, ctx, state):
     if record is None:
         # Try to load latest from history for this tab's instrument. Offloaded:
         # on a cache miss this rglobs + parses records — blocking file I/O.
+        #
+        # **必须传 user_id**：分析记录是每用户私有的。追问锚点与增量锚点走的是
+        # 同一份正文 —— 不判归属就会在共享目录里挑出别人最新的一条记录当锚点。
         from pa_agent.records.analysis_history import find_latest_successful_record
 
         record = await asyncio.to_thread(
@@ -495,6 +517,7 @@ async def _resolve_anchor(request, ctx, state):
             symbol=view_symbol or "",
             timeframe=view_timeframe or "",
             exchange=view[2] or "",
+            user_id=_current_user_id(request),
         )
         # Only promote to the shared hint when it is genuinely the newest one;
         # previously any fallback clobbered a fresh in-memory record.

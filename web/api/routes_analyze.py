@@ -462,8 +462,21 @@ def _run_analysis(
                 symbol = view_symbol
                 timeframe = view_timeframe
                 exchange = view_exchange
+                # **必须传 user_id**：分析记录是每用户私有的。不传则取数层
+                # 无从判断归属，会在共享目录里挑出**最新的一条**——不管是谁的。
+                # 而 `build_incremental_stage1` 会把上一条记录的诊断**原文**
+                # 注入 `[2] assistant` 与 `[3] user` 的 previous_summary ⇒
+                # 非 admin 点「增量」会把 admin 的完整 stage1 推理灌进自己的
+                # 提示词，新记录还继承 admin 的诊断结论，且全程零报错。
+                #
+                # 用形参 `user_id` 而**不是** `_request_user_id(request)`：
+                # 本函数跑在线程池里，没有 request 可问 —— 身份必须由持有
+                # request 的异步入口在派发前取好传进来（见本函数 docstring）。
                 previous_record = find_latest_successful_record(
-                    symbol=symbol, timeframe=timeframe, exchange=exchange
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    exchange=exchange,
+                    user_id=user_id,
                 )
                 if previous_record is not None:
                     incremental_new_bar_count = count_new_bars_since_record(
@@ -673,7 +686,10 @@ async def analyze_incremental_stream(
     if symbol and timeframe:
         try:
             previous_record = find_latest_successful_record(
-                symbol=symbol, timeframe=timeframe, exchange=exchange
+                symbol=symbol,
+                timeframe=timeframe,
+                exchange=exchange,
+                user_id=_request_user_id(request),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("incremental precheck failed: %s", exc)
@@ -741,7 +757,10 @@ async def analyze_incremental_post(request: Request):
     if not symbol or not timeframe:
         raise HTTPException(status_code=400, detail="缺少品种/周期")
     previous_record = find_latest_successful_record(
-        symbol=symbol, timeframe=timeframe, exchange=exchange
+        symbol=symbol,
+        timeframe=timeframe,
+        exchange=exchange,
+        user_id=_request_user_id(request),
     )
     if previous_record is None:
         raise HTTPException(
