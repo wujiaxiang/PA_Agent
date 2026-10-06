@@ -22,6 +22,127 @@
 
 ## 🔴 进行中（有人正在改这些文件，不要动）
 
+### 2026-10-05 · 修两个用户隔离漏洞（PendingWriter 归属丢失 / DELETE 无用户作用域）
+
+**状态**：已完工（**未 commit**，按上级指示保留工作区改动）
+
+#### 需求
+修上一条目里登记为「提醒灯」的两个**生产写路径**隔离漏洞，并把提醒灯用例转正。
+
+#### 根因（实测，非猜测）
+
+1. **写入归属恒为 admin**：`orchestrator.submit(user_id=...)` 把 user_id 传给了
+   经验库，却**没传**给 `PendingWriter`；`_mirror_to_sqlite` 调
+   `upsert_record(record, raw=data, file_path=path)`，落库 `user_id` 恒为
+   `DEFAULT_USER_ID`。症状：非 admin 用户「分析成功、文件落盘、接口 200」，
+   而 `GET /api/records` 按 `current_user_id` 过滤 ⇒ **列表永远为空**。
+2. **`DELETE /api/records/{id}` 无用户作用域**：签名里没有 `request`，三重后果
+   ——受害者的**文件被删**（`unlink()` 只看路径）、**索引行删不掉**
+   （`repo_delete(stem)` 用仓储默认 `user_id='admin'`）、却回报
+   `db_deleted: true`（`hub.execute()` 返回「SQL 执行成功」不是「删掉了行数」，
+   0 行匹配也是 True）。
+
+#### 方案
+
+- **归属通道走「记录自带」而不是「每个调用点记得传」**：新增
+  `pending_writer._resolve_owner()`，解析顺序 = 显式入参 → `record.meta.user_id`
+  → `DEFAULT_USER_ID`。`two_stage._build_empty_record` 早就把 `submit()` 的
+  `user_id` 盖进了 `meta`（`schema.RecordMeta.user_id`），所以**主通道无需改
+  `two_stage.py` 的 12 处 `save_partial` 调用点**。
+- **`ON CONFLICT` 列清单补 `user_id`**：归属原先只在 INSERT 生效，同 record_id
+  复用时永远卡在首次写入的用户。
+- **`execute()` 的 rowcount：走「新增原语」而不是改返回类型**。新增
+  `DatabaseHub.execute_count()`（返回受影响行数 / `None`），`repositories.delete_record`
+  改用它并**保持返回类型 `bool`**，但语义变成「**确实删掉了行**」。
+
+#### 被否决的方案（后来人别重复踩）
+
+- ❌ **改 `execute()` 的返回类型 `bool → int`**：全仓 90+ 个调用点，且几乎全部
+  写成 `ok = execute(...)` / `return execute(...)`。`0` 与 `False` 同为假 ⇒
+  「删掉了 0 行」与「执行失败」再也分不开，且既有 `assert ... is True` 会静默
+  漂移。改成新增原语则**零调用方改动**。
+- ❌ **`repositories.delete_record` 返回 `(ok, rows_deleted)` 元组**：会撞
+  `tests/unit/test_storage_layer.py::test_delete_record` 的 `is True` 断言，
+  而 rowcount 对本端点用不上。留作下一轮。
+- ❌ **改 `two_stage.py` 的每个 `save_partial` 加 `user_id=`**：漏一个就是一条
+  静默落到 admin 名下的记录且不报错；且该文件正被并行会话改（`exchange`
+  参数）。读 `meta.user_id` 无竞态（`ctx.pending_writer` 是进程级单例，
+  靠实例字段存归属会在并发分析下互相串写）。
+- ❌ **「认不出归属就放行」**：等于把漏洞原样留下（DB 一抖动/刚播种完就照删不误）。
+
+#### 改动文件（写入范围）
+
+| 文件 | 改动 |
+|---|---|
+| `pa_agent/records/pending_writer.py` | 新增 `_resolve_owner()`；`_mirror_to_sqlite` 透传 `user_id`；`save_full`/`save_partial` 增加 **keyword-only** `user_id: str = ""` |
+| `pa_agent/storage/repositories.py` | `upsert_record` 的 `ON CONFLICT` 补 `user_id=excluded.user_id`；`delete_record` 改用 `execute_count`（返回类型仍是 `bool`，语义变「真删掉了」） |
+| `pa_agent/storage/db.py` | 新增 `execute_count()` 原语（**纯新增**，`execute()` 契约一字未动） |
+| `web/api/routes_records.py` | `delete_record` 加 `request: Request`；新增 `_delete_target_is_owned()` 判归属（取不到即 404，与「不存在」同形）；`repo_delete` 显式传 `user_id` |
+| `tests/unit/test_record_user_isolation.py` | 2 条提醒灯转正 + 新增 4 条（记录自带归属 / 回落默认用户 / ON CONFLICT 改归属 / 仓储 0 行不谎报 / 404 同形） |
+
+#### 接口变更
+
+- `PendingWriter.save_full(record, *, user_id="")`、
+  `PendingWriter.save_partial(record, reason, *, user_id="")` —— 新增**关键字参数**，
+  既有位置调用（GUI、`free_chat`、`two_stage`）全部不受影响。
+- `DatabaseHub.execute_count(sql, params) -> int | None` —— **新增**方法。
+- `DELETE /api/records/{id}` **新增 `request: Request`**（框架注入，不影响 URL）；
+  跨用户删除由 `200` 改为 **`404` + `detail="record not found"`**。
+  响应体字段 `ok` / `record_id` / `db_deleted` **形状不变**，但 `db_deleted`
+  的含义收紧为「**确实删掉了索引行**」。
+- 其余端点、`?offset` 之类均未变。
+
+#### 发现的第三个同类漏洞（**未修，只报告**）
+
+`pa_agent/records/analysis_history.py::find_latest_successful_record()`
+的签名是 `(symbol, timeframe, exchange, directory)` —— **根本没有 `user_id`**，
+归属在这一层不参与判断。实测：carol 的记录 + admin 的更新记录放同一目录，
+函数选中的是 **admin** 的那条。
+
+后果（生产写路径）：`routes_analyze.py:465`（增量锚点）、`:743`
+（增量预检 404 端点）、`routes_chat.py:491`（追问锚点回落）都调它且**不传
+用户**；而 `prompt_assembler.build_incremental_stage1` 会把
+`previous_record.stage1_response["content"]` **原文注入** `[2] assistant`。
+⇒ **carol 点「增量」会把 admin 的完整 stage1 推理灌进自己的提示词**，
+并让新记录继承 admin 的诊断结论。全程零报错。
+
+**为什么本轮不修**：① `routes_analyze.py` 正被并行会话改；②
+`analysis_history.py` 是 GUI 共享模块（桌面端无 user 概念），改签名要同时
+评估桌面路径；③ 「跨用户共享历史」与「记录按用户隔离」本身存在**设计口径**
+冲突（AGENTS.md 称历史是 L2 跨会话共享资产，但 `GET /api/records` 明确按
+`current_user_id` 过滤）—— 需要先定口径再改。
+
+#### 反向验证（逐项单独回退，只看「撤掉哪处哪条红」）
+
+| 回退 | 变红 |
+|---|---|
+| A `_resolve_owner` 恒返回 admin | 8 条（含两条 ① 提醒灯 + 既有的 4 条跨用户用例） |
+| A2 `ON CONFLICT` 去掉 `user_id` | **精确 1 条** `test_upsert_record_conflict_updates_ownership` |
+| B 去掉归属判断 + `repo_delete` 不传 user_id | **精确 2 条** 两条 ② 提醒灯 |
+| C `delete_record` 改回 `execute()` | **精确 1 条** `test_repo_delete_reports_false_when_nothing_matched` |
+
+#### A/B 结果
+
+- 已提交用例（`git ls-files tests/unit`，133 个文件）：修复前 **25 失败** →
+  修复后 **25 失败**，**差集为空**（新增失败 0）。
+- 全量 `tests/unit`：修复后 25 失败，**与上面 25 条完全一致**，新增 0。
+
+#### 冲突风险
+
+- 本会话**未改** `pa_agent/orchestrator/two_stage.py`、`web/static/js/app.js`、
+  `experience_*`、`order_followup`、`routes_analyze`。开工前已把它们的
+  `git diff` 存档到 `/tmp/isofix/*.pre.patch`，回滚只挑自己那几行。
+- `tests/unit/test_record_user_isolation.py` 由上一条目创建，本条目在其基础上改；
+  期间观察到另一会话把 `_isolated_db` 夹具的 `close_all()` 换成了
+  `reset_hub_for_tests(...)` —— 那部分**未被我覆盖**，原样保留。
+- **既有失败（非本会话造成，勿误判）**：`tests/unit/test_routes_records.py::
+  test_list_records_returns_200`（`order_type` 形状断言，属存量红），
+  以及 `test_decision_continuity` / `test_free_chat_*` / `test_deepseek_client`
+  等共 25 条。
+- **既有 flake**：`tests/unit/test_auth_placeholder.py::test_tampered_payload_rejected`
+  按签发时刻浮动（签名覆盖含 `iat` 的 payload，`iat` 每秒变）。实测 20000 次里
+  17 次篡改后仍然通过（≈1/1176），与本次改动**无关**（未碰任何令牌代码）。
+
 ### 2026-10-05 · 修「全部品种」历史列表被过期响应覆盖 + 记录读写/用户隔离测试
 
 **状态**：已完工（**未 commit**，按上级指示保留工作区改动）

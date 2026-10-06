@@ -6,6 +6,130 @@
 
 ## 2026-10-06
 
+### 16. 增量锚点按 user_id 过滤 —— 跨用户推理泄漏（安全）
+
+- **问题**：用户报告「历史按当前品类查不到」，审计顺藤摸出一个不可察觉的污染源
+- **根因**：`analysis_history.find_latest_successful_record()` 签名里**没有
+  `user_id`**，而它是「增量分析」与「追问」的锚点入口。实测复现：同目录放
+  carol 的记录与 admin 的更新记录，函数选中的是 **admin** 那条 ⇒
+  `build_incremental_stage1` 把 admin 的完整 stage1 诊断注入 carol 的提示词，
+  新记录还继承 admin 的诊断结论 → 污染经验库 → 进检索端。**全程零报错**，
+  carol 只看到「分析跑成功了」
+- **注入点比预想的多**：`stage1_response["content"]` 原文只是**兜底分支**，
+  因「成功记录」要求 `stage1_diagnosis` 非空而**永不触发**。真实通道是
+  `stage1_diagnosis` → `[2] assistant`，以及 diagnosis/decision/meta →
+  `[3] user` 的 `previous_summary`
+- **修复**：加 `user_id` 参数，三档语义沿用仓库约定（`None` 不过滤 /
+  `""` 回落默认用户 / 有值精确匹配）。`pa_agent/gui/` **零字节 diff**
+  —— GUI 走 `None` 即改造前原语义。走库优先，扫盘保留为**同样带过滤**的降级
+  回落。存量记录归 `admin`（与写入端 `_resolve_owner` 逐字一致，否则同一批
+  记录会「列表可见、锚点不可见」）
+- **测试**：断言**提示词内容**而非返回值；泄漏断言**刻意排在归属断言之前**，
+  否则回退时只会在「拿到的不是 carol」那里红、泄漏本身永远看不见。另设对照
+  用例断言哨兵在拿错记录时确实出现，防止主用例因哨兵走不到而恒绿。**不 mock**
+  `build_incremental_stage1`（注入发生在它内部）
+- **文件**：`pa_agent/records/analysis_history.py`、`web/api/routes_analyze.py`、
+  `web/api/routes_chat.py`、`tests/unit/test_incremental_anchor_user_scope.py`
+- **提交**：`fc0e8afd`
+
+### 15. 非实时模式停轮询 —— Demo/回看被真实 K 线覆盖
+
+- **问题**：用户报「定时刷新 K 线把分析都中断了，demo 页面也会被刷新」
+- **根因**：`setDataMode()` 只改 LED/染色/只读，**从不回头管定时器**。5 秒后
+  `refreshBarsOnly` 照发 `/api/bars`（本会话游标的真实 K 线），
+  `applyBarsToChart` 覆盖主图。实测 Demo 下 `lastBars[0].close` 从演示的
+  **60500** 变回真实的 **1.5**。回看同样中招且更隐蔽：`applyReplayChart`
+  对齐订阅后**主动重开轮询**，而置 replay 模式的 `showReplayBadge` 跑在它之后
+- **一并修**：`chartUpdatePaused = true` 原写在 `try` **之前**，其上方是一串
+  无保护的 DOM 写，任何一句抛异常就跳过 `finally` ⇒ 标志**永久 true**
+  （图表再也不刷新）+ `isAnalyzing` 卡死把后续所有分析一起挡掉
+- **「分析被中断」实测复现不出来**：分析在途推进 15s，`/api/bars` 照发但
+  `applyBarsToChart` **0 次**、`abort()` **0 次**、流式面板 DOM 逐字不变、
+  结束后恰好补 1 次写图且图续上。服务端亦无中止路径。轮询与流式渲染不抢
+  同一块 DOM（token 流写侧边栏 vs canvas + `#chart-legend`）
+- **设计约束**：轮询启停**从 `dataMode` 派生**，不引入 `_pollingPaused`
+  之类第二事实源 —— 本轮几个 bug 的族根就是两个事实源打架
+- **文件**：`web/static/js/app.js`、`tests/js/test_live_refresh_modes.test.js`
+- **提交**：`6c4e6ee`
+
+### 14. 历史列表：响应竞态 + 交易所标注 + 游标回显
+
+- **问题**：勾「全部品种」能查到、按当前品类查不到
+- **竞态根因**：`loadHistoryList()` 4 个触发点**全部不 await**，
+  `renderHistoryList` 就地覆写 innerHTML —— 先发的过滤请求晚于后发的无过滤
+  请求返回时，0 条把 25 条抹成「暂无历史记录」。真实 Chromium 上确定性复现
+- **交易所标注**：同代码不同交易所的记录**长得一模一样**，正是这次查不出来
+  没人能自查的原因。取 `GET /api/tv/exchanges` 的 label（前端不另抄映射，
+  抄一份必然与后端漂移）
+- **游标回显**：`setCursorSelect` 让 `dataset.current` 做权威载体 —— 选项未就位
+  则挂起（这正是「先 settings 后 exchanges」顺序的用途），对不上则**显式报错**，
+  不再静默落到「自动（探测）」或首项
+- **文件**：`web/static/js/app.js`、`web/static/css/style.css`、
+  `tests/js/test_history_list.test.js`、`tests/js/test_history_exchange.test.js`、
+  `tests/js/test_exchange_echo.test.js`
+- **提交**：`24a57cb`
+
+### 13. 分析记录写错交易所 —— 根因不在路由层
+
+- **问题**：页面订阅 `NASDAQ/NVDA/5m`，落库却是 `GATEIO/NVDA/5m`，
+  三元组精确匹配必然 0 条
+- **根因**：`two_stage._build_empty_record` 从**冻结**的
+  `settings.general.last_tradingview_exchange` 取值。而 `KlineFrame`
+  **根本没有 exchange 字段**、`build_display_frame` 也不收该参数 ⇒
+  `view_exchange` **没有通道**流到 `record.meta.exchange`，
+  **完整分析路径与增量路径都受影响**
+- **修复**：`submit()`/`_build_empty_record` 显式收 `exchange`；增量端点改用
+  `resolve_view(ctx, session_id_of(request))`
+- **文件**：`pa_agent/orchestrator/two_stage.py`、`web/api/routes_analyze.py`
+
+### 12. 修两个用户隔离漏洞：写入归属恒落 admin + DELETE 无用户作用域：写入归属恒落 admin + DELETE 无用户作用域
+
+- **问题**：两个**生产写路径**上的真实隔离漏洞，全程零报错
+  1. 非 admin 用户「分析成功、文件落盘、接口 200」，但
+     `GET /api/records` **列表永远为空**
+  2. 任何登录用户拿别人的 `record_id` 调 `DELETE /api/records/{id}`，
+     **受害者的文件会被删掉**
+- **根因**（bug 修复）：
+  1. `orchestrator.submit(user_id=...)` 把 user_id 传给了经验库，却**没传**给
+     `PendingWriter`；`_mirror_to_sqlite` 调 `upsert_record(record, raw=data,
+     file_path=path)`，落库 `user_id` 恒为 `DEFAULT_USER_ID`。且
+     `upsert_record` 的 `ON CONFLICT` 列清单**不含 `user_id`** —— 归属只在
+     INSERT 时生效，同 record_id 复用时永远卡在首次写入的用户
+  2. `delete_record(record_id)` 签名里**没有 `request`**，拿不到调用者身份：
+     `target.unlink()` 只看路径不看归属；`repo_delete(stem)` 用仓储默认
+     `user_id='admin'` 所以匹配 0 行；而 `hub.execute()` 返回的是
+     「**SQL 执行成功**」不是「删掉了行数」，于是接口**谎报** `db_deleted: true`
+- **修复**：
+  - `pending_writer._resolve_owner()`：归属解析顺序 = 显式入参 →
+    `record.meta.user_id` → `DEFAULT_USER_ID`。主通道走「**记录自带**」，
+    因此**不需要**改 `two_stage.py` 十余处 `save_partial` 调用点
+    （漏一个就是一条静默落 admin 且不报错的记录）
+  - `save_full` / `save_partial` 新增 **keyword-only** `user_id: str = ""`，
+    桌面 GUI / `free_chat` / `two_stage` 的既有位置调用零影响
+  - `upsert_record` 的 `ON CONFLICT` 补 `user_id=excluded.user_id`
+  - `DELETE /api/records/{id}` 新增 `request: Request`；删之前用
+    `get_record_detail(user_id=…, file_path=…)` 判归属，取不到即 **404**
+    （与「记录不存在」**逐字同形**，避免确认某 id 存在而泄露信息）；
+    `repo_delete` 显式传 `user_id`
+  - 新增 `DatabaseHub.execute_count()`（返回受影响行数 / `None`），
+    `repositories.delete_record` 改用它并**保持返回类型 `bool`**，但语义收紧为
+    「**确实删掉了行**」—— 0 行匹配不再上报成功
+- **为什么不改 `execute()` 的返回类型**：全仓 90+ 调用点几乎全部写成
+  `ok = execute(...)` / `return execute(...)`；`0` 与 `False` 同为假，
+  改类型会让「删掉了 0 行」与「执行失败」再也分不开。改成新增原语，
+  `execute()` 契约一字未动、**零调用方改动**
+- **文件**：`pa_agent/records/pending_writer.py`、
+  `pa_agent/storage/repositories.py`、`pa_agent/storage/db.py`、
+  `web/api/routes_records.py`、`tests/unit/test_record_user_isolation.py`
+- **顺带发现，未修**：`analysis_history.find_latest_successful_record()`
+  **签名里没有 `user_id`** ⇒ 「增量分析」与「追问」的锚点会选中**别人**的记录，
+  而 `build_incremental_stage1` 会把上一条的 stage1 推理原文注入提示词。
+  实测 carol 的锚点选中的是 admin。因涉及 `routes_analyze.py`（并行会话在改）
+  与「跨用户共享历史」的设计口径，留待下一轮（详见 SESSION_CHANGES.md）
+- **提交**：（未 commit）
+
+## 2026-10-06
+
 ### 11. 鉴权从占位变成真能用（登录 / 登出 / 身份 + 强制鉴权开关翻 False）
 
 - **目标**：`ALLOW_ANONYMOUS_ADMIN` 一直是 `True`，且**全仓没有任何代码读它**

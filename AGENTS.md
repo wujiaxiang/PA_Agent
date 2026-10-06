@@ -440,6 +440,35 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
   只看到一条而无从解释）
 - **测试播种必须双写**：只 `write_text` 不走 `upsert_record`，读端只查库后会
   全部拿到空列表。`tests/unit/test_routes_records.py::_write_record` 已内置镜像
+- **写入归属必须走「记录自带」这条通道**（2026-10-06 修漏洞）：
+  `PendingWriter._resolve_owner()` 的解析顺序 = 显式入参 →
+  `record.meta.user_id` → `DEFAULT_USER_ID`。主通道是第 2 步
+  （`two_stage._build_empty_record` 早就把 `submit()` 的 user_id 盖进了
+  `RecordMeta.user_id`）。**不要**改成「要求每处 `save_partial` 都记得传
+  `user_id=`」：漏一个就是一条静默落到 admin 名下、用户列表永远为空、
+  **且不报错**的记录。`ctx.pending_writer` 是进程级单例，把归属挂在实例
+  属性上会在并发分析下互相串写，故只能做成参数
+- **`upsert_record` 的 `ON CONFLICT` 列清单必须含 `user_id`**：归属只在 INSERT
+  时生效的话，同 record_id 复用时永远卡在首次写入的那个用户
+- **`DELETE /api/records/{id}` 必须判归属**：`request: Request` 是必需的，
+  删之前用 `get_record_detail(user_id=…, file_path=…)` 过一遍，取不到即 404。
+  「不属于你」与「不存在」必须**逐字同形**（同一 status + 同一 detail）——
+  区分开等于向探测者确认某个 record_id 确实存在
+- **`hub.execute()` 返回的是「SQL 执行成功」，不是「影响了多少行」**：
+  `DELETE ... WHERE` 匹配 0 行同样返回 `True`。**绝不可**拿它当「删掉了」的
+  证据上报 —— 那会让接口在跨用户删除时**谎报** `db_deleted: true`。需要行数
+  请用新增的 `execute_count()`（返回 `int | None`，`None`=写失败、`0`=成功但
+  没匹配，两者必须分开看）。**不要**改 `execute()` 的返回类型：全仓 90+
+  调用点几乎全是 `ok = execute(...)` / `return execute(...)`，`0` 与 `False`
+  同为假会把「0 行匹配」与「执行失败」永远焊在一起
+- ⚠️ **尚未修的同类漏洞（2026-10-06 登记）**：
+  `pa_agent/records/analysis_history.py::find_latest_successful_record()`
+  的签名是 `(symbol, timeframe, exchange, directory)` —— **没有 `user_id`**。
+  它是「增量分析锚点」（`routes_analyze.py`）与「追问锚点回落」
+  （`routes_chat.py`）的取数入口，而 `prompt_assembler.build_incremental_stage1`
+  会把 `previous_record.stage1_response["content"]` **原文注入**提示词
+  ⇒ 非 admin 用户点「增量」会把 admin 的完整 stage1 推理灌进自己的上下文。
+  新增任何「按标的找上一条记录」的入口时，**必须先确认它带 user_id 过滤**
 
 ### 侧边栏 tab 分组与子 tab
 
