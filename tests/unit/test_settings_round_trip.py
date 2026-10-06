@@ -5,15 +5,25 @@ from unittest.mock import patch
 
 import pytest
 from pathlib import Path
-from pa_agent.config.settings import Settings, load_settings, save_settings
+from pa_agent.config.settings import (
+    AIProviderSettings,
+    Settings,
+    load_settings,
+    save_settings,
+)
 
 
 def test_defaults(tmp_path):
-    """load_settings on a missing file returns defaults and creates the file."""
+    """load_settings on a missing file returns defaults and creates the file.
+
+    断言对照 ``AIProviderSettings()`` 的实例默认值而非硬编码字符串：
+    出厂网关已从 api.deepseek.com 切到本地网关（2026-10-06），把字符串写死在
+    这里会让「改默认值」必然连带改测试，而这类默认值变更本该由本测试守住一致性。
+    """
     p = tmp_path / "settings.json"
     s = load_settings(p)
-    assert s.provider.model == "deepseek-v4-flash"
-    assert s.provider.base_url == "https://api.deepseek.com"
+    assert s.provider.model == AIProviderSettings().model
+    assert s.provider.base_url == AIProviderSettings().base_url
     assert s.provider.thinking is True
     assert s.provider.reasoning_effort == "high"
     assert s.provider.context_window == 2_000_000
@@ -61,7 +71,7 @@ def test_corrupt_json_returns_defaults(tmp_path):
     p = tmp_path / "settings.json"
     p.write_text("{not valid json", encoding="utf-8")
     s = load_settings(p)
-    assert s.provider.model == "deepseek-v4-flash"
+    assert s.provider.model == AIProviderSettings().model
 
 
 def test_missing_api_key_leaves_api_key_blank(tmp_path):

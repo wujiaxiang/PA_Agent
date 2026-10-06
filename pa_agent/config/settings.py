@@ -29,9 +29,14 @@ class AIProviderSettings(BaseModel):
     # 且不依赖对缓存 TTL 的猜测。设为 false 可关闭。
     prompt_cache_prime: bool = True
 
-    model: str = "deepseek-v4-flash"
-    base_url: str = "https://api.deepseek.com"
-    api_key: str = ""
+    # 出厂默认网关（2026-10-06 起）。原先指向 api.deepseek.com / deepseek-v4-flash，
+    # 该服务不再使用；而 `config/settings.json` 在 .gitignore 中，clone 后根本没有，
+    # 于是任何依赖代码默认值的路径都会连到一个无效端点。这里与 settings.json 保持
+    # 一致，让「无配置时的兜底」也指向真实可用的网关。
+    model: str = "space-bunny-free"
+    base_url: str = "http://192.168.2.128:8093/v1"
+    # 网关本身忽略鉴权，但 OpenAI SDK 要求 api_key 非空，否则构造客户端即抛错
+    api_key: str = "not-needed"
     thinking: bool = True
     reasoning_effort: Literal["low", "medium", "high", "max"] = "high"
     context_window: int = 2_000_000

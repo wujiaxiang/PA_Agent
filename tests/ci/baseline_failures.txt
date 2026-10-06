@@ -1,22 +1,5 @@
-# 已知失败基线 —— 只对**新增**失败红（见 tools/ci_diff_baseline.py）
 #
-# 为什么需要：CI 不可能永远全绿。直接接 pytest 会让 CI 永久红 → 所有人
-# 开始忽略 CI → 等于没有 CI。基线把存量失败降级为警告，只拦真正的新回归。
-#
-# ⚠️ 本文件必须以**已提交的干净状态**为基准生成，绝不能用脏工作区：
-#   2026-10-05 实测教训 —— 曾在多会话并行、别人正重构未提交时生成，
-#   把 40 项「别人半成品造成的失败」当成存量记了进来。于是 CI 对这 40 项
-#   真实回归保持绿灯，基线反而替未完成的代码背了书。
-#   纯净 HEAD 实测只有 32 项失败，脏工作区却是 102 项。
-#
-# 生成方式（在干净 HEAD 上）：
-#   git archive HEAD | tar -x -C /tmp/head && cd /tmp/head
-#   pytest tests/unit --tb=no -q | grep '^FAILED ' | sed 's/^FAILED //; s/ - .*$//'
-#
-# 维护：存量修好后本脚本会提示哪些项可移除；确认是预期内的新失败时追加进来。
-# 本文件只是快照，不替代修测试。
-#
-# 基准：纯净 HEAD（b0487d1）· 32 项 · 2026-10-05 15:02
+# 基准：默认网关切换为 8093/space-bunny-free 后的状态 · 24 项 · 2026-10-06 20:54
 tests/unit/test_coherence_checks.py::test_structural_inside_outside_mismatch_still_errors_in_strict
 tests/unit/test_decision_continuity.py::test_audit_relation_flip_label
 tests/unit/test_decision_continuity.py::test_build_continuity_context_auto_cancels_after_3_bars_unfilled_limit
@@ -24,7 +7,6 @@ tests/unit/test_decision_continuity.py::test_build_continuity_context_auto_cance
 tests/unit/test_decision_continuity.py::test_build_continuity_context_auto_cancels_on_direction_change_unfilled_limit
 tests/unit/test_decision_nodes_judges.py::test_normalize_stage2_upgrades_9_0_for_planned_limit
 tests/unit/test_deepseek_client.py::test_chat_kkai_sends_thinking_object_not_reasoning_effort
-tests/unit/test_deepseek_client.py::test_chat_kkai_thinking_off_sends_no_thinking_params
 tests/unit/test_deepseek_client.py::test_stream_kkai_passes_thinking_extra_body
 tests/unit/test_free_chat_keeps_reasoning_when_toggled.py::TestFreeChatKeepsReasoningWhenToggled::test_followup_assistant_keeps_reasoning_in_api_when_toggled
 tests/unit/test_free_chat_keeps_reasoning_when_toggled.py::TestFreeChatKeepsReasoningWhenToggled::test_previous_turns_keep_reasoning_in_api

@@ -64,6 +64,9 @@ def test_apply_cursor_provider_forces_openclaw_cs_model() -> None:
     from pa_agent.config.settings import Settings
 
     settings = Settings()
+    # 同上：本用例守护的是「强制指定 CS 模型」，与出厂 api_key 无关，
+    # 显式置空以免默认值变更把它带绿/带红。
+    settings.provider.api_key = ""
     settings.provider.model = "openclaw_cs"
     settings.provider.base_url = "http://127.0.0.1:1/v1"
 
@@ -112,6 +115,11 @@ def test_apply_cursor_rejects_openclaw_and_wb_hints() -> None:
     from pa_agent.config.settings import Settings
 
     settings = Settings()
+    # 显式清空 api_key：本用例测的是「没有 Cursor Key 时必须报错」。若依赖
+    # AIProviderSettings 的出厂默认值，则出厂 api_key 一旦改成非空（例如网关
+    # 忽略鉴权时填的占位值），本用例就会静默失去意义 —— 它守护的是拒绝逻辑，
+    # 不该被一个与之无关的默认值变更带绿。
+    settings.provider.api_key = ""
     with patch("pa_agent.ai.qclaw_connector.detect_qclaw", return_value=True):
         err_openclaw = apply_cursor_provider_to_settings(
             settings,

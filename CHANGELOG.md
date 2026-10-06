@@ -528,6 +528,24 @@ Stage 2 提示词（`<experience_review>` 块出现）→ 案例块 JSON 合法�
 - **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
 - **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
+### 31. 出厂默认网关切到 8093 / space-bunny-free（含一次误判的记录）
+
+用户报告「推理报错」。排查出模型/网关指向失效，并要求把**文件与代码两处**默认配置都切过去。
+
+- **症状**：容器 `/api/health` = `degraded`，`model_api` 报 `400 Model is unavailable`；而 `data_source` 正常（TradingView 能取到 bar）⇒ 排除网络与数据源，指向模型本身
+- **⚠️ 排查中的一次误判（记录下来）**：初次探测的是配置里 `base_url` 所指的 **8094**（带 `/zen/go/v1` 前缀），其模型列表里只有 `space-bunny`、没有 `-free`，于是断言「模型名写错了」。用户指出应为 **8093** 后实测：**8093 上确实有 `space-bunny-free`**。
+  **教训：不同网关的模型命名不同。断言「模型不存在」前必须先确认 `base_url` 指向的到底是哪个网关，不能凭端口相近就下结论**
+- **改了三处**：`config/settings.json` 的 provider 段（**仅 4 个字段，未整段替换**，其余 7 段与 `prompt_cache_prime`/`thinking`/`context_window` 等 11 个字段完好）、DB user overrides、`AIProviderSettings` 工厂默认值
+- **踩坑**
+  - **`_apply_llm_source` 会整段作废 provider 覆盖**：`use_custom` 为假时，用户对 provider 的覆盖**全部丢弃**（「跟随系统默认」）。首次只写 `model` 没写 `use_custom` ⇒ 改动被静默丢弃、服务照旧。必须显式带 `use_custom: true`
+  - **`save_overrides(patch, user_id)` 参数顺序**与记忆中的 `(user_id, patch)` 相反 ⇒ 把 dict 当 user_id 绑给 SQLite，报 `type 'dict' is not supported`
+- **顺带修好我自己引入的 2 项回归**：`api_key` 默认值改为非空占位符后，`test_cursor_agent_route.py` 两项变红 —— 它们靠「默认 api_key 为空」断言 Cursor 路由会拒绝。**默认值变更不该让守护拒绝逻辑的用例静默失去意义**，已改为显式 `api_key = ""`
+- **测试断言去硬编码**：`test_settings_round_trip.py` 两项把出厂默认值写死成字符串，改为对照 `AIProviderSettings()` 实例 —— 这类默认值变更本就该由该测试守住一致性
+- **验证（实测）**：容器内 `resolve` = 8093/space-bunny-free；容器内真实推理 ✓ `content='已切换'`；**纯文件兜底**（不依赖 DB、单独构造客户端）✓；代码默认值直接构造客户端 ✓；启动后错误数 0
+- **回归**：24 失败 / 0 error，**无新增失败**，较基线少 1（`test_deepseek_client` 那项已修好并已从基线移除）
+- **文件**：`pa_agent/config/settings.py`、`tests/unit/test_settings_round_trip.py`、`tests/unit/test_cursor_agent_route.py`、`tests/ci/baseline_failures.txt`
+- **接口变更**：`AIProviderSettings` 出厂默认 `model`/`base_url`/`api_key` 三项（`config/settings.json` 在 .gitignore 中，本次不入库）
+
 ### 30. 修 CI 基线的两个自伤缺陷（误报 + 基线取自脏工作区）
 
 上一条把 E2E 与单测接进 CI 后排查 72 项失败，发现主体来自**别人未提交的重构**，
