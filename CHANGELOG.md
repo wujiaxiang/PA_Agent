@@ -4,6 +4,31 @@
 
 ---
 
+## 2026-10-07
+
+### 32. 修 DB baseline 的坏网关组合 + override 被静默丢弃 + CHANGELOG 日期节重排
+
+- **问题**：推理再次报 `400 Model is unavailable`，排查发现配置**四层不一致**
+- **根因**：
+
+  | 层 | base_url | model | 结论 |
+  |---|---|---|---|
+  | DB baseline | `8094/zen/go/v1` | `space-bunny-free` | **8094 无此模型 → 400** |
+  | `config/settings.json` | `8093/v1` | `space-bunny-free` | ✓ |
+  | `AIProviderSettings` 代码默认 | `8093/v1` | `space-bunny-free` | ✓ |
+  | DB override | `8093/zen/v1` | — | **缺 `use_custom` → 被整段丢弃** |
+
+  baseline 是 10-05 19:56 写入的**从未修过**（上一轮我修的是 override/文件/代码默认值，baseline 遗漏了）；而 override 后来被覆盖成「只带 base_url、不带 use_custom」，被 `_apply_llm_source` 整段作废 —— 两层都失效，实际生效的是坏的那层
+- **修复**：baseline 与 override 都改为 `8093/v1` + `space-bunny-free`（override 显式补 `use_custom: true`）；只改 `provider.base_url`/`model`，整份合并回写，**8 个顶层段 / 11 个 provider 字段均未丢失**
+- **验证**：容器内真实推理 ✓ `content='恢复'`；`health` 的 `model_api` 连续 3 次 `ok`；修复后 0 次 `Model is unavailable`
+- **排查中的误判**：我先用 `grep -q '"choices"'` 判断三个网关路径是否可用，**输出被截断到 120 字符导致三条全判为失败**（其中两条其实是成功的）。**判定成功的脚本必须解析完整 JSON，不能 grep 被截断的字符串**
+- **顺带修文档**：`config/README.md` 的 provider 默认值表写的是 `deepseek-chat` / `api.deepseek.com` / `context_window 128000`，与实现完全脱节，且仍记录着**已删除的字段** `api_key_encrypted`。已按 `AIProviderSettings()` 实测值重写，补上表中缺失的 `use_custom`（整段作废那个开关）与 `prompt_cache_prime`，并加「配置真源在 DB」的醒目提示
+- **CHANGELOG 日期节重排（本文件自身的结构缺陷）**：原 `## 2026-10-03` 单节里塞了**四个日期**的 31 条（10-03×6、10-04×14、10-05×10、10-06×1），根因是持续多日追加却从未新增日期头。已按提交日补 `## 2026-10-04` / `## 2026-10-05` / `## 2026-10-06` 三个边界，并把错置在该节顶部的 `### 4.`（10-03）归位到 `5 → 4 → 3`。核对方法：逐条 `git log -S <标题> -- CHANGELOG.md` 取真实提交日
+- **未代改的两处**（属他人条目，日期意图无法判断）：`### 11. 鉴权…` 在 `## 2026-10-06` 下但提交于 10-05；`### 16. 结算受阻…` 在 `## 2026-10-05` 下但提交于 10-07。提交日可能晚于实际工作日，故只记录不移动
+- **删除 1 条结构上永远结算不了的经验记录**：`GATEIO/NVDA/5m`（加密交易所挂美股，即 AGENTS.md 记的「三轴不一致」实例）。删前备份到 `records/.bak/exp_20261007-035525_db.json`，按 `entry_id + status='pending'` 精确删除（rowcount=1），**未用通配符**；保留 `NASDAQ/NVDA/1h`（网络恢复后可结算）
+- **文件**：`config/README.md`、`CHANGELOG.md`、`SESSION_CHANGES.md`（配置本身写在 DB，不产生代码改动）
+
+
 ## 2026-10-06
 
 ### 16. 增量锚点按 user_id 过滤 —— 跨用户推理泄漏（安全）
@@ -542,20 +567,7 @@ Stage 2 提示词（`<experience_review>` 块出现）→ 案例块 JSON 合法�
 
 ---
 
-## 2026-10-03
-
-### 4. 事件循环阻塞下线 + 记录/交易落盘原子化
-
-- **问题**：async 路由里直接调用阻塞 I/O；记录文件名秒级碰撞；交易 CSV 整文件读改写
-- **根因**：
-  1. `/api/bars`（前端每秒轮询）与 `/api/bars/next-close` 直接在 `async def` 中调 `latest_snapshot()`，TradingView 源会开 WebSocket + HTTP `get_hist`；而 SSE 后台循环对**同一调用**已正确使用 `asyncio.to_thread`。一次缓存未命中即冻结整个事件循环，连带所有 SSE 流与在途请求。同类问题还有 `/api/subscribe` 的 `connect/disconnect/subscribe` + `save_settings`、`/api/feishu/test` 的 `requests.post`（10s 超时）、`/api/chat/stream` 的记录扫描、`/api/records` 的整目录扫描
-  2. SSE 订阅队列 `asyncio.Queue()` 无 `maxsize`，`QueueFull` 分支是不可达死代码，后台标签页无限堆积 `bar_update`
-  3. `_build_basename` 只精确到秒且无唯一后缀，同一秒内同品种两次分析写同一路径互相覆盖
-  4. `_write_json` 非原子，崩溃会留下被截断的 `.json`，读取端静默跳过 → 整条记录丢失
-  5. 交易 CSV 先读全量、内存追加、再以 `mode="w"` 重写：截断先于写入，崩溃或并发保存丢整段历史，且每次追加 O(n²)
-- **修复**：全部阻塞调用改 `await asyncio.to_thread(...)`（`routes_analyze._run_analysis` 本就跑在 `run_in_executor`，无需改）；订阅队列 `maxsize=256` 且满时丢弃**最旧**增量事件（`bar_update` 是覆盖式快照，丢旧的安全；丢 `bar_close` 会卡住倒计时）；记录文件名加毫秒 + uuid6；`_write_json` 改同目录临时文件 + `os.replace` 原子落盘；CSV 改 per-file 锁 + 单次追加 + 仅新建时写表头
-- **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
-- **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
+## 2026-10-06
 
 ### 31. 出厂默认网关切到 8093 / space-bunny-free（含一次误判的记录）
 
@@ -574,6 +586,8 @@ Stage 2 提示词（`<experience_review>` 块出现）→ 案例块 JSON 合法�
 - **回归**：24 失败 / 0 error，**无新增失败**，较基线少 1（`test_deepseek_client` 那项已修好并已从基线移除）
 - **文件**：`pa_agent/config/settings.py`、`tests/unit/test_settings_round_trip.py`、`tests/unit/test_cursor_agent_route.py`、`tests/ci/baseline_failures.txt`
 - **接口变更**：`AIProviderSettings` 出厂默认 `model`/`base_url`/`api_key` 三项（`config/settings.json` 在 .gitignore 中，本次不入库）
+
+## 2026-10-05
 
 ### 30. 修 CI 基线的两个自伤缺陷（误报 + 基线取自脏工作区）
 
@@ -805,6 +819,8 @@ Stage 2 提示词（`<experience_review>` 块出现）→ 案例块 JSON 合法�
 - **文件**：`pa_agent/orchestrator/two_stage.py`、`web/api/routes_records.py`、`web/static/{js/app.js,js/chart.js,index.html}`
 - **版本**：app.js?v=52→54、chart.js?v=7→8；全量 `tests/unit` 对基线新增失败 0
 
+## 2026-10-04
+
 ### 20. 后台定时结算 + 定时/手工模式开关 + 每条记录独立 LLM 复盘
 
 - **后台定时结算** `web/api/experience_scheduler.py`：此前待验证记录只能靠用户点「验证」才结算，不点就永远停在 pending，两阶段设计等于白做
@@ -1026,6 +1042,8 @@ Stage 2 提示词（`<experience_review>` 块出现）→ 案例块 JSON 合法�
 - **文件**：`web/static/js/continuous_gate.js`（新增）、`web/static/js/continuous_gate.test.js`（新增）、`web/static/js/app.js`、`web/static/index.html`
 - **验证**：新增 Node 单测（`node web/static/js/continuous_gate.test.js`，无 DOM 依赖的纯逻辑可直接 require 求值），覆盖 `closedBarTs` 的正常/休市/乱序/空数组边界与 `shouldWaitForClose` 契约。`app.js?v=27→28`、新增 `continuous_gate.js?v=1`。全量 `tests/unit` 对基线：新增失败 0。已重建镜像并部署至 `:8005`，确认 `continuous_gate.js` 返回 200 且 `app.js` 中有 10 处 `PAContinuousGate` 引用
 
+## 2026-10-03
+
 ### 6. 设置接口凭据跨域暴露修复 + Docker 重新部署
 
 - **问题**：`GET /api/settings` 只脱敏 `provider.api_key`，其余通知凭据明文返回；配合 `allow_origins=["*"]` 且全站无鉴权，运营者访问的任意网页即可跨域读取并可驱动写接口
@@ -1060,6 +1078,19 @@ Stage 2 提示词（`<experience_review>` 块出现）→ 案例块 JSON 合法�
   8. **demo 契约错位**：payload 与前端渲染器有 6 处不匹配（决策区恒显「不下单」、概率芯片全 0%、`terminal` 渲染为空串）。改为构造真实 `AnalysisRecord` 并复用 `_serialize_record()`，从结构上杜绝漂移
 - **文件**：`web/api/routes_chat.py`、`web/api/routes_demo.py`、`pa_agent/records/analysis_history.py`、`pa_agent/util/startup_health_check.py`、`pa_agent/ai/deepseek_client.py`
 - **验证**：新增 `tests/unit/test_followup_and_audit_fixes.py`(12)。线上实测两轮连续追问均正常返回 reasoning + content + done；全量 `tests/unit` 对基线：新增失败 0，修复 2
+
+### 4. 事件循环阻塞下线 + 记录/交易落盘原子化
+
+- **问题**：async 路由里直接调用阻塞 I/O；记录文件名秒级碰撞；交易 CSV 整文件读改写
+- **根因**：
+  1. `/api/bars`（前端每秒轮询）与 `/api/bars/next-close` 直接在 `async def` 中调 `latest_snapshot()`，TradingView 源会开 WebSocket + HTTP `get_hist`；而 SSE 后台循环对**同一调用**已正确使用 `asyncio.to_thread`。一次缓存未命中即冻结整个事件循环，连带所有 SSE 流与在途请求。同类问题还有 `/api/subscribe` 的 `connect/disconnect/subscribe` + `save_settings`、`/api/feishu/test` 的 `requests.post`（10s 超时）、`/api/chat/stream` 的记录扫描、`/api/records` 的整目录扫描
+  2. SSE 订阅队列 `asyncio.Queue()` 无 `maxsize`，`QueueFull` 分支是不可达死代码，后台标签页无限堆积 `bar_update`
+  3. `_build_basename` 只精确到秒且无唯一后缀，同一秒内同品种两次分析写同一路径互相覆盖
+  4. `_write_json` 非原子，崩溃会留下被截断的 `.json`，读取端静默跳过 → 整条记录丢失
+  5. 交易 CSV 先读全量、内存追加、再以 `mode="w"` 重写：截断先于写入，崩溃或并发保存丢整段历史，且每次追加 O(n²)
+- **修复**：全部阻塞调用改 `await asyncio.to_thread(...)`（`routes_analyze._run_analysis` 本就跑在 `run_in_executor`，无需改）；订阅队列 `maxsize=256` 且满时丢弃**最旧**增量事件（`bar_update` 是覆盖式快照，丢旧的安全；丢 `bar_close` 会卡住倒计时）；记录文件名加毫秒 + uuid6；`_write_json` 改同目录临时文件 + `os.replace` 原子落盘；CSV 改 per-file 锁 + 单次追加 + 仅新建时写表头
+- **文件**：`web/api/{routes_data,routes_settings,routes_chat,routes_records,routes_bars_stream}.py`、`pa_agent/records/{pending_writer,trade_logger}.py`
+- **验证**：新增 `tests/unit/test_record_durability.py`(6)，含 25 线程并发落盘全保留、表头唯一、同秒文件名不碰撞。全量 `tests/unit` 对基线：新增失败 0，修复 2
 
 ### 3. 逐功能审计修复：交易静默否决 / 凭据泄露 / 上下文溢出
 

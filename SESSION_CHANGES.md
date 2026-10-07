@@ -22,7 +22,89 @@
 
 ## 🔴 进行中（有人正在改这些文件，不要动）
 
-## ✅ 已提交（本条改动待 commit；条目已不再占用写入范围）
+## ✅ 已提交
+
+### 2026-10-07 · 修 DB baseline 的坏网关组合 + override 无效（当前）
+
+**状态**：已提交 `（本提交）`
+
+#### 需求
+推理再次报错。追查发现配置**四层不一致**。
+
+#### 根因
+| 层 | base_url | model | 结论 |
+|---|---|---|---|
+| DB baseline | `8094/zen/go/v1` | `space-bunny-free` | **8094 无此模型 → 400** |
+| `config/settings.json` | `8093/v1` | `space-bunny-free` | ✓ |
+| `AIProviderSettings` 代码默认 | `8093/v1` | `space-bunny-free` | ✓ |
+| DB override | `8093/zen/v1` | — | **缺 `use_custom` → 被 `_apply_llm_source` 整段丢弃** |
+
+- baseline 是 10-05 19:56 写入的，**从未修过** —— 上一轮我修的是 override、
+  文件与代码默认值，baseline 遗漏了。而 override 后来被覆盖成
+  「只带 base_url、不带 use_custom」⇒ 两层都失效，实际生效的是坏的那层
+- 实测三个路径：`8093/v1` ✓、`8093/zen/v1` ✓、`8094/zen/go/v1` ✗
+  （我第一次用 `grep -q '"choices"'` 判断成功与否，因截断到 120 字符误报成全失败，
+  **判定成功的脚本必须解析完整 JSON，不能 grep 被截断的字符串**）
+
+#### 方案
+1. baseline 修正为 `8093/v1` + `space-bunny-free`（与文件、代码默认三处对齐）
+2. override 补上 `use_custom: true`，让其真正生效并与 baseline 一致
+3. **不动** TradingView 不可达（`data_source: error`）与结算相关代码 ——
+   前者是环境网络问题，后者另一会话在 `c4b99cc` 刚改完
+
+#### 改动文件（写入范围）
+| 文件 | 改动 |
+|---|---|
+| `config/README.md` | provider 默认值表按实际重写（含已删除字段 `api_key_encrypted`） |
+| `CHANGELOG.md` | 新增 `## 2026-10-07` 条目 32 + 日期节重排 |
+| `SESSION_CHANGES.md` | 记录 |
+
+（配置写入走 DB 接口，不产生代码改动）
+
+#### 修复结果
+- baseline 改为 `8093/v1`（只改 `provider.base_url`/`model`，整份合并回写，
+  8 个顶层段 / 11 个 provider 字段**均未丢失**）；override 补 `use_custom: true`
+- 实测容器内推理 ✓、`health` 的 `model_api` 连续 3 次 `ok`、修复后 0 次
+  `Model is unavailable`
+- 顺带修文档：`config/README.md` 的 provider 默认值表此前写的是
+  `deepseek-chat` / `api.deepseek.com` / `context_window 128000`，与实现已完全
+  脱节，且仍记录着**已删除的字段** `api_key_encrypted`。已按
+  `AIProviderSettings()` 实测值重写，并补上表中缺失的 `use_custom`
+  与 `prompt_cache_prime`，另加「配置真源在 DB」的醒目提示
+
+#### 同轮排查结论（不代修，仅记录）
+- **TradingView 网络层不可达**：宿主与容器 `https://tradingview.com/` 均 HTTP 000
+  （同容器 baidu/github 都是 200），日志自 10-05 起有 `Connection reset by peer`。
+  `data_source` 因此为 `error`，**取不到任何 K 线 → 无法分析**。属环境问题，
+  需在部署侧解决（代理/线路）
+- **经验库当前 0 条可检索**：磁盘 40 个 JSON **全部在点号目录**
+  （`.omc` / `.seed_demo_20260817`），按规范是故意隔离的合成种子数据、
+  永不入库；库里只剩 1 条 pending（不可检索）。读端空库返回 `[]` 无异常
+- **删除 1 条结构上永远结算不了的记录**：`GATEIO/NVDA/5m`（加密交易所挂美股，
+  即 AGENTS.md 记的「三轴不一致」实例）。删前备份到
+  `records/.bak/exp_20261007-035525_db.json`；按 `entry_id + status='pending'`
+  精确删除（rowcount=1），未使用通配符。保留 `NASDAQ/NVDA/1h`（网络恢复后可结算）
+- 另一会话 `c4b99cc` 的退避已生效：近 150 秒 `failed to fetch bars` 日志 0 次
+- **CHANGELOG 日期节重排（本会话自身缺陷的修正）**：我此前多条条目被插入
+  `## 2026-10-03` 节 —— 根因是插入时用 `s.index("### NN.")` 找锚点，而历史
+  里本就有同号条目，于是落进了最近的旧节。后果：该单节里塞了**四个日期**的
+  31 条（10-03×6 / 10-04×14 / 10-05×10 / 10-06×1），日期倒序失效。
+  修法：逐条 `git log -S <标题> -- CHANGELOG.md` 取真实提交日 → 按边界补
+  `## 2026-10-04`/`10-05`/`10-06` 三个日期头 → 把错置在节顶的 `### 4.`
+  归位到 `5→4→3`。核对结果：10-07×1 / 10-06×7 / 10-05×22 / 10-04×14 /
+  10-03×6，同节编号严格降序，**仅剩 2 处不符且均为他人条目**（已记录未代改）。
+  过程中两次被自己的断言拦下：一次把 `del ... if ... else ...` 写成语法错、
+  一次断言了**期望状态**而非**当前状态** —— 断言必须表达「现在是什么样」
+- **本会话改动文件（实际）**：`config/README.md`、`CHANGELOG.md`、
+  `SESSION_CHANGES.md`；配置类改动落在 DB（baseline + override），无代码 diff
+- 残留 `api_key_encrypted` 引用 4 处（`SECURITY.md`、
+  `tools/run_live_two_stage_smoke.py`、`tests/unit/test_settings_round_trip.py:82`、
+  `web/static/js/app.js:875` 注释）——字段已删除，本轮只修了 `config/README.md`
+
+#### 冲突风险
+- 「进行中」区当前为空；他人最近提交 `c4b99cc` 属经验库结算，与本条无重叠
+- **TradingView 已不可达**（宿主与容器均 HTTP 000，`Connection reset` 自 10-05 起），
+  故 `data_source` 为 `error` 且经验结算会持续退避——非本会话引入，不代修## ✅ 已提交（本条改动待 commit；条目已不再占用写入范围）
 ### 2026-10-05 · 多会话推理收尾（P1 SSE下线 / P2a 追问隔离 / P3 交易域 / P4 配置层）
 
 **状态**：已完工（待本次统一提交）
@@ -206,8 +288,6 @@
   非代码问题；若复现先确认文件是否正被别的会话改写
 
 ---
-
-## ✅ 已提交
 
 ### 2026-10-06 · 出厂默认网关切到 8093 / space-bunny-free（当前）
 

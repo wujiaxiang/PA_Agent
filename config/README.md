@@ -19,9 +19,11 @@
    copy config\settings.example.json config\settings.json
    ```
 
-2. 启动程序，在 **设置** 中填写你的 **API Key**（会加密写入 `api_key_encrypted`）。
+2. 启动程序，在 **设置** 中填写你的 **API Key**。网页保存走 `PUT /api/settings`，
+   **只写数据库的 `overrides` 用户区**，不改本文件（见下节字段表的提示）。
 
-   也可直接编辑 `config/settings.json` 中的 `base_url`、`model` 等字段，Key 仍建议通过 GUI 保存以便自动加密。
+   也可直接编辑 `config/settings.json` 中的 `base_url`、`model` 等字段——但只在
+   **数据库还没有 baseline**（首次启动）时起作用；之后 DB 优先，文件仅作灾备兜底。
 
 3. `config/exception_state.json` 由程序在需要时自动创建，一般无需手动复制。结构可参考 `exception_state.example.json`。
 
@@ -39,14 +41,23 @@
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `provider.model` | string | `"deepseek-chat"` | 模型名称（须与网关支持的名称一致） |
-| `provider.base_url` | string | `"https://api.deepseek.com"` | OpenAI 兼容 API 根地址。DeepSeek：`https://api.deepseek.com`；MiMo：`https://api.xiaomimimo.com/v1`（程序自动处理 `enable_thinking` 与 `reasoning_content` 回放） |
-| `provider.api_key` | string | `""` | API Key（明文，内存中临时使用；不持久化到文件） |
-| `provider.api_key_encrypted` | string | `""` | 加密后的 Key；留空表示未配置（通过 GUI 保存时自动加密写入） |
+> ⚠️ **配置真源在 DB，不在本文件**：网页「设置」保存只写 SQLite 的
+> `overrides` 用户区，`config/settings.json` 只是**首启播种源 + 灾备兜底**。
+> 想直接编辑本文件生效，前提是 DB 里还没有 baseline（否则 DB 覆盖文件）。
+> 想把当前生效配置变成「出厂默认」，用 `POST /api/settings/promote-default`。
+> 下表默认值取自 `AIProviderSettings`（出厂兜底），与本文件、DB baseline 三处保持一致。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `provider.use_custom` | bool | `false` | **是否用自定义 LLM 配置**。为 `false` 时 `_apply_llm_source()` 会把用户对 provider 的覆盖**整段作废**（"跟随系统默认"）—— 只写 `model`/`base_url` 而不写这个开关，改动会被**静默丢弃、无任何报错** |
+| `provider.model` | string | `"space-bunny-free"` | 模型名称（须与网关支持的名称一致）。改前先 `GET {base_url}/models` 核对——不同网关命名不同 |
+| `provider.base_url` | string | `"http://192.168.2.128:8093/v1"` | OpenAI 兼容 API 根地址（内网网关）。`https://api.deepseek.com` 仍可用但需自行配置 key |
+| `provider.api_key` | string | `"not-needed"` | API Key。**默认非空**：网关本身忽略鉴权，但 OpenAI SDK 要求非空，否则构造客户端即抛错 |
+| `provider.prompt_cache_prime` | bool | `true` | 真实请求前用同一前缀先发 `max_tokens=1` 预热 prompt cache（实测命中率 0.2% → 100%） |
 | `provider.thinking` | bool | `true` | 是否启用思考/推理类扩展参数（依模型与网关而定）。关闭可 3–5 倍提速但分析质量下降 |
 | `provider.reasoning_effort` | string | `"high"` | 推理深度：`low` / `medium` / `high` / `max` |
-| `provider.context_window` | int | `128000` | 用于上下文占用提示的窗口大小（tokens） |
-| `provider.max_output_tokens` | int | `0` | 覆盖单次响应最大 tokens。`0` 或留空 = 按 provider 默认值（DeepSeek 原生 393216、OpenRouter free 32768、其他 128000）；free 模型建议设 32768 避免被拒 |
+| `provider.context_window` | int | `2000000` | 用于上下文占用提示的窗口大小（tokens） |
+| `provider.max_output_tokens` | int / null | `null` | 覆盖单次响应最大 tokens。`null` = 按 provider 默认值；free 模型建议设 32768 避免被拒 |
 | `provider.seed` | int | `null` | 随机性控制种子。同一输入+同一 seed 理论上返回相同结果（DeepSeek 官方不保证 100% 复现，thinking 模式下效果更弱，但能显著降低波动）。`null` = 不发送 |
 | `provider.top_p` | float | `null` | 核采样阈值 0~1。`0.1` = 近似贪心（仅最高概率 token），`1.0` = 完全随机。与 `temperature` 不同，`top_p` 在 thinking 模式下仍可使用。`null` = 不发送（用 provider 默认 1.0）。**推荐 0.1** |
 
