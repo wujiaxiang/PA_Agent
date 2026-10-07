@@ -393,6 +393,20 @@ async def get_next_close(
 # 经验库此前只有 reader、没有任何写入方，也没有浏览入口 —— Web 端完全看不到
 # 库里到底有什么、Stage2 到底检索到了什么。这里补上只读浏览接口。
 
+def _max_no_data_attempts() -> int:
+    """结算侧的「取不到数」阈值。
+
+    **不要在这里另写一个数字**：与 ``experience_verifier.MAX_NO_DATA_ATTEMPTS``
+    各存一份，早晚会分叉 —— 那时界面说「正常等待」而结算侧已在报错。
+    """
+    try:
+        from web.api.experience_verifier import MAX_NO_DATA_ATTEMPTS
+
+        return int(MAX_NO_DATA_ATTEMPTS)
+    except Exception:  # noqa: BLE001
+        return 5
+
+
 def _status_label(status: str) -> str:
     """Bilingual label for a two-stage experience status."""
     return {
@@ -515,6 +529,16 @@ async def list_experience(
             "entry_ts_open_ms": content.get("entry_ts_open_ms"),
             "resolved_ts_open_ms": content.get("resolved_ts_open_ms"),
             "bars_seen": content.get("bars_seen"),
+            # 结算受阻信息：**必须透出到界面**。此前它只存在库里和一行服务端
+            # ERROR 日志里，用户看到的永远是一张写着「待验证」的卡片 ——
+            # 分不清「还在等 K 线」和「根本取不到数」，于是反复点「验证」，
+            # 真机上同一条记录累计失败 335 次仍无任何提示。
+            "no_data_attempts": int(content.get("_no_data_attempts") or 0),
+            "settle_error": str(content.get("_last_error") or ""),
+            "settle_blocked": (
+                int(content.get("_no_data_attempts") or 0)
+                >= _max_no_data_attempts()
+            ),
             "cycle_position": cycle_pos,
             "cycle_label": _bilingual_cycle(cycle_pos),
             "direction_label": _bilingual_direction(content.get("direction", "")),

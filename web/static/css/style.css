@@ -3636,6 +3636,20 @@ button.secondary:hover { background: var(--border); }
 .exp-pnl { font-family: 'JetBrains Mono', monospace; margin-left: auto; }
 .exp-pnl.pos { color: #26a69a; }
 .exp-pnl.neg { color: #ef5350; }
+.exp-tag.exp-blocked {
+  background: rgba(255, 138, 128, 0.18);
+  border-color: rgba(255, 138, 128, 0.55);
+  color: #ff8a80;
+  cursor: help;
+}
+.exp-blocked-hint {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #ff8a80;
+  word-break: break-word;
+}
+
 .exp-summary { color: #cbd5e1; }
 .exp-patterns { color: #6b7280; font-size: 11px; margin-top: 2px; }
 .exp-empty { color: #6b7280; padding: 18px 0; text-align: center; font-size: 12px; }

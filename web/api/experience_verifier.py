@@ -134,6 +134,9 @@ class _DedicatedSource:
 
     def __init__(self, factory: Callable[[], Any], symbol: str, timeframe: str,
                  exchange: str, logger_: logging.Logger):
+        #: 取不到数时的人话原因，供界面显示。**必须回传**：否则用户只看到
+        #: 「待验证」永远不变，无从知道是网络不通、组合无效还是还没走满 K 线。
+        self.last_error = ""
         self._factory = factory
         self._symbol = symbol
         self._timeframe = timeframe
@@ -155,8 +158,15 @@ class _DedicatedSource:
             if callable(setter):
                 setter(self._exchange or "")
             src.subscribe(self._symbol, self._timeframe)
-            return _bar_rows(src.latest_snapshot(_FETCH_BARS))
+            rows = _bar_rows(src.latest_snapshot(_FETCH_BARS))
+            if not rows:
+                self.last_error = (
+                    f"上游未返回 {self._exchange or '自动'}/{self._symbol} "
+                    f"{self._timeframe} 的 K 线（交易所/品种组合可能无效）"
+                )
+            return rows
         except Exception as exc:  # noqa: BLE001
+            self.last_error = f"{type(exc).__name__}: {exc}"
             self._log.warning(
                 "experience verify: dedicated fetch failed for %s/%s/%s: %s",
                 self._exchange, self._symbol, self._timeframe, exc,
@@ -227,6 +237,22 @@ def settle_record(
     return STATUS_PENDING, seen
 
 
+#: 取不到数据后的重试间隔（秒）。``_backoff_seconds(n)`` = 第 n 次失败后等多久。
+#:
+#: **为什么必须有**：真机上一条 `GATEIO/NVDA` 的记录累计失败 **335 次** ——
+#: 调度器每轮都拿它去连一次 TradingView，永远失败、永远重试。这既浪费上游配额，
+#: 也让「失败次数」这个本该报警的信号被淹没在噪声里。
+#: 指数退避：1 次失败等 60s，之后翻倍，封顶 1h。
+BACKOFF_BASE_S = 60
+BACKOFF_MAX_S = 3600
+
+
+def _backoff_seconds(attempts: int) -> int:
+    if attempts <= 0:
+        return 0
+    return int(min(BACKOFF_BASE_S * (2 ** min(attempts - 1, 8)), BACKOFF_MAX_S))
+
+
 #: 连续取不到数据多少次后判定「这条永远结算不了」。
 #:
 #: 典型触发是交易所/品种组合本身无效（实测见过 ``GATEIO/NVDA`` —— 美股挂在
@@ -236,7 +262,8 @@ def settle_record(
 MAX_NO_DATA_ATTEMPTS = 5
 
 
-def _note_no_data(entry_id: str, content: dict[str, Any], logger) -> None:
+def _note_no_data(entry_id: str, content: dict[str, Any], logger,
+                  reason: str = "") -> None:
     """取不到数据时累计次数并告警，不能无限静默重试。
 
     典型触发是交易所/品种组合本身无效（实测见过 ``GATEIO/NVDA`` —— 美股挂在
@@ -271,6 +298,11 @@ def _note_no_data(entry_id: str, content: dict[str, Any], logger) -> None:
 
         n = int(current.get("_no_data_attempts") or 0) + 1
         current["_no_data_attempts"] = n
+        # 原因与时间戳一并落库：界面要据此告诉用户「为什么一直没结算」，
+        # 退避要据此判断「这一轮该不该再试」。
+        if reason:
+            current["_last_error"] = str(reason)[:400]
+        current["_last_attempt_ts"] = time.time()
         get_hub().execute(
             "UPDATE experience_entries SET content_json = ? WHERE entry_id = ?",
             (json.dumps(current, ensure_ascii=False), entry_id),
@@ -370,7 +402,8 @@ def verify_pending(
     Returns a summary dict; never raises.
     """
     summary = {"checked": 0, "win": 0, "loss": 0, "unresolved": 0,
-               "pending": 0, "skipped_no_data": 0, "skipped_misaligned": 0}
+               "pending": 0, "skipped_no_data": 0, "skipped_misaligned": 0,
+               "skipped_backoff": 0, "skipped_budget": 0}
     w = writer or ExperienceWriter(logger=logger)
     try:
         n_bars = int(verify_bars if verify_bars is not None
@@ -393,9 +426,18 @@ def verify_pending(
         return summary
 
     used_dedicated = 0
+    now = time.time()
     for entry_id, content in pending:
         if summary["checked"] >= limit:
             break
+        # 反复取不到数就退避，别再每轮都去撞一次上游。
+        attempts = int(content.get("_no_data_attempts") or 0)
+        if attempts:
+            waited = now - float(content.get("_last_attempt_ts") or 0)
+            if waited < _backoff_seconds(attempts):
+                summary["skipped_backoff"] += 1
+                continue
+
         symbol = str(content.get("symbol") or "")
         timeframe = str(content.get("timeframe") or "")
         exchange = str(content.get("exchange") or "")
@@ -404,18 +446,26 @@ def verify_pending(
 
         bars = _shared_fetch(shared_source, symbol, timeframe, exchange) \
             if shared_source is not None else []
-        dedicated = False
+        dedicated_src = None
         if not bars:
             if source_factory is None or used_dedicated >= max(0, int(max_dedicated)):
-                summary["skipped_no_data"] += 1
+                # **本轮没轮到它，不是这条记录的问题** —— 不记失败次数、
+                # 不覆盖 `_last_error`。否则「预算用完」会顶掉真正的原因
+                # （实测把 `TradingView 连接超时` 覆盖成了「预算已用完」），
+                # 还会把 `_no_data_attempts` 灌到阈值、误报「永远结算不了」。
+                summary["skipped_budget"] += 1
                 continue
             used_dedicated += 1
-            dedicated = True
-            bars = _DedicatedSource(source_factory, symbol, timeframe,
-                                    exchange, logger).fetch()
+            dedicated_src = _DedicatedSource(source_factory, symbol, timeframe,
+                                             exchange, logger)
+            bars = dedicated_src.fetch()
         if not bars:
             summary["skipped_no_data"] += 1
-            _note_no_data(entry_id, content, logger)
+            _note_no_data(
+                entry_id, content, logger,
+                reason=(dedicated_src.last_error if dedicated_src else
+                        f"共享数据源未返回 {exchange}/{symbol} {timeframe} 的 K 线"
+                        "（订阅的标的与这条记录不一致）"))
             continue
 
         # 价格量级兜底：bars 与本记录价格不在同一量级 → 一定不是这个标的

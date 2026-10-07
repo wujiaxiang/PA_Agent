@@ -385,3 +385,104 @@ def test_analyze_passes_the_live_exchange_not_the_frozen_one():
     assert calls, "找不到 spawn_post_order_followup 的调用块"
     assert any("exchange=" in block for block in calls), (
         "调用点没有把本次分析的交易所透传下去")
+
+
+# ── 取不到数：必须可见、必须退避 ────────────────────────────────────────────
+
+def test_backoff_grows_and_caps():
+    """取不到数要**指数退避**，不能每轮都去撞上游。
+
+    真机上一条 `GATEIO/NVDA` 记录累计失败 **335 次** —— 调度器每轮都拿它去连
+    一次 TradingView，永远失败、永远重试。既浪费上游配额，也让「失败次数」这个
+    本该报警的信号淹没在噪声里。
+    """
+    from web.api.experience_verifier import BACKOFF_MAX_S, _backoff_seconds
+
+    assert _backoff_seconds(0) == 0, "没失败过不该退避"
+    assert _backoff_seconds(1) < _backoff_seconds(2) < _backoff_seconds(3), "必须递增"
+    assert _backoff_seconds(99) == BACKOFF_MAX_S, "必须封顶，否则永远不再重试"
+
+
+def test_no_data_records_reason_and_is_visible():
+    """失败原因必须落库 —— 界面靠它告诉用户「为什么一直没结算」。"""
+    from pa_agent.storage.db import get_hub
+    from pa_agent.storage.experience_repo import upsert_entry
+    from web.api import experience_verifier as ev
+
+    upsert_entry({"symbol": "NVDA", "exchange": "NASDAQ", "timeframe": "1h"},
+                 entry_id="admin_nd", cycle_position="trending_tr",
+                 status="pending", symbol="NVDA", timeframe="1h")
+    ev._note_no_data("admin_nd", {"symbol": "NVDA"}, __import__("logging").getLogger(),
+                     reason="OSError: Network is unreachable")
+    row = get_hub().connect().execute(
+        "SELECT content_json FROM experience_entries WHERE entry_id='admin_nd'"
+    ).fetchone()
+    content = json.loads(row[0])
+    assert content["_no_data_attempts"] == 1
+    assert "Network is unreachable" in content["_last_error"]
+    assert content["_last_attempt_ts"] > 0, "退避需要时间戳"
+
+
+def test_repeated_failures_are_backed_off_not_retried_every_pass():
+    """失败过的记录在退避窗口内**不得**再建专用源。"""
+    import time
+
+    from web.api import experience_verifier as ev
+
+    made: list[int] = []
+
+    class _W:
+        def list_pending(self, limit, user_id=None):
+            return [("e1", {"symbol": "NVDA", "exchange": "NASDAQ",
+                            "timeframe": "1h", "entry_price": 238.0,
+                            # 刚失败过 → 应当被退避挡下
+                            "_no_data_attempts": 3,
+                            "_last_attempt_ts": time.time()})]
+
+        def finalize(self, *a, **k):
+            raise AssertionError("退避中不得结算")
+
+    def _factory():
+        made.append(1)
+        raise RuntimeError("should not be called")
+
+    s = ev.verify_pending(shared_source=None, source_factory=_factory,
+                          settings=None, scope=None, max_dedicated=3,
+                          writer=_W())
+    assert made == [], "退避窗口内仍然去建了专用源"
+    assert s["skipped_backoff"] == 1, f"未计入退避：{s}"
+
+
+def test_experience_payload_surfaces_the_settle_block_reason(loop):
+    """**回归守卫**：`GET /api/experience` 必须把受阻状态与原因透给前端。
+
+    此前它们只存在库里和一行服务端 ERROR 日志里，用户看到的永远是一张写着
+    「待验证」的卡片 —— 分不清「还在等 K 线」和「根本取不到数」，于是反复点
+    「验证」，真机上同一条记录累计失败 335 次仍无任何提示。
+    """
+    from fastapi.testclient import TestClient
+
+    from pa_agent.storage.db import get_hub
+    from pa_agent.storage.experience_repo import upsert_entry
+    from web.api import experience_verifier as ev
+    from web.server import app
+
+    upsert_entry({"symbol": "NVDA", "exchange": "NASDAQ", "timeframe": "1h",
+                  "summary": "受阻用例", "status": "pending"},
+                 entry_id="admin_blocked", cycle_position="trending_tr",
+                 status="pending", symbol="NVDA", timeframe="1h")
+    for _ in range(ev.MAX_NO_DATA_ATTEMPTS):
+        ev._note_no_data("admin_blocked", {}, __import__("logging").getLogger(),
+                         reason="OSError: Network is unreachable")
+
+    client = TestClient(app)
+    r = client.get("/api/experience", params={"symbol": "NVDA", "timeframe": "1h"})
+    if r.status_code in (401, 403):
+        pytest.skip("该构建要求鉴权，跳过（字段由 _row_dict 直接保证）")
+    assert r.status_code == 200, r.text
+    rows = [x for x in r.json().get("entries", []) if x.get("filename") == "admin_blocked"]
+    assert rows, f"找不到用例条目：{r.json().get('entries')}"
+    row = rows[0]
+    assert row["no_data_attempts"] >= ev.MAX_NO_DATA_ATTEMPTS
+    assert row["settle_blocked"] is True, "受阻状态必须透出"
+    assert "Network is unreachable" in row["settle_error"], "原因必须透出"

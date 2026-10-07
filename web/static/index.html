@@ -10,7 +10,7 @@
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 <!-- v=43 新增 .history-item-exchange（交易所标注的弱化样式） -->
-<link rel="stylesheet" href="/css/style.css?v=43">
+<link rel="stylesheet" href="/css/style.css?v=73">
 </head>
 <!-- data-auth="pending" = 身份未定（app.js 的闸门正在判定）：
      此时主界面保持可见但**不接受点击**，登录页也还没显示。
@@ -758,15 +758,15 @@
 <!-- api.js?v 必须递增：会话身份改成「稳定 id + BroadcastChannel 克隆检测」
      后又加了鉴权闸门（Bearer 令牌 + 401 拦截）；旧版每次刷新换 id（游标与
      追问历史全丢），且不带 Authorization。见 api.js 顶部注释。 -->
-<script src="/js/api.js?v=8"></script>
-<script src="/js/chart.js?v=9"></script>
-<script src="/js/indicators.js?v=5"></script>
-<script src="/js/continuous_gate.js?v=2"></script>
+<script src="/js/api.js?v=73"></script>
+<script src="/js/chart.js?v=73"></script>
+<script src="/js/indicators.js?v=73"></script>
+<script src="/js/continuous_gate.js?v=73"></script>
 <!-- app.js?v 必须递增：boot 最前面加了登录闸门（未登录不初始化主界面）；
      v=69 修「全部品种」历史列表被过期响应覆盖 —— loadHistoryList 加序号守卫
      （只有最新一次调用有资格渲染），并把「读失败」与「确实为空」拆成两个空态；
      v=70 历史列表项标注交易所可读名（缓存 /api/tv/exchanges 的 label，
      无快照时回落裸代号）—— 同 symbol+timeframe 不同交易所的记录不再长得一样。 -->
-<script src="/js/app.js?v=72"></script>
+<script src="/js/app.js?v=73"></script>
 </body>
 </html>

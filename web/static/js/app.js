@@ -5950,8 +5950,17 @@ async function loadExperienceLibrary(opts) {
       const cls = st === 'pending' ? 'is-pending' : st === 'unresolved' ? 'is-unresolved'
                 : st === 'win' ? 'is-success' : 'is-failure';
       const N = window.__expVerifyBars || 20;
+      // 结算受阻：**必须和「正常等待」区分开**。取不到数时这张卡片此前只说
+      // 「待验证」，用户于是反复点「验证」——真机上同一条记录累计失败 335 次
+      // 仍无任何提示，看起来像功能坏了。
+      const blocked = st === 'pending' && (e.settle_blocked || (e.no_data_attempts || 0) > 0);
       const prog = st === 'pending'
-        ? `<span class="exp-tag">已走 ${e.bars_seen || 0}/${N} 根</span>` : '';
+        ? `<span class="exp-tag${blocked ? ' exp-blocked' : ''}" title="${escapeHtml(e.settle_error || '')}">`
+          + (blocked
+              ? `结算受阻 · 取数失败 ${e.no_data_attempts} 次`
+              : `已走 ${e.bars_seen || 0}/${N} 根`)
+          + '</span>'
+        : '';
       return `<div class="exp-item ${cls}" data-exp-index="${i}">
         <div class="exp-head">
           <span class="exp-symbol">${escapeHtml(e.symbol || '—')}</span>
@@ -5964,6 +5973,9 @@ async function loadExperienceLibrary(opts) {
           ${pnl != null ? `<span class="exp-pnl ${pnl >= 0 ? 'pos' : 'neg'}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</span>` : ''}
         </div>
         <div class="exp-summary">${escapeHtml(e.summary || '')}</div>
+        ${blocked && e.settle_error
+          ? `<div class="exp-blocked-hint">取数失败原因：${escapeHtml(e.settle_error)}</div>`
+          : ''}
         <div class="exp-levels">入场 ${escapeHtml(String(e.entry_price ?? '—'))} · 止盈 ${escapeHtml(String(e.take_profit_price ?? '—'))} · 止损 ${escapeHtml(String(e.stop_loss_price ?? '—'))} · ${dir}</div>
         ${pats ? `<div class="exp-patterns">形态：${escapeHtml(pats)}</div>` : ''}
         <div class="exp-actions">
@@ -6320,12 +6332,20 @@ async function initExperienceTab() {
         const decided = (r.win || 0) + (r.loss || 0) + (r.unresolved || 0);
         if (decided) {
           showToast(`结算 ${decided} 条：盈利 ${r.win} / 亏损 ${r.loss} / 未触及 ${r.unresolved}`, 'success');
-        } else if (r.pending) {
-          showToast(`还有 ${r.pending} 条 K 线未走满，继续等待`, 'warning');
         } else if (r && r.skipped) {
           showToast('正在结算中，请稍后再试', 'warning');
+        } else if (r.skipped_no_data) {
+          // 这句以前是「暂无可结算的记录」—— **是假话**：有记录，只是取不到数。
+          // 用户看到卡片写着「待验证」、toast 说「没有记录」，只能反复点。
+          showToast(
+            `${r.skipped_no_data} 条记录取不到 K 线，本条已跳过（详见卡片上的原因）`,
+            'error');
+        } else if (r.skipped_backoff) {
+          showToast(`${r.skipped_backoff} 条记录在退避等待中，稍后会自动重试`, 'warning');
+        } else if (r.pending) {
+          showToast(`还有 ${r.pending} 条 K 线未走满，继续等待`, 'warning');
         } else {
-          showToast('暂无可结算的记录', 'warning');
+          showToast('没有待结算的记录', 'warning');
         }
         await loadExperienceLibrary({ all: _expShowAll });
       } catch (e) {
