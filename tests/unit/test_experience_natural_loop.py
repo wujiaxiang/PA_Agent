@@ -557,3 +557,34 @@ def test_resolve_exit_reports_exit_bar_ts():
     info2 = resolve_exit(flat, entry_price=100.0, take_profit_price=120.0,
                          stop_loss_price=90.0, is_long=True)
     assert info2["exit_ts_open_ms"] == 1000 + 2 * 60
+
+
+def test_replay_registers_overlays_in_the_shared_state():
+    """**回归守卫**：经验回放必须把价格线/marker **登记进** overlay 状态。
+
+    这两处登记各漏过一次，两次都是**视觉验收**抓到的，后端单测全绿：
+
+    - marker：直接 ``series.setMarkers()`` 绕过状态层 → 连点 3 条叠了 3 组箭头
+    - 价格线：调了 ``createPriceLine()`` 却从不 ``st.priceLines.push(...)``
+      → ``_clearPriceLines()`` 遍历空数组，上一条的线一根都没清，
+      价格轴上同时挂着两套入场/止盈/止损（实测 5 个标签）
+
+    这类"忘了登记"无法用后端测试覆盖 —— 它验的是 JS 有没有把对象交还给
+    状态层，所以只能对源码做结构断言。
+    """
+    import pathlib
+    import re
+
+    src = (pathlib.Path(__file__).resolve().parents[2]
+           / "web" / "static" / "js" / "chart.js").read_text(encoding="utf-8")
+    m = re.search(r"function setExperienceReplay\(.*?\n\}\n", src, re.S)
+    assert m, "找不到 setExperienceReplay"
+    body = m.group(0)
+
+    assert re.search(r"\.priceLines\.push\s*\(", body), \
+        "价格线没有登记进 st.priceLines —— 换记录时不会被清除"
+    assert "_applyMarkers(series)" in body, \
+        "marker 必须走 _applyMarkers，绕过状态层会导致切换记录时旧标记不消失"
+    # 单位一致性：from 是毫秒，比较前必须折成秒
+    assert re.search(r"fromSec|\bfrom\s*/\s*1000", body), \
+        "入场时间(毫秒)与 marker 时间(秒)必须先统一单位再比较"

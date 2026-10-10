@@ -628,13 +628,20 @@ function setExperienceReplay(series, entry) {
     { price: Number(entry.take_profit_price), color: '#22c55e', lineStyle: 2, lineWidth: 1 },
     { price: Number(entry.stop_loss_price), color: '#ef4444', lineStyle: 2, lineWidth: 1 },
   ];
+  const stLines = _getOverlayState(series);
   for (const l of lines) {
     if (!Number.isFinite(l.price) || l.price <= 0) continue;
     try {
-      series.createPriceLine({
+      const pl = series.createPriceLine({
         price: l.price, color: l.color, lineWidth: l.lineWidth,
         lineStyle: l.lineStyle, axisLabelVisible: true, title: '',
       });
+      // **必须登记**：`_clearPriceLines()` 只遍历 `st.priceLines`。此前这里调了
+      // createPriceLine 却从不 push —— 于是换一条记录时遍历的是空数组，
+      // 上一条的价格线一根都没清掉，价格轴上会同时挂着两套入场/止盈/止损
+      // （实测连点两条，轴上出现 5 个标签）。视觉验收才抓到：marker 那次修了，
+      // 价格线这次才发现同样漏了登记
+      stLines.priceLines.push(pl);
     } catch (e) { /* 价格线失败不应影响回放整体 */ }
   }
 
@@ -661,7 +668,12 @@ function setExperienceReplay(series, entry) {
   const exitMs = Number(entry.resolved_ts_open_ms || 0);
   if (exitMs > 0 && Number.isFinite(exitMs)) {
     const sec = Math.floor(exitMs / 1000);
-    if (!from || sec >= from) {
+    // **单位必须一致**：``from`` 是毫秒而 ``sec`` 是秒，直接比大小永远为假
+    // （1790870400 >= 1790740800000）—— 于是判定箭头**从来没有被画出来过**。
+    // 这个 bug 在纯后端单测里完全看不见：它验的是库里有这个字段，不是图上
+    // 有没有箭头。视觉验收才抓到。
+    const fromSec = from ? Math.floor(from / 1000) : 0;
+    if (!fromSec || sec >= fromSec) {
       if (_hasBarAt(series, sec)) {
         const won = entry.status === 'win';
         const lost = entry.status === 'loss';

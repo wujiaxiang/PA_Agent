@@ -377,10 +377,17 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
   两次调用给出不同答案 = 复盘挂到 admin 名下、carol 看不到自己的
 - **词表只有一份**（`review_program.VERDICTS`）。`review_spec` 的兜底值必须
   取自它 —— 兜底路径正是词表校验最薄的地方，曾硬编码出一个词表外的值
-- **经验回放的 marker 必须走 overlay 状态层**：`setExperienceReplay()` 曾直接调
-  `series.setMarkers()`，**绕过** `_getOverlayState().markers` —— 于是换一条记录时
-  上一条的 marker 不会被清，实测连点 3 条，图上叠了 3 组「入场」箭头且前一条永远
-  不消失。走 `_applyMarkers()` 顺带保住 seq 序号标记不被抹掉
+- **画出来的每个 overlay 都必须登记进 `_getOverlayState()`**：marker 走
+  `_applyMarkers()`，价格线 `st.priceLines.push(pl)`。**两处各漏过一次，两次都是
+  视觉验收抓到的，后端单测全绿** ——
+  ① marker 直接 `series.setMarkers()` 绕过状态层 → 连点 3 条叠 3 组箭头；
+  ② 价格线调了 `createPriceLine()` 却从不 push → `_clearPriceLines()` 遍历空数组，
+  价格轴上同时挂两套入场/止盈/止损（实测 5 个标签）。
+  「忘了把对象交还给状态层」无法用后端测试覆盖，只能靠截图验收 + 对源码做结构断言
+- **毫秒与秒不可直接比大小**：`entry_ts_open_ms` 是毫秒，LWC 的 marker 时间是秒。
+  `sec >= from` 写成 `1790870400 >= 1790740800000` **恒为假** → 判定箭头
+  **从来没有被画出来过**。后端单测验的是「库里有这个字段」，看不出图上有没有箭头
+  —— 这条只有视觉验收能抓
 - **`createPriceLine()` 不得传 `title`**：`title` 是画在**图上**的文字，会直接压住
   蜡烛（实测「入场 238.93」「止损 237.245」盖在 K 线上遮挡走势）。数值走
   `axisLabelVisible`（价格轴），线的含义由**颜色 + `#experience-legend`** 承担
