@@ -390,6 +390,24 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
   成了半套叠加层。而 `clearExperienceReplay()` 原本**故意不清 marker**（怕连 seq
   序号标记一起抹掉）—— 改为给经验 marker 打 `__exp` 标记，清理时只摘这些，
   两种极端（全清 / 全留）都避开
+- **marker 归属只有一种标记 `__src`**（`MARKER_SRC = {SEQ, DIR, EXP}`）：曾有三套
+  字段名混在同一个 `st.markers` 数组里（seq 用 `_isSeq`、经验回放用 `__exp`、
+  方向箭头用 `_isDirection`），只清其中一种时另外两种必然残留 —— 「恰好互补」
+  不是设计是运气。清理一律走 `_dropMarkers(st, src)` / `_keepOnlyMarkers(st, src)`
+- **视窗定位必须按实际周期换算**：`setVisibleLogicalRange` 的单位是**逻辑 bar
+  根数**，写死 `/3600`（当小时用）只在 1h 下正确：5m 偏 12 倍、15m 偏 4 倍、
+  4h 反向偏 4 倍，随后被 `Math.max(0, …)` 夹到最左边 —— 定位到错误区域却毫无
+  报错。用 `logicalOffsetFrom(secDiff, timeframe)` + `TF_SECONDS`
+- **切品种必须清叠加层**：价格线/图例/箭头绑的是**上一个标的**的价位与时间，
+  而 `loadBars() → applyBarsToChart()` 全程不碰 overlay（指标会清、叠加层不会）。
+  清完还要 `setDataMode('live')`：画面已是新标的的实时行情，副标却还挂着
+  「经验回放 · <旧标的>」比不清更骗人，且 replay 已停轮询、图会冻住不更新。
+  用显式标志 `isExperienceReplay` 区分「经验回放」与「历史记录回看」——
+  不要靠 `_liveSubBeforeReplay` 是否为空推断，那是间接证据
+- **画经验回放前必须校验标的/周期**：`experienceReplayMatches()`。经验库筛选
+  「默认跟随当前订阅」只是界面约定、**不是不变量**；一旦筛选被改动或将来支持
+  跨标的浏览，就会在 A 的图上画出 B 的价格线 —— 看起来毫无破绽却完全错误。
+  宁可拒绝画并 toast 说明
 - **画出来的每个 overlay 都必须登记进 `_getOverlayState()`**：marker 走
   `_applyMarkers()`，价格线 `st.priceLines.push(pl)`。**两处各漏过一次，两次都是
   视觉验收抓到的，后端单测全绿** ——

@@ -1795,6 +1795,27 @@ async function applySubscribe() {
   // 先清空所有指标老数据，避免新数据来之前老指标还显示在图上
   if (window._indicatorsAPI) window._indicatorsAPI.clearAllData();
 
+  // **叠加层也必须清**：价格线/经验图例/入场箭头绑的是**上一个标的**的价位与
+  // 时间。`loadBars() → applyBarsToChart()` 全程不碰 overlay（实测切到 NVDA 后
+  // 图例仍写着「BTCUSDT 1h · 入场 82709」）。指标会清、叠加层不会 —— 这是漏网
+  // 的那一类：两者看起来都是"图上的旧东西"，但只有后者会带着**错标的的价格**。
+  //
+  // seq 序号标记不在这里清：它由 `setSeqMarkers` 在新 K 线到达时按新数据重画。
+  if (typeof window.clearExperienceReplay === 'function' && candleSeries) {
+    window.clearExperienceReplay(candleSeries);   // 经验价格线 + 图例 + 经验 marker
+  }
+  if (typeof clearOverlays === 'function' && candleSeries) {
+    clearOverlays(candleSeries);                  // 决策价格线 + 交易图例 + 全部 marker
+  }
+  // 叠加层清空后画面就是**新标的的实时行情**了，模式必须跟着回到实时，否则
+  // 副标还挂着「经验回放 · <旧标的>」而图上画的是新标的 —— 比不清叠加层更骗人；
+  // 且 replay 模式已停掉轮询，图会冻住不更新。
+  // 只退出「经验回放」，不动「历史记录回看」：后者由「返回实时」按钮统一处理。
+  if (isExperienceReplay) {
+    isExperienceReplay = false;
+    setDataMode('live');
+  }
+
   // 恢复 UI 控件为可编辑状态（不管成功或失败最终都要恢复）
   const restoreControls = () => {
     btn.textContent = '应用';
@@ -5629,6 +5650,7 @@ function hideReplayBadge() {
   const badge = $('#replay-badge');
   if (badge) badge.classList.add('hidden');
   isReplaying = false;
+  isExperienceReplay = false;
   // 经验回放也会把状态置成 replay，所以「返回实时」必须一并清掉它画的价格线与
   // marker。此前 btn-live 的多数分支会 clearOverlays()，但**订阅未变**那条走的是
   // `if (!live || !live.symbol) { await loadBars(); return; }` —— 只刷 K 线、
@@ -6011,19 +6033,37 @@ async function loadExperienceLibrary(opts) {
         if (!rec) return;
         list.querySelectorAll('.exp-item.is-replaying').forEach(x => x.classList.remove('is-replaying'));
         el.classList.add('is-replaying');
+        // G6 守卫：标的/周期不一致就拒绝画 —— 宁可什么都不画，也不要在 A 的图上
+        // 画出 B 的价格线（那看起来毫无破绽，却完全错误）。
+        const curSym = $('#ds-symbol')?.value || '';
+        const curTf = $('#ds-timeframe')?.value || '';
+        const ok = typeof window.experienceReplayMatches !== 'function'
+          || window.experienceReplayMatches(rec, curSym, curTf);
+        if (!ok) {
+          showToast(`这条经验是 ${rec.symbol} ${rec.timeframe} 的，与当前 `
+            + `${curSym} ${curTf} 不符，未标注到图上`, 'warning');
+          return;
+        }
         if (typeof window.setExperienceReplay === 'function') {
           // **先把状态切到「历史回看」**：经验回放画的是一笔**历史**交易的入场 /
           // 止盈 / 止损，此时状态灯还亮着「实时」等于骗人 —— 用户以为在看实时
           // 行情，却看到一根历史标记和一条历史价格线。
           // 顺带的副作用都是对的：停掉实时轮询（画面不再被真实 K 线每 5s 顶掉）、
           // 分析面板转只读（对着历史不该再跑分析）、图表染色与「历史」灯同源。
+          isExperienceReplay = true;
           setDataMode('replay', `经验回放 · ${rec.symbol || ''} ${rec.timeframe || ''}`.trim());
           window.setExperienceReplay(candleSeries, rec);
+          // 视窗定位按**实际周期**换算成逻辑 bar 偏移。此前写死 `/3600`，
+          // 只在 1h 下正确：5m 会偏 12 倍、15m 偏 4 倍、4h 反向偏 4 倍，
+          // 结果被 Math.max(0, ...) 夹到最左边 —— 定位到错误的区域。
           const anchor = Number(rec.entry_ts_open_ms || 0);
           const win = Number(window.__PA_LAST_BAR_TIME__ || 0);
           if (anchor > 0 && win > 0) {
             const sec = anchor / 1000;
-            const from = Math.max(0, Math.round((sec - win) / 3600) - 10);
+            const off = typeof window.logicalOffsetFrom === 'function'
+              ? window.logicalOffsetFrom(sec - win, rec.timeframe)
+              : Math.round((sec - win) / 3600);
+            const from = Math.max(0, off - 10);
             chart.timeScale().setVisibleLogicalRange({ from, to: from + 80 });
           }
         }
@@ -6041,6 +6081,11 @@ async function loadExperienceLibrary(opts) {
 // 用户会把它当成真实报价。三个按钮的 LED 与状态条由 setDataMode() 统一驱动，
 // 不要在别处单独改 class。
 let dataMode = 'live';
+//: 当前是否处于「经验回放」—— 与 `replay`（历史记录回看）区分开：
+//: 切品种时前者必须退回实时（叠加层已被清空、画面就是新标的的实时行情），
+//: 后者则由「返回实时」按钮统一处理。不能靠 `_liveSubBeforeReplay` 是否为空
+//: 推断 —— 那是间接证据，不是这��事实的直接表达。
+let isExperienceReplay = false;
 
 const DATA_MODE_META = {
   live:   { label: '实时行情', color: 'live' },

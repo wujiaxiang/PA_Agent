@@ -588,3 +588,136 @@ def test_replay_registers_overlays_in_the_shared_state():
     # 单位一致性：from 是毫秒，比较前必须折成秒
     assert re.search(r"fromSec|\bfrom\s*/\s*1000", body), \
         "入场时间(毫秒)与 marker 时间(秒)必须先统一单位再比较"
+
+
+# ── G1/G2/G5/G6：前端纯逻辑。**必须跑真实源码**，不许在测试里重写一遍 ──────────
+
+def _chart_js() -> str:
+    import pathlib
+
+    return (pathlib.Path(__file__).resolve().parents[2]
+            / "web" / "static" / "js" / "chart.js").read_text(encoding="utf-8")
+
+
+def _node(js: str):
+    import json
+    import subprocess
+
+    out = subprocess.run(["node", "-e", js], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, f"node 执行失败：{out.stderr[:300]}"
+    return json.loads(out.stdout.strip())
+
+
+def _extract(src: str, pattern: str) -> str:
+    import re
+
+    m = re.search(pattern, src, re.S)
+    assert m, f"源码里找不到：{pattern}"
+    return m.group(0)
+
+
+def test_logical_offset_scales_with_timeframe():
+    """G1：视窗定位必须按**实际周期**换算，不能写死小时。
+
+    此前写死 ``/3600``，只在 1h 下正确：5m 会偏 12 倍、15m 偏 4 倍、4h 反向偏
+    4 倍，结果被 ``Math.max(0, ...)`` 夹到最左边 —— 定位到错误的区域却毫无报错。
+    """
+    src = _chart_js()
+    # 依赖 TF_SECONDS，一起抽出 —— 单独抽函数会 ReferenceError，而那不是被测行为
+    table = _extract(src, r"const TF_SECONDS = \{.*?\};")
+    fn = _extract(src, r"function logicalOffsetFrom\(.*?\n\}")
+    got = _node(table + "\n" + fn + """
+      const D = 5 * 3600;   // 相距 5 小时
+      console.log(JSON.stringify({
+        '1h': logicalOffsetFrom(D,'1h'), '5m': logicalOffsetFrom(D,'5m'),
+        '15m': logicalOffsetFrom(D,'15m'), '4h': logicalOffsetFrom(D,'4h'),
+        '1d': logicalOffsetFrom(D,'1d'), '未知': logicalOffsetFrom(D,'7x'),
+      }));
+    """)
+    assert got["1h"] == 5
+    assert got["5m"] == 60, "5 小时的 5m bar 应是 60 根，而不是 5"
+    assert got["15m"] == 20
+    assert got["4h"] == 1, "5 小时的 4h bar 应是 1 根"
+    assert got["1d"] == 0
+    assert got["未知"] == 5, "未知周期按 1h 兜底"
+
+
+def test_replay_guards_against_a_different_instrument():
+    """G6：标的/周期不符时**必须拒绝绘制**。
+
+    经验库筛选「默认跟随当前订阅」只是界面约定、不是不变量。一旦筛选被改动或
+    将来支持跨标的浏览，就会在 A 的图上画出 B 的价格线 —— 看起来毫无破绽，
+    却完全错误。宁可什么都不画。
+
+    **跑 chart.js 里的真实函数**：早先版本把逻辑在测试里重写了一遍，于是反向
+    验证时改真实实现、测试照样绿 —— 自己测自己，等于没测。
+    """
+    fn = _extract(_chart_js(), r"function experienceReplayMatches\(.*?\n\}")
+    got = _node(fn + """
+      console.log(JSON.stringify({
+        same:    experienceReplayMatches({symbol:'BTCUSDT',timeframe:'1h'}, 'BTCUSDT', '1h'),
+        diffSym: experienceReplayMatches({symbol:'NVDA',   timeframe:'1h'}, 'BTCUSDT', '1h'),
+        diffTf:  experienceReplayMatches({symbol:'BTCUSDT',timeframe:'5m'}, 'BTCUSDT', '1h'),
+        blank:   experienceReplayMatches({symbol:'',       timeframe:''},    'BTCUSDT', '1h'),
+        none:    experienceReplayMatches(null, 'BTCUSDT', '1h'),
+      }));
+    """)
+    assert got["same"] is True
+    assert got["diffSym"] is False, "标的不符必须拒绝"
+    assert got["diffTf"] is False, "周期不符必须拒绝"
+    assert got["blank"] is True, "记录自身缺标的时不拦截（交给上层）"
+    assert got["none"] is False
+
+
+def test_marker_ownership_is_unified():
+    """G5：marker 归属标记**必须只有一种**，否则清理必然漏。
+
+    此前有三套字段名混在同一个 ``st.markers`` 数组里：seq 用 ``_isSeq``、
+    经验回放用 ``__exp``、方向箭头用 ``_isDirection``。只清其中一种时另外两种
+    必然残留 —— 「恰好互补」不是设计，是运气。
+
+    **只查代码、不查注释**：注释里保留旧名是有意的，那段文字记录了「为什么要
+    统一归属标记」，删掉就丢了这次改动的原因。
+    """
+    raw = _chart_js()
+    src = "\n".join(l.split("//")[0] for l in raw.splitlines())
+    for legacy in ("_isSeq", "_isDirection", "__exp"):
+        assert legacy not in src, f"旧的 {legacy} 标记仍在代码里使用"
+    made = {k: src.count(f"__src: MARKER_SRC.{k}") for k in ("SEQ", "DIR", "EXP")}
+    assert all(v >= 1 for v in made.values()), f"有 marker 没标归属：{made}"
+    assert src.count("_dropMarkers(st") >= 3, \
+        "每类 marker 的清理都必须走 _dropMarkers，不能各写各的 filter"
+
+
+def test_symbol_switch_clears_experience_overlay():
+    """G2：切换品种必须清掉经验叠加层。
+
+    ``loadBars() → applyBarsToChart()`` 全程不碰 overlay，而价格线/图例/箭头绑
+    的是**上一个标的**的价位与时间 —— 实测切到 NVDA 后图例仍写着
+    「BTCUSDT 1h · 入场 82709」。指标会清、叠加层不会。
+    """
+    import pathlib
+    import re
+
+    src = (pathlib.Path(__file__).resolve().parents[2]
+           / "web" / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    body = re.search(r"async function applySubscribe\(.*?\n\}", src, re.S)
+    assert body, "找不到 applySubscribe"
+    b = body.group(0)
+    # 断言**真的调用**，不是"标识符出现过"。只查标识符时，把
+    # `window.clearExperienceReplay(candleSeries)` 换成空操作、只留下
+    # `typeof window.clearExperienceReplay === 'function'` 那行守卫，测试照样绿。
+    code = "\n".join(l.split("//")[0] for l in b.splitlines())
+    assert "window.clearExperienceReplay(candleSeries)" in code, \
+        "切品种没有真正调用 clearExperienceReplay"
+    assert re.search(r"\bclearOverlays\(candleSeries\)", code), \
+        "切品种没有真正调用 clearOverlays"
+    # 两处都必须在切换**之前**（否则新 K 线先到、旧叠加层后清，会有闪一下）
+    i_exp = code.index("window.clearExperienceReplay(candleSeries)")
+    i_bars = code.find("loadBars(")
+    assert i_exp < i_bars, "清理必须早于重载 K 线，否则会闪一帧旧叠加层"
+    # 叠加层清空后画面就是新标的的实时行情，模式必须跟着回到实时 —— 否则
+    # 副标还挂着「经验回放 · <旧标的>」而图上是新标的，且 replay 已停轮询、图会冻住。
+    assert "isExperienceReplay" in code, "切品种未退出经验回放模式"
+    assert re.search(r"if \(isExperienceReplay\)[\s\S]{0,200}setDataMode\('live'\)", code), \
+        "切品种后没有把模式切回实时"

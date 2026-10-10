@@ -423,7 +423,7 @@ function setSupportResistance(candleSeries, levels) {
 function setDirectionMarker(candleSeries, decision, anchorTimeSec) {
   const st = _getOverlayState(candleSeries);
   // 移除旧的方向 marker（保留 seq marker 由 setSeqMarkers 管理）
-  st.markers = st.markers.filter(m => !m._isDirection);
+  st.markers = _dropMarkers(st, MARKER_SRC.DIR);
 
   if (!decision) return;
   if (decision.order_type === '不下单' || decision.order_type === 'no_order') return;
@@ -459,7 +459,7 @@ function setDirectionMarker(candleSeries, decision, anchorTimeSec) {
     color: isLong ? COLOR_LONG : COLOR_SHORT,
     shape: isLong ? 'arrowUp' : 'arrowDown',
     text: isLong ? '▲' : '▼',
-    _isDirection: true,
+    __src: MARKER_SRC.DIR,
   };
   st.markers.push(marker);
   _applyMarkers(candleSeries);
@@ -488,7 +488,7 @@ function _seqStep(total) {
 
 function setSeqMarkers(candleSeries, bars) {
   const st = _getOverlayState(candleSeries);
-  st.markers = st.markers.filter(m => !m._isSeq);
+  st.markers = _dropMarkers(st, MARKER_SRC.SEQ);
 
   if (!bars || !bars.length) {
     _applyMarkers(candleSeries);
@@ -508,7 +508,7 @@ function setSeqMarkers(candleSeries, bars) {
       color: '#9ca3af',
       shape: 'circle',
       text: `#${b.seq}`,
-      _isSeq: true,
+      __src: MARKER_SRC.SEQ,
     });
   }
   _applyMarkers(candleSeries);
@@ -544,6 +544,24 @@ function fitView(chart, visibleBars = FIT_VISIBLE_BARS, totalBars = 0) {
   } catch (_) {}
 }
 
+// ── marker 归属 ──────────────────────────────────────────────────────
+//: 每个 marker 都标 `__src` 说明**是谁画的**。清理时只摘自己那一份。
+//:
+//: **为什么必须统一**：此前 seq 标记用 `_isSeq`、经验回放用 `__exp`，两套字段名
+//: 混在同一个 `st.markers` 数组里，谁也认不全对方的 —— 只要有一处清理只认一种，
+//: 另一种就会残留。两套命名「恰好互补」不是设计，是运气。
+const MARKER_SRC = { SEQ: 'seq', EXP: 'exp', DIR: 'dir' };
+
+/** 摘掉属于 ``src`` 的 marker（就地返回新数组）。 */
+function _dropMarkers(st, src) {
+  return (st.markers || []).filter(m => !m || m.__src !== src);
+}
+
+/** 摘掉不属于 ``keep`` 的 marker。 */
+function _keepOnlyMarkers(st, keep) {
+  return (st.markers || []).filter(m => m && m.__src === keep);
+}
+
 // ── 清空 overlays ───────────────────────────────────────────────────
 function clearOverlays(candleSeries) {
   _clearPriceLines(candleSeries);
@@ -577,7 +595,7 @@ function _applyMarkers(candleSeries) {
     const tb = typeof b.time === 'number' ? b.time : 0;
     return ta - tb;
   });
-  // 去掉内部字段 _isSeq/_isDirection 再交给 SDK
+  // 去掉内部字段 __src 等再交给 SDK（SDK 不认识，多传会被忽略但别留垃圾）
   const clean = sorted.map(m => ({
     time: m.time, position: m.position, color: m.color,
     shape: m.shape, text: m.text,
@@ -605,13 +623,37 @@ function _toNum(v) {
 // 数据契约见 GET /api/experience 的 entry：{entry_price, take_profit_price,
 // stop_loss_price, is_long, entry_ts_open_ms, status, pnl_pct}。
 
+/**
+ * 这条经验能否画在**当前图表**上 —— 标的/周期必须一致。
+ *
+ * **为什么必须有守卫**：经验库的筛选「默认跟随当前订阅」只是**界面约定**，不是
+ * 不变量。一旦筛选被改动、或将来支持跨标的浏览，就会在 A 的图上画出 B 的
+ * 价格线（BTC 的 82709 画在 NVDA 图上），看起来毫无破绽却完全错误。
+ * 宁可拒绝画，也不要画一个错的。
+ */
+function experienceReplayMatches(entry, symbol, timeframe) {
+  if (!entry) return false;
+  const s = String(entry.symbol || '').toUpperCase();
+  const t = String(entry.timeframe || '').toLowerCase();
+  const cs = String(symbol || '').toUpperCase();
+  const ct = String(timeframe || '').toLowerCase();
+  if (s && cs && s !== cs) return false;
+  if (t && ct && t !== ct) return false;
+  return true;
+}
+
 function setExperienceReplay(series, entry) {
   if (!series) return;
   _clearPriceLines(series);
-  // 早退也要清 marker：否则「清掉回放」只清了价格线，箭头还留在图上
+  // **只摘经验回放自己的 marker**，不要清空整个数组：上一次分析留下的方向箭头
+  // 和 seq 序号标记都不属于这里。此前用 `st.markers = []` 会把它们一起抹掉，
+  // 而方向箭头**不会**像 seq 标记那样被下次 loadBars 补回来。
   const st0 = _getOverlayState(series);
-  st0.markers = [];
+  st0.markers = _dropMarkers(st0, MARKER_SRC.EXP);
   _applyMarkers(series);
+  // 交易图例也必须清：它描述的是刚被清掉的那些价格线，留着就是一段没有对应
+  // 线条的陈旧说明，比不画更误导（AGENTS 里已为 clearOverlays 记过同一条）。
+  clearTradeLegend();
   if (!entry) { clearExperienceLegend(); return; }
 
   const isLong = entry.is_long !== false;
@@ -629,6 +671,9 @@ function setExperienceReplay(series, entry) {
     { price: Number(entry.stop_loss_price), color: '#ef4444', lineStyle: 2, lineWidth: 1 },
   ];
   const stLines = _getOverlayState(series);
+  // 本次回放会完全取代上一回放的 marker（切换记录时不该叠加），
+  // 因此这里只保留**非经验**的那些 —— seq 序号标记要留着。
+  stLines.markers = _keepOnlyMarkers(stLines, MARKER_SRC.SEQ);
   for (const l of lines) {
     if (!Number.isFinite(l.price) || l.price <= 0) continue;
     try {
@@ -693,11 +738,11 @@ function setExperienceReplay(series, entry) {
   // 图上叠了 3 组「入场 238.93」箭头，前一条永远不消失。
   // 走状态层还顺带保住 seq 序号标记不被抹掉。
   //
-  // 打 `__exp` 标记是为了让 clearExperienceReplay 能**只摘自己画的那几个** ——
+  // 标 `__src` 是为了让 clearExperienceReplay 能**只摘自己画的那几个** ——
   // 直接 setMarkers([]) 会把 seq 序号标记一起抹掉，而不清又会留下半套叠加层
   // （实测返回实时后价格线清了、「入场」箭头还挂着）。
   const st = _getOverlayState(series);
-  st.markers = markers.map(m => Object.assign({ __exp: true }, m));
+  st.markers = st.markers.concat(markers.map(m => Object.assign({ __src: MARKER_SRC.EXP }, m)));
   _applyMarkers(series);
 
   _renderExperienceLegend(entry, statusLabel, isLong, dir, entryMarked, exitMarked);
@@ -716,13 +761,13 @@ function _hasBarAt(series, sec) {
 
 function clearExperienceReplay(series) {
   _clearPriceLines(series);
-  // **只摘经验回放自己画的 marker**（`__exp`），保留 seq 序号标记。
+  // **只摘经验回放自己画的 marker**（`__src === EXP`），保留 seq 序号标记。
   // 两种极端都是错的：
   //   · `series.setMarkers([])` —— 连 seq 序号标记一起抹掉；
   //   · 完全不清 —— 返回实时后价格线没了、「入场」箭头还挂着，半套叠加层。
   try {
     const st = _getOverlayState(series);
-    st.markers = (st.markers || []).filter(m => !m || !m.__exp);
+    st.markers = _dropMarkers(st, MARKER_SRC.EXP);
     _applyMarkers(series);
   } catch (e) { /* 摘不掉也要把价格线与图例清干净 */ }
   clearExperienceLegend();
@@ -753,8 +798,23 @@ function _renderExperienceLegend(entry, statusLabel, isLong, dir,
   `;
 }
 
+/** 周期 → 秒。视窗定位必须按**实际周期**换算，不能写死小时。 */
+const TF_SECONDS = {
+  '1m': 60, '3m': 180, '5m': 300, '15m': 900, '30m': 1800, '45m': 2700,
+  '1h': 3600, '2h': 7200, '3h': 10800, '4h': 14400, '6h': 21600,
+  '1d': 86400, '1w': 604800,
+};
+
+/** 时间（秒）差 → LWC 的逻辑 bar 偏移。未知周期按 1h 兜底。 */
+function logicalOffsetFrom(secDiff, timeframe) {
+  const step = TF_SECONDS[String(timeframe || '').toLowerCase()] || 3600;
+  return Math.round(secDiff / step);
+}
+
 // 挂到全局，供 app.js 调用
 if (typeof window !== 'undefined') {
   window.setExperienceReplay = setExperienceReplay;
   window.clearExperienceReplay = clearExperienceReplay;
+  window.experienceReplayMatches = experienceReplayMatches;
+  window.logicalOffsetFrom = logicalOffsetFrom;
 }
