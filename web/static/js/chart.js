@@ -606,8 +606,13 @@ function _toNum(v) {
 // stop_loss_price, is_long, entry_ts_open_ms, status, pnl_pct}。
 
 function setExperienceReplay(series, entry) {
+  if (!series) return;
   _clearPriceLines(series);
-  if (!entry || !series) return;
+  // 早退也要清 marker：否则「清掉回放」只清了价格线，箭头还留在图上
+  const st0 = _getOverlayState(series);
+  st0.markers = [];
+  _applyMarkers(series);
+  if (!entry) { clearExperienceLegend(); return; }
 
   const isLong = entry.is_long !== false;
   const dir = isLong ? '多' : '空';
@@ -615,20 +620,20 @@ function setExperienceReplay(series, entry) {
     pending: '待验证', win: '盈利', loss: '亏损', unresolved: '未触及',
   }[entry.status] || entry.status || '—';
 
+  // **不要给 createPriceLine 传 title**：title 是画在**图上**的文字，会直接压住
+  // 蜡烛（实测「入场 238.93」「止损 237.245」盖在 K 线上遮挡走势）。
+  // `axisLabelVisible` 已经把价格放到价格轴上；线的含义由颜色 + 图例承担。
   const lines = [
-    { price: Number(entry.entry_price), color: '#2962ff',
-      title: `入场 ${entry.entry_price}`, lineStyle: 0, lineWidth: 2 },
-    { price: Number(entry.take_profit_price), color: '#22c55e',
-      title: `止盈 ${entry.take_profit_price}`, lineStyle: 2, lineWidth: 1 },
-    { price: Number(entry.stop_loss_price), color: '#ef4444',
-      title: `止损 ${entry.stop_loss_price}`, lineStyle: 2, lineWidth: 1 },
+    { price: Number(entry.entry_price), color: '#2962ff', lineStyle: 0, lineWidth: 2 },
+    { price: Number(entry.take_profit_price), color: '#22c55e', lineStyle: 2, lineWidth: 1 },
+    { price: Number(entry.stop_loss_price), color: '#ef4444', lineStyle: 2, lineWidth: 1 },
   ];
   for (const l of lines) {
     if (!Number.isFinite(l.price) || l.price <= 0) continue;
     try {
       series.createPriceLine({
         price: l.price, color: l.color, lineWidth: l.lineWidth,
-        lineStyle: l.lineStyle, axisLabelVisible: true, title: l.title,
+        lineStyle: l.lineStyle, axisLabelVisible: true, title: '',
       });
     } catch (e) { /* 价格线失败不应影响回放整体 */ }
   }
@@ -649,20 +654,37 @@ function setExperienceReplay(series, entry) {
       entryMarked = true;
     }
   }
-  if (entry.resolved_ts_open_ms) {
-    const sec = Math.floor(Number(entry.resolved_ts_open_ms) / 1000);
-    if (Number.isFinite(sec) && (!from || sec > from)) {
-      markers.push({ time: sec, position: 'belowBar', shape: 'circle',
-                     color: statusLabel === '盈利' ? '#22c55e'
-                          : statusLabel === '亏损' ? '#ef4444' : '#94a3b8',
-                     text: statusLabel });
+  // 出场（判定）那根：盈利画向上箭头、亏损画向下箭头 —— 方向本身就是结论。
+  // LWC 的 marker 时间必须落在真实 bar 上，否则**静默丢弃**，所以和入场点
+  // 一样要先 _hasBarAt 校验，并在图例里说明没标出来的原因。
+  let exitMarked = false;
+  const exitMs = Number(entry.resolved_ts_open_ms || 0);
+  if (exitMs > 0 && Number.isFinite(exitMs)) {
+    const sec = Math.floor(exitMs / 1000);
+    if (!from || sec >= from) {
+      if (_hasBarAt(series, sec)) {
+        const won = entry.status === 'win';
+        const lost = entry.status === 'loss';
+        markers.push({
+          time: sec,
+          position: won ? 'belowBar' : 'aboveBar',
+          shape: won ? 'arrowUp' : 'arrowDown',
+          color: won ? '#22c55e' : lost ? '#ef4444' : '#94a3b8',
+          text: statusLabel,
+        });
+        exitMarked = true;
+      }
     }
   }
-  if (markers.length) {
-    try { series.setMarkers(markers); } catch (e) { /* 忽略 */ }
-  }
+  // **必须走 _applyMarkers，不能直接 series.setMarkers()**：后者绕过 overlay
+  // 状态，换一条记录时上一条的 marker 不会被清 —— 实测连续点开 3 条经验，
+  // 图上叠了 3 组「入场 238.93」箭头，前一条永远不消失。
+  // 走状态层还顺带保住 seq 序号标记不被抹掉。
+  const st = _getOverlayState(series);
+  st.markers = markers;
+  _applyMarkers(series);
 
-  _renderExperienceLegend(entry, statusLabel, isLong, dir, entryMarked);
+  _renderExperienceLegend(entry, statusLabel, isLong, dir, entryMarked, exitMarked);
 }
 
 // 该时间点是否存在于已加载的 bar 中
@@ -683,7 +705,8 @@ function clearExperienceReplay(series) {
   clearExperienceLegend();
 }
 
-function _renderExperienceLegend(entry, statusLabel, isLong, dir, entryMarked = true) {
+function _renderExperienceLegend(entry, statusLabel, isLong, dir,
+                                 entryMarked = true, exitMarked = true) {
   const el = document.getElementById('experience-legend');
   if (!el) return;
   const pnl = typeof entry.pnl_pct === 'number' ? entry.pnl_pct : null;
@@ -694,11 +717,16 @@ function _renderExperienceLegend(entry, statusLabel, isLong, dir, entryMarked = 
     <div class="exp-lg-title">经验回放 · ${escapeHtml(statusLabel)}</div>
     <div class="exp-lg-row">${escapeHtml(entry.symbol || '')} ${escapeHtml(entry.timeframe || '')} · ${dir}头</div>
     ${entry.cycle_label ? `<div class="exp-lg-row">${escapeHtml(entry.cycle_label)}</div>` : ''}
-    <div class="exp-lg-row">入场 <b>${entry.entry_price}</b> → 止盈 ${entry.take_profit_price} / 止损 ${entry.stop_loss_price}</div>
+    <div class="exp-lg-row">
+      <span style="color:#2962ff">▬ 入场</span> ${entry.entry_price} ·
+      <span style="color:#22c55e">▬ 止盈</span> ${entry.take_profit_price} ·
+      <span style="color:#ef4444">▬ 止损</span> ${entry.stop_loss_price}
+    </div>
     ${bars ? `<div class="exp-lg-row">判定窗口 ${escapeHtml(bars)} ${pnlText}</div>` : ''}
     ${entry.status === 'pending' ? '<div class="exp-lg-row dim">K 线尚未走完，继续等待结算</div>' : ''}
     ${entry.status === 'unresolved' ? '<div class="exp-lg-row dim">窗口内未触及任一价位</div>' : ''}
     ${entryMarked ? '' : '<div class="exp-lg-row dim">入场点不在当前 K 线范围内，未标注</div>'}
+    ${exitMarked ? '' : '<div class="exp-lg-row dim">判定 K 线不在当前范围内，未标注</div>'}
   `;
 }
 

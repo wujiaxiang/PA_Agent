@@ -285,6 +285,7 @@ class ExperienceWriter:
         pnl_pct: float | None = None,
         bars_seen: int | None = None,
         resolved_ts_ms: int | None = None,
+        resolved_ts_open_ms: int | None = None,
         user_id: str = "",
     ) -> bool:
         """Stage 2 — 把一条 pending 结成终态。
@@ -295,6 +296,11 @@ class ExperienceWriter:
 
         ``user_id`` 不传则沿用记录自带的 —— 阶段二跑在后台调度器线程上，
         没有请求上下文可问，记录本身是唯一的归属依据。
+
+        ``resolved_ts_open_ms`` 是**出场那根 K 线**的开盘时间（由
+        ``resolve_exit`` 的 ``exit_ts_open_ms`` 传来），供图上标注「判定发生在
+        哪一根」。它与 ``resolved_ts_ms`` 不是一回事：后者是**结算动作**发生的
+        时刻，可以是几天之后；前者是**行情上**的那一根。混淆两者会让箭头指错位置。
         """
         import time as _time
 
@@ -325,6 +331,10 @@ class ExperienceWriter:
             content.pop("pnl_pct", None)
         if bars_seen is not None:
             content["bars_seen"] = int(bars_seen)
+        if resolved_ts_open_ms is not None:
+            content["resolved_ts_open_ms"] = int(resolved_ts_open_ms)
+        else:
+            content.pop("resolved_ts_open_ms", None)
         content["resolved_ts_ms"] = int(
             resolved_ts_ms if resolved_ts_ms is not None else _time.time() * 1000
         )
@@ -427,7 +437,8 @@ def resolve_exit(
 
     返回首个触及 TP/SL 那根 bar 及其之前的全部信息：
 
-    ``{result, pnl_pct, exit_index, bars_to_exit, mfe_pct, mae_pct, touched}``
+    ``{result, pnl_pct, exit_index, exit_ts_open_ms, bars_to_exit, mfe_pct,
+    mae_pct, touched}``
 
     ``touched`` 为 False 表示窗口内两个价位都没碰到（未决终态），此时
     ``exit_index`` 为 None，MFE/MAE 覆盖**全部** ``bars``。
@@ -476,6 +487,10 @@ def resolve_exit(
             "pnl_pct": pnl,
             "exit_index": i,
             "bars_to_exit": i + 1,
+            # 出场那根 bar 的开盘时间。**必须报**：只给 exit_index 的话，
+            # 渲染层无法知道该在 K 线上标哪一根 —— 实测「确认的 K 线没有箭头」
+            # 就是因为 `resolved_ts_open_ms` 全仓没有任何写入方，永远为空。
+            "exit_ts_open_ms": int(ordered[i].get("ts_open") or 0) or None,
             "mfe_pct": mfe,
             "mae_pct": mae,
             "touched": True,
@@ -487,6 +502,8 @@ def resolve_exit(
         "pnl_pct": None,
         "exit_index": None,
         "bars_to_exit": len(ordered),
+        # 未触价：末根即判定窗口的终点，图上标在最后观察的那一根
+        "exit_ts_open_ms": int(ordered[-1].get("ts_open") or 0) if ordered else None,
         "mfe_pct": mfe,
         "mae_pct": mae,
         "touched": False,

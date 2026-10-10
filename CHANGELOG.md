@@ -197,6 +197,25 @@
 
 ## 2026-10-05
 
+### 17. 经验库回放三个显示缺陷（用户报）
+
+- **切换记录时图形重复累积**：`setExperienceReplay()` 直接 `series.setMarkers()`，
+  **绕过** overlay 状态层 → 上一条的 marker 永不清除。实测连点 3 条，叠了 3 组
+  「入场」箭头。改为写入 `st.markers` 后走 `_applyMarkers()`
+- **确认的 K 线没有箭头**：`resolved_ts_open_ms` **全仓只有读、没有写** ——
+  `resolve_exit` 只返回 `exit_index`，`finalize` 从没接受过该参数。补上
+  `exit_ts_open_ms` 回报 + `finalize(resolved_ts_open_ms=…)` 传递，
+  判定点改成盈利↑ / 亏损↓ 的**箭头**（方向本身即结论）
+- **金额压住 K 线**：`createPriceLine({title})` 的 `title` 画在图上，盖住蜡烛。
+  去掉 `title`，数值只走价格轴，含义交给颜色 + 图例
+
+**顺带修掉的早退漏洞**：`setExperienceReplay(series, null)` 原先只清价格线、
+不清 marker，箭头会留在图上。
+
+**测试自身踩的坑**：断言里 `after = [b for b in future if ...]` 没排序，而
+`future` 是最新在前 —— `next()` 取到最新那根，把断言指向了根本没成交的 bar。
+`_bars_after()` 的契约是 oldest-first，测试必须照做。
+
 ### 16. 结算受阻要在界面上说出来（用户报「验证后还能重复验证」）
 
 用户反馈：点了「验证」没反应，按钮还在，能反复点，怀疑没有状态守卫。

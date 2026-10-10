@@ -224,12 +224,17 @@ def settle_record(
     )
     if info is not None and info["touched"]:
         status = STATUS_WIN if info["result"] == "win" else STATUS_LOSS
-        writer.finalize(entry_id, status=status, pnl_pct=info["pnl_pct"], bars_seen=seen)
+        # resolved_ts_open_ms = **出场那根 K 线**，图上的判定箭头靠它定位。
+        # 不传的话该字段永远为空，界面上「确认的 K 线」就永远没有箭头。
+        writer.finalize(entry_id, status=status, pnl_pct=info["pnl_pct"],
+                        bars_seen=seen,
+                        resolved_ts_open_ms=info.get("exit_ts_open_ms"))
         _attach_program_review(writer, entry_id, status, content, info, user_id)
         return status, seen
 
     if seen >= max(1, int(verify_bars)):
-        writer.finalize(entry_id, status=STATUS_UNRESOLVED, bars_seen=seen)
+        writer.finalize(entry_id, status=STATUS_UNRESOLVED, bars_seen=seen,
+                        resolved_ts_open_ms=info.get("exit_ts_open_ms"))
         _attach_program_review(writer, entry_id, STATUS_UNRESOLVED, content, info, user_id)
         return STATUS_UNRESOLVED, seen
 

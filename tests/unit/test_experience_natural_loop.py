@@ -192,6 +192,14 @@ def _settle(loop, bars, shared_source):
 
 #: 入场时能看到的 K 线数（最后 40 根），其后才是「未来」
 _AT_ENTRY = 40
+#: ``_bars`` 里第一根的 ts_open
+_AT_ENTRY_BASE_MS = 1000
+
+
+def _pending_anchor(bars) -> int:
+    """生产写入口径：最后一根**已收盘** bar 的 ts_open。"""
+    closed = [b for b in bars if b.closed]
+    return closed[0].ts_open if closed else bars[1].ts_open
 
 
 def _later(*, extra: int, tp_at: int | None = None, sl_at: int | None = None,
@@ -486,3 +494,66 @@ def test_experience_payload_surfaces_the_settle_block_reason(loop):
     assert row["no_data_attempts"] >= ev.MAX_NO_DATA_ATTEMPTS
     assert row["settle_blocked"] is True, "受阻状态必须透出"
     assert "Network is unreachable" in row["settle_error"], "原因必须透出"
+
+
+# ── 图上标注需要的时间戳（渲染层 bug 的根因）────────────────────────────
+
+def test_settlement_records_the_exit_bar_timestamp(loop):
+    """结算必须落下 `resolved_ts_open_ms`（**出场那根 K 线**的开盘时间）。
+
+    **回归守卫**：该字段此前**全仓只有读、没有写** —— `resolve_exit` 只返回
+    `exit_index`，`finalize` 也从没接受过这个参数。于是图上的「判定箭头」
+    永远没有定位依据，界面上表现为「确认的 K 线上面没有箭头」。
+
+    注意它与 `resolved_ts_ms` 不是一回事：后者是**结算动作**发生的时刻
+    （可能是几天之后），前者是**行情上**的那一根。混淆会让箭头指错位置。
+    """
+    from pa_agent.storage.experience_repo import get_entry
+
+    entry_bars = _bars(n=_AT_ENTRY)
+    _run_stage1(loop, bars=entry_bars)
+    eid = _pending(loop)[0][0]
+
+    future = _later(extra=10, tp_at=_AT_ENTRY + 5)
+    _settle(loop, future, _FakeSource("BTCUSDT", "1h", "GATEIO", future))
+
+    e = get_entry(eid)
+    assert e["status"] == "win"
+    exit_ms = e.get("resolved_ts_open_ms")
+    assert exit_ms, "出场 bar 的时间戳缺失 —— 图上画不出判定箭头"
+
+    # 必须是**入场之后第一根真正触及止盈的那一根**，而不是窗口首尾或占位值。
+    #
+    # 不要写成「正好是 tp_at 那一根」：上涨趋势下价格在 tp_at 之前就可能穿过
+    # TP（本 fixture 就是如此），断言会指向一个根本没成交的 bar —— 那样测试
+    # 反而在验证一个假命题。
+    anchor = _pending_anchor(entry_bars)
+    # **必须升序**：``future`` 是最新在前（生产契约），不排序的话 ``next()``
+    # 取到的是最新那根 —— 实测因此把断言指向了 3940 而非真正的成交那根 3340。
+    # ``_bars_after()`` 的契约也是 oldest-first。
+    after = sorted((b for b in future if b.ts_open > anchor),
+                   key=lambda b: b.ts_open)
+    first_touch = next(b for b in after if b.high >= 120.0)
+    assert exit_ms == first_touch.ts_open, (
+        f"判定时间戳 {exit_ms} 不是第一根触及止盈的 bar（{first_touch.ts_open}）")
+
+
+def test_resolve_exit_reports_exit_bar_ts():
+    """纯函数层：`resolve_exit` 必须报出场 bar 的 ts_open。"""
+    from pa_agent.records.experience_writer import resolve_exit
+
+    bars = [
+        {"ts_open": 1000, "high": 101, "low": 99, "close": 100},
+        {"ts_open": 1060, "high": 121, "low": 100, "close": 120},   # 触及止盈
+    ]
+    info = resolve_exit(bars, entry_price=100.0, take_profit_price=120.0,
+                        stop_loss_price=90.0, is_long=True)
+    assert info["exit_ts_open_ms"] == 1060
+    assert info["exit_index"] == 1
+
+    # 未触价：报到最后一根
+    flat = [{"ts_open": 1000 + i * 60, "high": 101, "low": 99, "close": 100}
+            for i in range(3)]
+    info2 = resolve_exit(flat, entry_price=100.0, take_profit_price=120.0,
+                         stop_loss_price=90.0, is_long=True)
+    assert info2["exit_ts_open_ms"] == 1000 + 2 * 60
