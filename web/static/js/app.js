@@ -5629,6 +5629,15 @@ function hideReplayBadge() {
   const badge = $('#replay-badge');
   if (badge) badge.classList.add('hidden');
   isReplaying = false;
+  // 经验回放也会把状态置成 replay，所以「返回实时」必须一并清掉它画的价格线与
+  // marker。此前 btn-live 的多数分支会 clearOverlays()，但**订阅未变**那条走的是
+  // `if (!live || !live.symbol) { await loadBars(); return; }` —— 只刷 K 线、
+  // 不清叠加层，于是返回实时后历史价格线还挂在图上。
+  try {
+    if (typeof window.clearExperienceReplay === 'function' && candleSeries) {
+      window.clearExperienceReplay(candleSeries);
+    }
+  } catch (e) { /* 清不干净也要继续切回实时 */ }
 }
 
 // 删除历史记录：二次确认 → DELETE /api/records/{record_id} → 刷新列表
@@ -6003,6 +6012,12 @@ async function loadExperienceLibrary(opts) {
         list.querySelectorAll('.exp-item.is-replaying').forEach(x => x.classList.remove('is-replaying'));
         el.classList.add('is-replaying');
         if (typeof window.setExperienceReplay === 'function') {
+          // **先把状态切到「历史回看」**：经验回放画的是一笔**历史**交易的入场 /
+          // 止盈 / 止损，此时状态灯还亮着「实时」等于骗人 —— 用户以为在看实时
+          // 行情，却看到一根历史标记和一条历史价格线。
+          // 顺带的副作用都是对的：停掉实时轮询（画面不再被真实 K 线每 5s 顶掉）、
+          // 分析面板转只读（对着历史不该再跑分析）、图表染色与「历史」灯同源。
+          setDataMode('replay', `经验回放 · ${rec.symbol || ''} ${rec.timeframe || ''}`.trim());
           window.setExperienceReplay(candleSeries, rec);
           const anchor = Number(rec.entry_ts_open_ms || 0);
           const win = Number(window.__PA_LAST_BAR_TIME__ || 0);

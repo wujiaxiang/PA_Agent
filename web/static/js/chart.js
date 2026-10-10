@@ -692,8 +692,12 @@ function setExperienceReplay(series, entry) {
   // 状态，换一条记录时上一条的 marker 不会被清 —— 实测连续点开 3 条经验，
   // 图上叠了 3 组「入场 238.93」箭头，前一条永远不消失。
   // 走状态层还顺带保住 seq 序号标记不被抹掉。
+  //
+  // 打 `__exp` 标记是为了让 clearExperienceReplay 能**只摘自己画的那几个** ——
+  // 直接 setMarkers([]) 会把 seq 序号标记一起抹掉，而不清又会留下半套叠加层
+  // （实测返回实时后价格线清了、「入场」箭头还挂着）。
   const st = _getOverlayState(series);
-  st.markers = markers;
+  st.markers = markers.map(m => Object.assign({ __exp: true }, m));
   _applyMarkers(series);
 
   _renderExperienceLegend(entry, statusLabel, isLong, dir, entryMarked, exitMarked);
@@ -712,8 +716,15 @@ function _hasBarAt(series, sec) {
 
 function clearExperienceReplay(series) {
   _clearPriceLines(series);
-  // 注意：不要在这里 series.setMarkers([]) —— 那会连 seq 序号标记一起抹掉。
-  // 由 clearOverlays 统一处理 markers。
+  // **只摘经验回放自己画的 marker**（`__exp`），保留 seq 序号标记。
+  // 两种极端都是错的：
+  //   · `series.setMarkers([])` —— 连 seq 序号标记一起抹掉；
+  //   · 完全不清 —— 返回实时后价格线没了、「入场」箭头还挂着，半套叠加层。
+  try {
+    const st = _getOverlayState(series);
+    st.markers = (st.markers || []).filter(m => !m || !m.__exp);
+    _applyMarkers(series);
+  } catch (e) { /* 摘不掉也要把价格线与图例清干净 */ }
   clearExperienceLegend();
 }
 
