@@ -678,6 +678,7 @@ class DeepSeekClient:
         cancel_token: "CancelToken | None" = None,
         timeout_s: float = 600.0,
         max_tokens: int | None = None,
+        max_retries: int | None = None,
     ) -> AIReply:
         """Send *messages* to the DeepSeek API and return a structured reply.
 
@@ -687,6 +688,11 @@ class DeepSeekClient:
         *max_tokens* caps the computed completion budget. Use it for liveness
         probes (``startup_health_check``) so a connectivity check does not
         reserve/price a full 65k-token completion.
+
+        *max_retries* overrides the shared exponential backoff. Pass ``0`` for a
+        **liveness probe**: a probe that retries 5 times is not a probe, it is a
+        quota burner — one call becomes six, and the caller's ``timeout_s`` does
+        not bound it because the retries happen inside this function.
         """
         # Check cancellation before making the network call
         if cancel_token is not None and cancel_token.is_set():
@@ -765,6 +771,8 @@ class DeepSeekClient:
                 log=self._log,
                 stage_label="DeepSeek",
                 cancel_token=cancel_token,
+                # 只在显式传入时覆盖：默认值属于 rate_limit，不在这里重述一遍
+                **({"max_retries": int(max_retries)} if max_retries is not None else {}),
             )
         except Exception as exc:
             latency_ms = (time.monotonic() - t0) * 1000

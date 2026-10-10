@@ -68,6 +68,14 @@ def check_model_api(ctx: Any) -> ComponentHealth:
     an AIReply synchronously).  ``max_tokens`` is capped to 1 and the request
     timeout to 10s: this endpoint is unauthenticated, so it must not price or
     occupy a full completion budget, nor hang the caller for the default 600s.
+
+    ``max_retries=0`` is the point of this function. A liveness probe that
+    inherits the client's exponential backoff turns **one** probe into **six**
+    upstream requests, and the caller's ``timeout_s`` cannot bound it because the
+    retries happen inside ``chat()`` — measured latency in production was 166 s
+    (5+10+20+40+80 s of backoff) while the frontend polls this endpoint every
+    60 s, so probes stack on top of each other. On a free-tier model that is the
+    quota: 2381 health requests in one day, each up to 6 calls.
     """
     start = time.perf_counter()
     try:
@@ -77,9 +85,12 @@ def check_model_api(ctx: Any) -> ComponentHealth:
         messages = [{"role": "user", "content": "ping"}]
         if hasattr(client, "chat"):
             try:
-                client.chat(messages, max_tokens=1, timeout_s=10.0)
+                client.chat(messages, max_tokens=1, timeout_s=10.0, max_retries=0)
             except TypeError:
                 # Client without the newer kwargs — fall back, still bounded.
+                # NOTE: this path cannot guarantee a single attempt; it is only
+                # for clients that predate ``max_retries``. The production client
+                # (DeepSeekClient) supports it, so this is not the live path.
                 client.chat(messages)
         else:
             return ComponentHealth(
