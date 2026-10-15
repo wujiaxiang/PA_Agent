@@ -130,6 +130,28 @@ _apply_llm_source 读到 use_custom 缺失 → 「从未表态」
 `test_provider_overrides_ignored_until_opted_in` 守护，不放宽）、
 `web/static/**`、容器运行中的配置数据。
 
+#### ⚠️ 本轮自身失误：隔离 e2e 污染了生产 `config/settings.json`
+
+做端到端验收时，我在隔离实例（临时库 + 8111 端口）上调了
+`POST /api/settings/promote-default`。**该接口会把生效配置回写
+工作区的 `config/settings.json`**，而 `docker-compose.yml` 把这个目录挂进了
+容器（`../config:/app/config`）—— 于是我的测试值
+（`e2e-user-model-xyz` / `http://127.0.0.1:9999/v1`）写进了**真实配置文件**，
+事后 Docker 内读到的就是被改坏的配置。
+
+**教训（要给所有做 e2e 的人）**：
+- 「临时 DB」隔离不了**文件副作用**。`PA_AGENT_DB_PATH` 只管 SQLite，
+  `promote-default` 写的是 repo 里的 `config/settings.json`，两回事
+- 判断测试是否干净，**比对 `config/settings.json` 的 md5**，不能只看端口和库
+- e2e 需要 `baseline.use_custom=True` 这个触发条件时，**直接写 `save_baseline`**
+  （同进程、明确的库），不要绕道 `promote-default`
+
+**已处置**：从事先备份与容器内生产 baseline
+（`model=space-bunny-free` / `base_url=8093` / `thinking=False`）逐字段还原，
+并核对 Docker 内 `settings.json` 与 `global_config.settings.baseline` 一致。
+重跑干净版 e2e 验证：`model` 与待存 `longcat` 不同（排除"等于基线"的假通过）、
+复查 md5 未变、生产配置零改动。
+
 ---
 
 ### 2026-10-07 · 修 DB baseline 的坏网关组合 + override 无效（当前）
