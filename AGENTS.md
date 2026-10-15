@@ -100,6 +100,25 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
   **守护拒绝/校验逻辑的用例不许依赖与该逻辑无关的默认值**，要显式设置
 - **测试断言不要硬编码出厂默认值**：对照 `AIProviderSettings()` 实例，
   否则每次改默认值都要连带改测试
+  2026-10-16 合并上游（上游把 `reasoning_effort` 默认值
+   让这条**本该守住默认值一致性**的用例反过来反对默认值本身
+- **测试隔离必须覆盖 `settings.json` 播种源，不只是 DB**（2026-10-16 实测）：
+  `promote_to_baseline()` 写完 baseline 后还会把同一份配置写进
+  `paths.SETTINGS_JSON_PATH`（= `config/settings.json`）。那是**导入期常量**，
+  `PA_AGENT_DB_PATH` 管不到它 —— 只隔离 DB 时，跑一遍单测就把真实的
+  `config/settings.json` 改成代码默认值。**危险在于它伪装成「无害」**：值全是
+  合法默认值、模型可用、没有任何报错，直到清库重播种时用户才拿到被改坏的
+  出厂配置。而 `use_custom` 这类开关一旦与 DB baseline 不一致，
+  `_apply_llm_source` 的门控就会整段作废用户覆盖
+  - 隔离写法见 `tests/conftest.py`：改 `paths` 模块属性即可
+    （`promote_to_baseline` 用函数内 `from ... import`，会重读当前属性值）
+  - ⚠️ **守护测试推导仓库路径必须用 `PROJECT_ROOT`**，不能用
+    `from paths import SETTINGS_JSON_PATH`：模块顶层 import 在 **conftest 执行
+    之后**才求值，拿到的也是被隔离的 tmp 路径，会把守护测成恒绿。
+    `PROJECT_ROOT` conftest 不改，是真值锚点
+  - ⚠️ **守护测试不许自己打 monkeypatch 兜底**：那会把「路径已被隔离」测成
+    恒真，撤掉 conftest 也照样绿。要故意让被测代码自己解析路径，
+    只断言它不在仓库内 —— 撤掉 conftest 后本条必须变红（已反向验证）
 - **`git add` 改的是共享暂存区，不是会话私有的**：并行会话在同一工作树下
   `git add` 后、自身 `git commit` 前，另一会话的提交会把**本会话暂存的文件
   一并带走**。2026-10-05 实测：`app.js` 被对方的 auth 提交捎走（代码完好、

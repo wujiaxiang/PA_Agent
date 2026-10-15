@@ -6,6 +6,42 @@
 
 ## 2026-10-16
 
+### 34. 合并上游 main + 固化为镜像 + 修「测试污染 config/settings.json」
+
+- **合并上游**：`cd0aca2..80d387e`（5 提交，77 文件 +8954/-407，纯新增）。
+  **仓库无 `master` 分支**，主分支是 `main`（历史同步均经 PR 合入），故合入 `main`。
+  3 处冲突全部取「上游结构 + 本仓库行为」的并集：
+  - `deepseek_client.py`：上游把参数搬进 `_rl_kwargs` 只处理 sensenova，
+    丢掉了健康探针的显式 `max_retries` 覆盖 ⇒ 合并解保留前者、再让显式覆盖
+    二次生效，防「非 sensenova 网关上探针仍退避 5 次」的回归复活
+  - `two_stage.py`：上游删掉 `incremental/continuous/user_id/exchange` 四入参。
+    这四个不能删（`user_id` 是用户隔离唯一通道；`exchange` 用本次请求游标而非
+    只读冻结值）。已核实上游签名仍接受，删除纯属合并表象
+  - `util/logging.py`：三类 import 均被使用，取并集
+- **固化为镜像**：buildkit 的 `RUN` 阶段在本 LXC 无法加载 apparmor profile，
+  从**真实部署版** `pa-agent-web:new-c600443` 派生 + `--security-opt apparmor=unconfined`
+  跑完各层后 `docker commit`（显式重设 CMD/EXPOSE/WORKDIR，历史踩坑）。
+  代码源自 `git archive HEAD` 纯净树，不含任何他人未提交改动；清过 `__pycache__`
+  防旧字节码冒充新代码。从固化镜像起纯净容器跑真实保存路径复现成功
+- **顺手修掉的真 bug**：`promote_to_baseline()` 除写 DB 外还把同一份配置写进
+  `paths.SETTINGS_JSON_PATH`，而它是**导入期常量**，`PA_AGENT_DB_PATH` 管不到。
+  只隔离 DB 时，跑一遍单测就把真实 `config/settings.json` 改成代码默认值。
+  **危险在于它伪装成无害** —— 值全合法、无报错，直到清库重播种用户才拿到被
+  改坏的出厂配置；而 `use_custom` 与 DB baseline 不一致会让 `_apply_llm_source`
+  门控整段作废用户覆盖。修复在 `tests/conftest.py` 隔离该路径 + 新增守护用例，
+  反相验证三态已做（在场→绿、撤掉→红且报错直指根因、恢复→绿）
+  - ⚠️ 守卫推导仓库路径必须用 `PROJECT_ROOT`；用
+    `from paths import SETTINGS_JSON_PATH` 拿到的是已隔离的 tmp 路径，会恒绿
+  - ⚠️ 守卫不能自己打 monkeypatch，否则「已被隔离」被测成恒真
+- **上游默认值变更连带的存量测试**：上游把 `reasoning_effort` 默认值
+  `high`→`low`，`test_settings_round_trip.py::test_defaults` 写死 `"high"`
+  让这条**本该守住默认值一致性**的用例反过来反对默认值本身，改为对照实例
+- **文件**：`pa_agent/{ai/deepseek_client.py, orchestrator/two_stage.py,
+  util/logging.py, config/settings.py, ai/market_features.py,
+  ai/sensenova_fallback.py, orchestrator/free_chat.py}`、
+  `tests/{conftest.py, unit/test_settings_cascade.py,
+  unit/test_settings_round_trip.py}`、`AGENTS.md`、`SESSION_CHANGES.md`
+
 ### 33. 修「Docker 里保存 LLM 配置不生效」—— `use_custom` 被稀疏化删掉
 
 - **问题**：用户在 Docker 环境保存 LLM 配置（换 model / base_url）后完全不生效，

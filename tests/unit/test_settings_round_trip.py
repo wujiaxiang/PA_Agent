@@ -25,7 +25,10 @@ def test_defaults(tmp_path):
     assert s.provider.model == AIProviderSettings().model
     assert s.provider.base_url == AIProviderSettings().base_url
     assert s.provider.thinking is True
-    assert s.provider.reasoning_effort == "high"
+    # 同上：对照实例默认值，不硬编码。上游把 reasoning_effort 的默认值从 "high"
+    # 调成 "low"（2026-10-16 合并）时，写死的 "high" 会让这条**本该守住默认值
+    # 一致性**的用例反过来反对默认值本身 —— 与它自己的 docstring 相悖。
+    assert s.provider.reasoning_effort == AIProviderSettings().reasoning_effort
     assert s.provider.context_window == 2_000_000
     assert s.general.analysis_bar_count == 100
     # 本仓库 Web 后端为 TradingView-only（factory.py::DATA_SOURCE_CHOICES 只暴露

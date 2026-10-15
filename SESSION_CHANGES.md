@@ -69,6 +69,83 @@
 
 ## ✅ 已提交
 
+### 2026-10-16 · 合并上游 main + 固化为镜像 + 修「测试污染 config/settings.json」
+
+**状态**：已提交（合并 `5c7574a`，本次提交见末尾）
+
+#### 需求
+按用户指示「固化吧，代码提交合并 master 吧，顺便 pull 一下上游的项目的更新」。
+
+#### 三件事
+1. **pull 上游 main**（`cd0aca2..80d387e`，5 个提交，77 文件 +8954/-407，
+   纯新增研究脚本与测试）。仓库**没有 `master` 分支**，主分支是 `main`
+   （`origin/HEAD -> origin/main`），故合入 `main`。
+2. **解 3 处冲突**，全部取「上游结构 + 本仓库行为」的并集：
+   - `deepseek_client.py`：上游把调用参数搬进 `_rl_kwargs` 只处理 sensenova，
+     **丢掉了探针的显式 `max_retries` 覆盖**。合并解保留 `_rl_kwargs` 结构，
+     再让显式 `max_retries` 二次覆盖它 —— 否则「非 sensenova 网关上探针仍
+     退避 5 次」这条回归（AGENTS.md「健康探针不得继承退避」）会复活
+   - `two_stage.py`：上游删掉 `incremental/continuous/user_id/exchange` 四个
+     入参，只保留 `self._last_sensenova_fallback_failure = None`。**四个入参
+     不能删** —— `user_id` 落进 `RecordMeta.user_id` 是用户隔离的唯一通道，
+     `exchange` 用本次请求游标而非全局冻结值（`_CURSOR_FIELDS` 只读）。
+     已核实上游 `_build_empty_record()` 签名仍接受它们，删除纯属合并表象
+   - `util/logging.py`：`contextvars`+`json` 与 `copy` 三者在文件里都被使用，取并集
+3. **固化为镜像**：本机 buildkit 的 `RUN` 阶段无法加载 apparmor profile
+   （AppArmor 限制，CHANGELOG 记录过），故从**真实部署版**
+   `pa-agent-web:new-c600443` 派生容器，`docker run --security-opt apparmor=unconfined`
+   跑完 Dockerfile 各层，再 `docker commit`。**显式重设 `CMD`/`EXPOSE`/`WORKDIR`**
+   （历史踩坑：不重设会把 `sleep infinity` 固化成默认启动命令）。
+   - 代码来源是 `git archive HEAD` 纯净树，**不含任何他人未提交改动**
+     （`app.js`/`chart.js`/`index.html` 的未提交分属其他会话，未纳入）
+   - 清过 `__pycache__`/`*.pyc`，防旧字节码冒充新代码
+   - 镜像内校验：4 个关键文件 md5 与 HEAD 逐字一致、`_LLM_SWITCH_KEY` 在场、
+     `py_compile` 通过、无 PyQt6、`config/` 只含 example 无真实凭据
+   - 从固化镜像起纯净容器跑真实保存路径复现：`use_custom=True` 落库生效
+
+#### 顺手抓到并修掉的一个真 bug：测试会改写真实 `config/settings.json`
+**现象**：跑完设置相关测试后，`config/settings.json` 从
+`use_custom=true / thinking=false / reasoning_effort=high`
+漂成 `use_custom=false / thinking=true / reasoning_effort=low`
+（全是**代码默认值**），而生产 DB baseline 是前者。
+
+**根因**：`promote_to_baseline()` 写完 baseline 后还会把同一份配置写进
+`paths.SETTINGS_JSON_PATH`，那是**导入期常量**，`PA_AGENT_DB_PATH` 管不到。
+`tests/conftest.py` 原本只隔离 DB。
+**它伪装成无害**：值全合法、模型可用、无任何报错，直到清库重播种时用户
+才拿到被改坏的出厂配置；而 `use_custom` 与 DB baseline 一旦不一致，
+`_apply_llm_source` 门控会整段作废用户覆盖（正是本次 bug 的判据）。
+
+**修复**：`tests/conftest.py` 在导入期把 `paths.SETTINGS_JSON_PATH`
+指向 tmp 目录；新增守护 `test_promote_does_not_touch_repo_settings_json`。
+- ⚠️ 守卫推导仓库路径必须用 `PROJECT_ROOT`（`from paths import
+  SETTINGS_JSON_PATH` 拿到的也是被隔离后的 tmp 路径，会把守护测成恒绿）
+- ⚠️ 守卫**不能自己打 monkeypatch**（那会把「已被隔离」测成恒真）
+- 反向验证三态已做：修复在场→绿、撤掉→红且报错直指根因、恢复→再绿；
+  真实文件三态全程 md5 不变
+
+#### 被上游默认值变更打断的存量测试（已修）
+上游把 `reasoning_effort` 默认值 `high`→`low`，`test_settings_round_trip.py::
+test_defaults` 写死 `"high"`，让这条**本该守住默认值一致性**的用例反过来
+反对默认值本身。改为对照 `AIProviderSettings()` 实例（符合它自己的 docstring）。
+
+#### 已知崩溃（存量，与本次无关）
+`pytest tests/unit` 在约 4% 处 `Fatal Python error: Aborted`，栈里是 PyQt6。
+已用 `git archive HEAD` 干净树双向对照：合并前（HEAD~1）与合并后（HEAD）
+**崩溃点完全一致**（同处第 39 个测试后），故为 Linux 上 PyQt 的存量问题。
+
+#### 冲突风险 ⚠️
+- `tests/conftest.py` 改的是**导入期属性**，任何在收集前就
+  `from pa_agent.config.paths import ...` 的模块拿到的仍是旧值。
+  新测试若需隔离该路径，请在用例内从 `paths` 模块属性读
+- `pa-agent-web:latest` 已指向本次固化镜像；回滚标签
+  `pa-agent-web:rollback-before-c627f3c` 保留
+
+#### 接口变更
+`POST /api/settings/promote-default` 的播种源写入目标在**测试环境**下
+改为 tmp 目录（生产未变）。
+
+
 ### 2026-10-16 · 修「LLM 配置保存不生效」：`use_custom` 被稀疏化删掉
 
 **状态**：已提交 `c627f3c`

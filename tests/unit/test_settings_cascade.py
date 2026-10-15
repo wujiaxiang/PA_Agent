@@ -486,6 +486,58 @@ def test_switch_key_literal_matches_storage_module(db):
 # ── 出厂默认的显式提升（settings.json 不再随保存漂移）─────────────────────────
 
 
+def test_promote_does_not_touch_repo_settings_json(db):
+    """`promote_to_baseline` 必须写隔离路径，**不能碰仓库真实 settings.json**。
+
+    守护一次实测事故（2026-10-16）：`tests/conftest.py` 原本只隔离
+    `PA_AGENT_DB_PATH`，而 `promote_to_baseline()` 写完 baseline 后还会把同一份
+    配置写进 `settings.json` 播种源。那个路径是**导入期常量**，环境变量管不到
+    它 —— 跑一遍单测就把 `config/settings.json` 改成了代码默认值
+    （`use_custom=false / thinking=true / reasoning_effort=low`），与生产 baseline
+    （`use_custom=true / reasoning_effort=high`）不一致。**清库重播种时用户拿到的
+    就是被测试改坏的出厂配置**，且毫无报错。
+
+    判据不看「有没有调 promote」，看**代码解析到的目标路径在哪**。
+
+    ⚠️ 推导仓库路径只能用 `PROJECT_ROOT`：`SETTINGS_JSON_PATH` 已被 conftest
+    改指向 tmp，而模块顶层 `from paths import SETTINGS_JSON_PATH` 是在
+    **conftest 执行之后**才求值的，拿到的也是 tmp 路径 —— 拿它当「真实文件」
+    会把守护测成恒绿。`PROJECT_ROOT` conftest 不改，是真值锚点。
+
+    **也不能靠 monkeypatch 兜底**：那会把「路径已被隔离」测成恒真，撤掉
+    conftest 也照样绿，守护就成了摆设。本用例**故意不打 monkeypatch**，
+    让被测代码自己解析路径，只断言它不在仓库内。
+
+    反向验证（撤掉 conftest 隔离后本条必须变红）已验证：两种断言各守一半 ——
+    前者发现「真文件被改」，后者发现「路径隔离失效」。
+    """
+    from pa_agent.config import paths as _pa_paths
+    from pa_agent.config.settings import Settings
+    from pa_agent.storage.settings_store import promote_to_baseline
+
+    repo_file = _pa_paths.PROJECT_ROOT / "config" / "settings.json"
+    before = repo_file.read_bytes() if repo_file.exists() else None
+
+    # 只记下「代码会写到哪」，**不改它** —— 改了就等于替被测逻辑做了隔离。
+    resolved = _pa_paths.SETTINGS_JSON_PATH
+
+    current = Settings.model_validate({
+        **Settings().model_dump(),
+        "general": {**Settings().general.model_dump(), "analysis_bar_count": 4242},
+    }).model_dump(mode="json")
+
+    assert promote_to_baseline(current) is True
+
+    after = repo_file.read_bytes() if repo_file.exists() else None
+    assert after == before, (
+        f"{repo_file} 被改了 —— promote_to_baseline 写到了仓库真实配置文件。"
+        "必须隔离 settings.json 播种源路径（见 tests/conftest.py）"
+    )
+    assert Path(resolved).resolve() != repo_file.resolve(), (
+        f"播种源解析到了仓库路径 {repo_file} —— conftest.py 的隔离失效了"
+    )
+
+
 def test_put_settings_does_not_write_back_settings_json(db, monkeypatch):
     """保存设置**不得**回写 settings.json。
 

@@ -29,6 +29,32 @@ os.environ.setdefault(
 # 部分测试会连真实 .env，模型凭证可能指向付费端点。测试里一律不发真请求。
 os.environ.setdefault("PA_AGENT_TESTING", "1")
 
+# ── settings.json 播种源隔离（2026-10-16 实测事故后补）──────────────────────
+#
+# **只隔离 DB 是不够的**。`promote_to_baseline()` 在写完 baseline 之后，会
+# 再把同一份配置写进 ``SETTINGS_JSON_PATH``（= config/settings.json）。
+# 那个路径是**导入期常量**（`pa_agent/config/paths.py` 里直接算好），
+# `PA_AGENT_DB_PATH` 管不到它 —— 于是任何调用 promote 的测试都会覆盖开发者的
+# 真实配置文件。
+#
+# 实测后果：跑一遍 `tests/unit` 之后，`config/settings.json` 被改成
+# `use_custom=false / thinking=true / reasoning_effort=low`（全是代码默认值），
+# 而生产 DB 的 baseline 是 `use_custom=true / reasoning_effort=high`。
+# 两者一旦不一致，**清库重播种时用户拿到的就是被测试改坏的出厂配置**。
+#
+# 注意：`promote_to_baseline` 用的是 `from ... import SETTINGS_JSON_PATH`
+# 的**函数内导入**，改模块属性对它无效 —— 必须在**模块被导入前**改。
+# 这里的做法是直接改 paths 模块的属性，因为 promote 的函数内 import
+# 每次都会重新解析属性（`from X import Y` 取的是当时的值）。
+_SETTINGS_JSON_TMP = _SESSION_DB_DIR / "config"
+_SETTINGS_JSON_TMP.mkdir(parents=True, exist_ok=True)
+from pa_agent.config import paths as _pa_paths  # noqa: E402
+
+_pa_paths.SETTINGS_JSON_PATH = _SETTINGS_JSON_TMP / "settings.json"
+
+# 有些调用点可能已 `from pa_agent.config.paths import SETTINGS_JSON_PATH`
+# 形式绑到了自己的命名空间，那种改不动；至少守住「用 paths.X 引用」的多数写法。
+
 @pytest.fixture()
 def db_path_isolated(tmp_path, monkeypatch):
     """把 hub 指向 tmp 目录下的独立 DB，并保证每次测试拿到全新的 hub。"""
