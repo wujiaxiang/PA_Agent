@@ -51,6 +51,13 @@ class BreakoutEvent:
 
 @dataclass(frozen=True)
 class HLCountState:
+    """H/L trigger count inside the CURRENT pullback leg (not over the whole window).
+
+    bull_count counts H triggers since the most recent confirmed swing high, as long as that
+    swing high has not been exceeded; bear_count is the mirror for L triggers after a swing low.
+    0 / "none" also means "no active pullback leg".
+    """
+
     bull_count: int
     bear_count: int
     last_bull_trigger_seq: int | None
@@ -58,6 +65,8 @@ class HLCountState:
     bull_candidate: str  # none | h1 | h2 | h3
     bear_candidate: str  # none | l1 | l2 | l3
     bar_range: str
+    bull_leg_start_seq: int | None = None  # seq of the swing high that started the active leg
+    bear_leg_start_seq: int | None = None  # seq of the swing low that started the active leg
 
 
 @dataclass(frozen=True)
@@ -157,7 +166,7 @@ def compute_simple_market_features(
     )
     breakout_events = _dedupe_breakout_events(raw_breakout_events)
 
-    hl_count = _compute_hl_count(window, atr_val)
+    hl_count = _compute_hl_count(window)
     supports, resistances = _structure_levels(window, close, swings)
     invalidation_long = supports[0] if supports else None
     invalidation_short = resistances[0] if resistances else None
@@ -311,16 +320,28 @@ def render_simple_market_features(features: SimpleMarketFeatures) -> str:
     )
 
     hc = features.hl_count
-    lines.extend(["", "### H/L 计数触发（突破前一棒极点）"])
+    lines.extend(["", "### H/L 计数（当前回撤腿内；自最近确认的摆动高/低点起，创出新极值后清零）"])
+    if hc.bull_leg_start_seq is None:
+        lines.append("- 多头：当前无活跃回撤腿（最近摆动高点已被突破，或窗口内无确认的摆动高点），H1/H2 不适用")
+    else:
+        cand = hc.bull_candidate.upper() if hc.bull_candidate != "none" else "尚无触发"
+        lines.append(
+            f"- 多头：自摆动高点 K{hc.bull_leg_start_seq} 起已触发 **{hc.bull_count}** 次 H（候选 {cand}）"
+            + (f"，最近触发 K{hc.last_bull_trigger_seq}" if hc.last_bull_trigger_seq else "")
+        )
+    if hc.bear_leg_start_seq is None:
+        lines.append("- 空头：当前无活跃反弹腿（最近摆动低点已被跌破，或窗口内无确认的摆动低点），L1/L2 不适用")
+    else:
+        cand = hc.bear_candidate.upper() if hc.bear_candidate != "none" else "尚无触发"
+        lines.append(
+            f"- 空头：自摆动低点 K{hc.bear_leg_start_seq} 起已触发 **{hc.bear_count}** 次 L（候选 {cand}）"
+            + (f"，最近触发 K{hc.last_bear_trigger_seq}" if hc.last_bear_trigger_seq else "")
+        )
     lines.append(
-        f"- 多头计数：**{hc.bull_count}**（候选 {hc.bull_candidate.upper()}）"
-        + (f"，最近触发 K{hc.last_bull_trigger_seq}" if hc.last_bull_trigger_seq else "")
+        "- 口径：H1 = 回撤腿内第一次突破前一棒高点；只有上一次 H 的信号棒低点被跌破（出现新的下探腿）后，"
+        "下一次突破才计为 H2，依此类推；L1/L2 对称。"
     )
-    lines.append(
-        f"- 空头计数：**{hc.bear_count}**（候选 {hc.bear_candidate.upper()}）"
-        + (f"，最近触发 K{hc.last_bear_trigger_seq}" if hc.last_bear_trigger_seq else "")
-    )
-    lines.append(f"- 计数窗口：{hc.bar_range}")
+    lines.append(f"- 计数范围：{hc.bar_range}")
 
     lines.extend(["", "### 结构价位候选"])
     if features.supports:
@@ -921,52 +942,83 @@ def _detect_breakout_events(
     return events
 
 
-def _compute_hl_count(bars: tuple[KlineBar, ...], atr: float | None) -> HLCountState:
-    if len(bars) < 2:
+_HL_PIVOT_RIGHT = 2        # fractal confirmation: 2 bars on each side
+_HL_MAX_LEG_BARS = 30      # a pullback leg older than this is no longer treated as "current"
+
+
+def _count_pullback_triggers(
+    highs: list[float],
+    lows: list[float],
+    seqs: list[int],
+) -> tuple[int, int | None, int | None]:
+    """Count H triggers in the ACTIVE pullback leg at the end of a chronological window.
+
+    Returns (count, last_trigger_seq, leg_start_seq); leg_start_seq is None when no leg is active.
+
+    Definition (causal, mirrors the validated research version):
+      * A leg starts when a fractal swing high (higher than 2 bars on each side) is confirmed.
+      * It ends (state cleared) when a later bar's high exceeds that swing high, or after
+        ``_HL_MAX_LEG_BARS`` bars.
+      * Trigger = a bar after the first pullback bars whose high exceeds the previous bar's high.
+      * After a trigger the counter is disarmed; it re-arms only when a later bar trades below the
+        previous trigger's signal-bar low (a new down-leg).  The n-th trigger is H_n.
+    For L1/L2 call this on mirrored arrays (highs=-lows, lows=-highs).
+    """
+    n = len(highs)
+    state: dict | None = None
+    for k in range(n):
+        s = k - _HL_PIVOT_RIGHT
+        if (
+            state is None
+            and s >= 2
+            and highs[s] > highs[s - 1]
+            and highs[s] > highs[s - 2]
+            and highs[s] > highs[s + 1]
+            and highs[s] > highs[k]
+        ):
+            state = {"s": s, "sh": highs[s], "count": 0, "armed": True, "sig_low": None, "last": None}
+        if state is None:
+            continue
+        if k > state["s"] + _HL_PIVOT_RIGHT and highs[k] > state["sh"]:
+            state = None
+            continue
+        if k - state["s"] > _HL_MAX_LEG_BARS:
+            state = None
+            continue
+        if not state["armed"] and state["sig_low"] is not None and lows[k] < state["sig_low"]:
+            state["armed"] = True
+        if state["armed"] and k > state["s"] + _HL_PIVOT_RIGHT and highs[k] > highs[k - 1]:
+            state["count"] += 1
+            state["last"] = seqs[k]
+            state["armed"] = False
+            state["sig_low"] = lows[k - 1]
+    if state is None:
+        return 0, None, None
+    return state["count"], state["last"], seqs[state["s"]]
+
+
+def _compute_hl_count(bars: tuple[KlineBar, ...]) -> HLCountState:
+    """H1/H2/L1/L2 count inside the current pullback / rally leg (bars are newest-first)."""
+    if len(bars) < 6:
         return HLCountState(0, 0, None, None, "none", "none", "不适用")
 
-    bull = 0
-    bear = 0
-    last_bull: int | None = None
-    last_bear: int | None = None
-    newest = int(bars[0].seq)
-    oldest = int(bars[-1].seq)
-    reset_range = (atr or 0.0) * 1.2
+    chrono = list(reversed(bars))
+    highs = [float(b.high) for b in chrono]
+    lows = [float(b.low) for b in chrono]
+    seqs = [int(b.seq) for b in chrono]
 
-    for older_idx in range(len(bars) - 1, 0, -1):
-        newer = bars[older_idx - 1]
-        older = bars[older_idx]
-        newer_range = float(newer.high) - float(newer.low)
-
-        if float(newer.high) > float(older.high):
-            bull += 1
-            last_bull = int(newer.seq)
-        elif (
-            float(newer.close) < float(older.low)
-            and reset_range > 0
-            and newer_range >= reset_range
-        ):
-            bull = 0
-
-        if float(newer.low) < float(older.low):
-            bear += 1
-            last_bear = int(newer.seq)
-        elif (
-            float(newer.close) > float(older.high)
-            and reset_range > 0
-            and newer_range >= reset_range
-        ):
-            bear = 0
+    bull, last_bull, bull_start = _count_pullback_triggers(highs, lows, seqs)
+    bear, last_bear, bear_start = _count_pullback_triggers(
+        [-x for x in lows], [-x for x in highs], seqs
+    )
 
     def _tag(count: int, prefix: str) -> str:
         if count <= 0:
             return "none"
-        if count == 1:
-            return f"{prefix}1"
-        if count == 2:
-            return f"{prefix}2"
-        return f"{prefix}3"
+        return f"{prefix}{min(count, 3)}"
 
+    newest = int(bars[0].seq)
+    oldest = int(bars[-1].seq)
     return HLCountState(
         bull_count=bull,
         bear_count=bear,
@@ -975,6 +1027,8 @@ def _compute_hl_count(bars: tuple[KlineBar, ...], atr: float | None) -> HLCountS
         bull_candidate=_tag(bull, "h"),
         bear_candidate=_tag(bear, "l"),
         bar_range=f"K{newest}-K{oldest}" if newest != oldest else f"K{newest}",
+        bull_leg_start_seq=bull_start,
+        bear_leg_start_seq=bear_start,
     )
 
 

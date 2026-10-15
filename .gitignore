@@ -38,9 +38,11 @@ logs/*
 !logs/.gitkeep
 
 records/**/*
+!records/**/
 !records/**/.gitkeep
 
 experience/**/*
+!experience/**/
 !experience/**/.gitkeep
 
 trade_records/*
@@ -110,6 +112,30 @@ tools/_diag_*.txt
 
 # ── 个人开发笔记（非对外文档）────────────────────────────────────────────────
 docs/changelog/
+
+# ── 本地配置备份与凭据副本（主配置已忽略，备份也必须忽略）────────────────────
+/config/settings.json.*
+/config/settings.local.json.*
+/config/feishu.json.*
+/config/secret.key.*
+/config/*.bak
+/config/*.bak_*
+/config/*.backup
+
+# ── Agent 会话资料与本地研究输出（保留可复现脚本、测试与正式文档）─────────────
+/.workbuddy/
+/research/sensenova_fallback/runs/
+/research/sensenova_fallback/independent_review/
+/research/sensenova_fallback/agent_task.md
+/research/sensenova_fallback/agent_result.md
+/research/sensenova_fallback/agent_review_task.md
+/research/sensenova_fallback/agent_review_result.md
+/research/sensenova_fallback/delegation_transcript.md
+/research/sensenova_fallback/ACCEPTANCE.html
+/research/pa_validation/_figs/
+
+# 日志应完整保存在本地，但不提交到源码仓库
+*.log
 
 # ── OS ───────────────────────────────────────────────────────────────────────
 Thumbs.db

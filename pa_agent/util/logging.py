@@ -11,6 +11,7 @@ get_trace_id() -> str
 from __future__ import annotations
 
 import contextvars
+import copy
 import json
 import logging
 import logging.handlers
@@ -128,6 +129,45 @@ class JsonlFormatter(logging.Formatter):
         self._api_key = new_key
 
 
+class ConsoleFormatter(MaskingFormatter):
+    """Neutral console progress; keep the original record for file diagnostics."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = record.getMessage()
+        is_backup = (
+            record.name == "pa_agent.ai.sensenova_fallback"
+            or "SenseNova free fallback" in message
+        )
+        if not is_backup:
+            return super().format(record)
+
+        # Never mutate a shared LogRecord: the file handler must retain details.
+        public_record = copy.copy(record)
+        public_record.name = "pa_agent.analysis"
+        if "triggered" in message:
+            text = "正在通过备用通道继续分析，请稍等。"
+        elif "已由免费模型接管" in message:
+            text = "备用通道分析完成，结果已通过校验。"
+        elif "exhausted" in message:
+            text = "备用通道多次尝试均未成功，本阶段分析失败。"
+        elif "aborted" in message:
+            text = "备用通道发生异常，本阶段分析未完成。"
+        elif "listing failed" in message:
+            text = "备用通道暂时无法连接，请稍后重试。"
+        elif "validation failed" in message:
+            text = "本次返回未通过校验，正在尝试其他通道。"
+        elif "miss:" in message:
+            text = "本次请求未成功，正在尝试其他通道，请稍等。"
+        else:
+            text = "正在进行分析，请稍等。"
+        public_record.msg = text
+        public_record.args = ()
+        public_record.exc_info = None
+        public_record.exc_text = None
+        public_record.stack_info = None
+        return super().format(public_record)
+
+
 # ── Public functions ──────────────────────────────────────────────────────────
 
 _LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
@@ -188,7 +228,7 @@ def configure_logging(api_key: str = "") -> None:
 
     # Build formatters
     file_formatter = MaskingFormatter(_LOG_FORMAT, api_key=api_key)
-    console_formatter = MaskingFormatter(_LOG_FORMAT, api_key=api_key)
+    console_formatter = ConsoleFormatter(_LOG_FORMAT, api_key=api_key)
 
     # Track all active formatters so update_api_key can reach them
     _active_formatters.clear()

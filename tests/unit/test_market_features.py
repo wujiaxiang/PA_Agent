@@ -46,17 +46,78 @@ def test_swing_pivots_and_structure_label() -> None:
     assert "high" in kinds and "low" in kinds
 
 
-def test_hl_count_triggers_on_high_breaks() -> None:
-    bars = (
-        KlineBar(seq=1, ts_open=3.0, open=10.2, high=10.4, low=10.0, close=10.3, volume=1),
-        KlineBar(seq=2, ts_open=2.0, open=10.0, high=10.2, low=9.8, close=10.1, volume=1),
-        KlineBar(seq=3, ts_open=1.0, open=9.9, high=10.1, low=9.7, close=10.0, volume=1),
-        KlineBar(seq=4, ts_open=0.0, open=9.8, high=10.0, low=9.6, close=9.9, volume=1),
-    )
-    features = compute_simple_market_features(_frame(*bars), lookback=4)
-    assert features.hl_count.bull_count >= 2
-    assert features.hl_count.bull_candidate in ("h2", "h3")
-    assert features.hl_count.last_bull_trigger_seq == 1
+def _chrono_frame(rows: list[tuple[float, float]]) -> KlineFrame:
+    """Build a newest-first frame from (high, low) rows given oldest -> newest."""
+    n = len(rows)
+    bars = []
+    for i, (hi, lo) in enumerate(rows):
+        bars.append(
+            KlineBar(
+                seq=n - i,
+                ts_open=float(i),
+                open=lo + 0.4 * (hi - lo),
+                high=hi,
+                low=lo,
+                close=lo + 0.6 * (hi - lo),
+                volume=1,
+            )
+        )
+    return _frame(*reversed(bars))
+
+
+# Swing high 11.0 at index 2 (confirmed two bars later), then a pullback leg.
+_PULLBACK_ROWS = [
+    (10.0, 9.0),
+    (10.5, 9.5),
+    (11.0, 10.0),   # swing high
+    (10.6, 9.8),
+    (10.2, 9.4),    # pivot confirmed here
+    (10.4, 9.6),    # H1: breaks previous high 10.2
+]
+
+
+def test_hl_count_h1_then_h2_needs_a_new_down_leg() -> None:
+    rows = _PULLBACK_ROWS + [
+        (10.1, 9.0),    # trades below the H1 signal bar low (9.4): new down-leg, counter re-armed
+        (10.3, 9.2),    # H2: breaks previous high 10.1
+        (10.0, 9.1),
+    ]
+    hc = compute_simple_market_features(_chrono_frame(rows), lookback=len(rows)).hl_count
+    assert hc.bull_count == 2
+    assert hc.bull_candidate == "h2"
+    assert hc.last_bull_trigger_seq == 2          # index 7 of 9 -> seq 2
+    assert hc.bull_leg_start_seq == 7             # swing high at index 2 -> seq 7
+
+
+def test_hl_count_second_break_without_new_down_leg_is_not_h2() -> None:
+    rows = _PULLBACK_ROWS + [(10.5, 9.7)]         # breaks 10.4 again but never traded below 9.4
+    hc = compute_simple_market_features(_chrono_frame(rows), lookback=len(rows)).hl_count
+    assert hc.bull_count == 1
+    assert hc.bull_candidate == "h1"
+
+
+def test_hl_count_clears_when_swing_high_is_exceeded() -> None:
+    rows = _PULLBACK_ROWS + [(11.2, 9.9)]         # new high above the swing high -> leg is over
+    hc = compute_simple_market_features(_chrono_frame(rows), lookback=len(rows)).hl_count
+    assert hc.bull_count == 0
+    assert hc.bull_candidate == "none"
+    assert hc.bull_leg_start_seq is None
+
+
+def test_hl_count_straight_trend_has_no_active_leg() -> None:
+    rows = [(10.0 + 0.5 * i, 9.0 + 0.5 * i) for i in range(10)]
+    hc = compute_simple_market_features(_chrono_frame(rows), lookback=len(rows)).hl_count
+    assert hc.bull_count == 0 and hc.bear_count == 0
+    assert hc.bull_leg_start_seq is None and hc.bear_leg_start_seq is None
+
+
+def test_hl_count_mirrors_for_bear_side() -> None:
+    # mirror: price -> 20 - price, so the swing high becomes a swing low and H1 becomes L1
+    mirrored = [(20.0 - lo, 20.0 - hi) for (hi, lo) in _PULLBACK_ROWS]
+    hc = compute_simple_market_features(_chrono_frame(mirrored), lookback=len(mirrored)).hl_count
+    assert hc.bear_count == 1
+    assert hc.bear_candidate == "l1"
+    assert hc.bear_leg_start_seq is not None
 
 
 def test_breakout_failure_detected() -> None:
@@ -164,3 +225,4 @@ def test_breakout_events_deduped_per_level() -> None:
     assert len(highs) == 1
     assert highs[0].trigger_seq == 3
     assert len(deduped) == 2
+

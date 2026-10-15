@@ -211,6 +211,26 @@ def _emit_buffered_stream(
     return True
 
 
+def _short_text(text: Any, limit: int = 140) -> str:
+    """Flatten and truncate text for a one-line user-visible message."""
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+#: Friendly stage names for user-visible progress lines.
+_STAGE_LABELS_ZH = {"stage1": "阶段一", "stage2": "阶段二"}
+
+
+def _emit_progress(on_progress: Callable[[str], None] | None, text: str) -> None:
+    """Best-effort progress line for the UI; never break analysis if it fails."""
+    if on_progress is None or not text:
+        return
+    try:
+        on_progress(text)
+    except Exception:  # noqa: BLE001
+        logger.debug("progress callback failed", exc_info=True)
+
+
 def _build_empty_record(
     frame: KlineFrame,
     settings: Optional["Settings"],
@@ -481,11 +501,17 @@ class TwoStageOrchestrator:
             Fully or partially populated record.
         """
         # ── Step 1: Build partial record ──────────────────────────────────────
+        # incremental/continuous/user_id/exchange 四个入参是**记录归属与交易所
+        # 正确性**的必要条件（user_id 落进 RecordMeta.user_id 才能做用户隔离；
+        # exchange 用本次请求游标而非全局冻结值）。上游删掉它们的那个版本会让
+        # 所有记录静默落到 admin 名下、并带上上一次订阅残留的交易所。
         record = _build_empty_record(
             frame, self._settings,
             incremental=incremental, continuous=continuous, user_id=user_id,
             exchange=exchange,
         )
+        # Clear stale free-fallback traces from a previous submit on this instance.
+        self._last_sensenova_fallback_failure = None  # type: ignore[attr-defined]
 
         # ── Step 2: Pre-Stage-1 cancel check ─────────────────────────────────
         if cancel_token.is_set():
@@ -576,6 +602,33 @@ class TwoStageOrchestrator:
             if on_stage1_content is not None:
                 on_stage1_content(chunk)
 
+        prev_s1: dict[str, Any] | None = None
+        if previous_record is not None and int(incremental_new_bar_count or 0) > 0:
+            prev_s1 = previous_record.stage1_diagnosis
+
+        s1_validate_kwargs = {
+            "kline_frame": frame,
+            "incremental_new_bar_count": int(incremental_new_bar_count or 0),
+            "incremental_previous_stage1": prev_s1,
+        }
+
+        def _validate_s1_reply(reply: Any) -> Any:
+            from pa_agent.ai.json_validator import coalesce_model_json_text
+
+            content = coalesce_model_json_text(
+                getattr(reply, "content", None) or "",
+                getattr(reply, "reasoning_content", None) or "",
+            )
+            return self._validator.validate("stage1", content, **s1_validate_kwargs)
+
+        s1_usage_calls: list[Any] = []
+        s1_fallback_meta: dict[str, Any] | None = None
+        reply_s1: Any = None
+        result_s1: Any = None
+        s1_validation_attempts = 0
+        s1_primary_error: Exception | None = None
+        s1_primary_error_type = "network_error"
+
         try:
             reply_s1 = self._stream_chat_resilient(
                 messages_s1,
@@ -587,101 +640,162 @@ class TwoStageOrchestrator:
                 stage_label="Stage 1",
             )
         except Exception as exc:
-            if self._is_network_error(exc):
+            from pa_agent.ai.sensenova_fallback import is_cancel_or_interrupt
+
+            if is_cancel_or_interrupt(exc):
+                raise
+            # SenseNova: catch ordinary Exception (ValueError/RuntimeError/429/…)
+            # so free fallback can run. Non-SenseNova keeps network-only behavior.
+            if self._sensenova_free_eligible():
+                s1_primary_error = exc
+                s1_primary_error_type = (
+                    "network_error" if self._is_network_error(exc) else "provider_error"
+                )
+                logger.warning("Stage 1 primary error (SenseNova fallback eligible): %s", exc)
+            elif self._is_network_error(exc):
+                s1_primary_error = exc
+                s1_primary_error_type = "network_error"
                 logger.warning("Stage 1 network error: %s", exc)
+            else:
+                raise
+
+        if s1_primary_error is None and reply_s1 is not None:
+            if not s1_streamed_reasoning and reply_s1.reasoning_content:
+                _emit_buffered_stream(reply_s1.reasoning_content, on_stage1_reasoning)
+            if not s1_streamed_content and reply_s1.content:
+                _emit_buffered_stream(reply_s1.content, on_stage1_content)
+
+            # ── Step 6: Post-Stage-1-call cancel check ────────────────────────────
+            if cancel_token.is_set():
                 record = record.model_copy(
                     update={
                         "stage1_messages": messages_s1,
-                        "exception": {
-                            "type": "network_error",
-                            "stage": "stage1",
-                            "message": str(exc),
-                        },
+                        "stage1_response": reply_s1.raw,
+                        "usage_total": _accumulate_usage(record.usage_total, reply_s1.usage),
                     }
                 )
-                self._pending_writer.save_partial(record, "network_error")
-                on_event(OrchestratorEvent.Stage1Failed)
+                self._pending_writer.save_partial(record, "user_cancelled")
+                on_event(OrchestratorEvent.Cancelled)
                 return record
-            raise
 
-        if not s1_streamed_reasoning and reply_s1.reasoning_content:
-            _emit_buffered_stream(reply_s1.reasoning_content, on_stage1_reasoning)
-        if not s1_streamed_content and reply_s1.content:
-            _emit_buffered_stream(reply_s1.content, on_stage1_content)
-
-        # ── Step 6: Post-Stage-1-call cancel check ────────────────────────────
-        if cancel_token.is_set():
-            record = record.model_copy(
-                update={
-                    "stage1_messages": messages_s1,
-                    "stage1_response": reply_s1.raw,
-                    "usage_total": _accumulate_usage(record.usage_total, reply_s1.usage),
-                }
+            # ── Step 7: Validate Stage 1 ──────────────────────────────────────────
+            logger.debug("\n" + "="*80)
+            logger.debug("【Stage 1 AI 完整响应】")
+            logger.debug("="*80)
+            logger.debug(reply_s1.content)
+            if reply_s1.reasoning_content:
+                logger.debug("\n--- [思考过程] ---\n%s", reply_s1.reasoning_content)
+            logger.debug(
+                "\n--- [Token 用量] prompt=%s completion=%s latency=%s ---",
+                reply_s1.usage.prompt_tokens,
+                reply_s1.usage.completion_tokens,
+                _latency_ms_label(reply_s1.latency_ms),
             )
-            self._pending_writer.save_partial(record, "user_cancelled")
-            on_event(OrchestratorEvent.Cancelled)
-            return record
+            logger.debug("="*80 + "\n")
 
-        # ── Step 7: Validate Stage 1 ──────────────────────────────────────────
-        logger.debug("\n" + "="*80)
-        logger.debug("【Stage 1 AI 完整响应】")
-        logger.debug("="*80)
-        logger.debug(reply_s1.content)
-        if reply_s1.reasoning_content:
-            logger.debug("\n--- [思考过程] ---\n%s", reply_s1.reasoning_content)
-        logger.debug(
-            "\n--- [Token 用量] prompt=%s completion=%s latency=%s ---",
-            reply_s1.usage.prompt_tokens,
-            reply_s1.usage.completion_tokens,
-            _latency_ms_label(reply_s1.latency_ms),
-        )
-        logger.debug("="*80 + "\n")
+            s1_usage_calls = [getattr(reply_s1, "usage", None)]
 
-        prev_s1: dict[str, Any] | None = None
-        if previous_record is not None and int(incremental_new_bar_count or 0) > 0:
-            prev_s1 = previous_record.stage1_diagnosis
+            def _call_s1_retry(msgs: list[dict]) -> Any:
+                nonlocal s1_streamed_reasoning, s1_streamed_content
+                on_event(OrchestratorEvent.Stage1Retry)
+                s1_streamed_reasoning = False
+                s1_streamed_content = False
+                r = self._client.stream_chat(
+                    msgs,
+                    on_reasoning_token=_on_s1_reasoning,
+                    on_content_token=_on_s1_content,
+                    cancel_token=cancel_token,
+                    thinking=_thinking,
+                    reasoning_effort=_effort,
+                )
+                if not s1_streamed_reasoning and r.reasoning_content:
+                    _emit_buffered_stream(r.reasoning_content, on_stage1_reasoning)
+                if not s1_streamed_content and r.content:
+                    _emit_buffered_stream(r.content, on_stage1_content)
+                s1_usage_calls.append(getattr(r, "usage", None))
+                return r
 
-        s1_usage_calls: list[Any] = [getattr(reply_s1, "usage", None)]
+            try:
+                vr_s1 = validate_with_retry(
+                    stage="stage1",
+                    messages=messages_s1,
+                    reply=reply_s1,
+                    validator=self._validator,
+                    validation_settings=self._validation_settings(),
+                    validate_kwargs=s1_validate_kwargs,
+                    call_api=_call_s1_retry,
+                    provider_settings=getattr(self._settings, "provider", None),
+                )
+                messages_s1 = vr_s1.messages
+                reply_s1 = vr_s1.reply
+                result_s1 = vr_s1.result
+                s1_validation_attempts = vr_s1.attempts
+                if vr_s1.attempts > 1:
+                    logger.info(
+                        "Stage 1 validation succeeded after %d attempt(s)", vr_s1.attempts
+                    )
+            except Exception as exc:
+                from pa_agent.ai.sensenova_fallback import is_cancel_or_interrupt
 
-        def _call_s1_retry(msgs: list[dict]) -> Any:
-            nonlocal s1_streamed_reasoning, s1_streamed_content
-            on_event(OrchestratorEvent.Stage1Retry)
-            s1_streamed_reasoning = False
-            s1_streamed_content = False
-            r = self._client.stream_chat(
-                msgs,
+                if is_cancel_or_interrupt(exc):
+                    raise
+                if self._sensenova_free_eligible():
+                    s1_primary_error = exc
+                    s1_primary_error_type = (
+                        "network_error" if self._is_network_error(exc) else "provider_error"
+                    )
+                    logger.warning(
+                        "Stage 1 validate_with_retry error (SenseNova fallback eligible): %s",
+                        exc,
+                    )
+                else:
+                    raise
+
+        # SenseNova free fallback: primary Exception / ValidationError recoveries
+        if s1_primary_error is not None or isinstance(result_s1, ValidationError):
+            recovered = self._try_sensenova_free_stage(
+                stage="stage1",
+                messages=messages_s1,
+                validate_reply=_validate_s1_reply,
                 on_reasoning_token=_on_s1_reasoning,
                 on_content_token=_on_s1_content,
                 cancel_token=cancel_token,
-                thinking=_thinking,
-                reasoning_effort=_effort,
+                on_progress=on_stage1_content,
+                reason=(
+                    str(s1_primary_error)
+                    if s1_primary_error is not None
+                    else "阶段一输出未通过校验"
+                ),
             )
-            if not s1_streamed_reasoning and r.reasoning_content:
-                _emit_buffered_stream(r.reasoning_content, on_stage1_reasoning)
-            if not s1_streamed_content and r.content:
-                _emit_buffered_stream(r.content, on_stage1_content)
-            s1_usage_calls.append(getattr(r, "usage", None))
-            return r
+            if recovered is not None:
+                reply_s1, result_s1, s1_fallback_meta = recovered
+                s1_primary_error = None
+                s1_usage_calls.append(getattr(reply_s1, "usage", None))
+                if s1_fallback_meta:
+                    raw = dict(getattr(reply_s1, "raw", None) or {})
+                    raw.update(s1_fallback_meta)
+                    try:
+                        reply_s1.raw = raw
+                    except Exception:  # noqa: BLE001
+                        pass
 
-        vr_s1 = validate_with_retry(
-            stage="stage1",
-            messages=messages_s1,
-            reply=reply_s1,
-            validator=self._validator,
-            validation_settings=self._validation_settings(),
-            validate_kwargs={
-                "kline_frame": frame,
-                "incremental_new_bar_count": int(incremental_new_bar_count or 0),
-                "incremental_previous_stage1": prev_s1,
-            },
-            call_api=_call_s1_retry,
-            provider_settings=getattr(self._settings, "provider", None),
-        )
-        messages_s1 = vr_s1.messages
-        reply_s1 = vr_s1.reply
-        result_s1 = vr_s1.result
-        if vr_s1.attempts > 1:
-            logger.info("Stage 1 validation succeeded after %d attempt(s)", vr_s1.attempts)
+        if s1_primary_error is not None:
+            save_reason = (
+                "network_error" if s1_primary_error_type == "network_error" else "provider_error"
+            )
+            record = record.model_copy(
+                update={
+                    "stage1_messages": messages_s1,
+                    "exception": self._sensenova_fallback_exception_fields(
+                        primary_type=s1_primary_error_type,
+                        primary_message=str(s1_primary_error),
+                        stage="stage1",
+                    ),
+                }
+            )
+            self._pending_writer.save_partial(record, save_reason)
+            on_event(OrchestratorEvent.Stage1Failed)
+            return record
 
         if isinstance(result_s1, ValidationError):
             err = result_s1
@@ -694,19 +808,23 @@ class TwoStageOrchestrator:
             record = record.model_copy(
                 update={
                     "stage1_messages": messages_s1,
-                    "stage1_response": reply_s1.raw,
+                    "stage1_response": reply_s1.raw if reply_s1 is not None else {},
                     "usage_total": _accumulate_usage_calls(record.usage_total, s1_usage_calls),
-                    "exception": {
-                        "type": "provider_error" if err.category == "e" else "validation_error",
-                        "stage": "stage1",
-                        "category": err.category,
-                        "message": err_message,
-                        "missing_fields": err.missing_fields,
-                        "invalid_fields": err.invalid_fields,
-                        "raw_text": err.raw_text,
-                        "parse_position": err.parse_position,
-                        "validation_attempts": vr_s1.attempts,
-                    },
+                    "exception": self._sensenova_fallback_exception_fields(
+                        primary_type=(
+                            "provider_error" if err.category == "e" else "validation_error"
+                        ),
+                        primary_message=err_message,
+                        stage="stage1",
+                        extra={
+                            "category": err.category,
+                            "missing_fields": err.missing_fields,
+                            "invalid_fields": err.invalid_fields,
+                            "raw_text": err.raw_text,
+                            "parse_position": err.parse_position,
+                            "validation_attempts": s1_validation_attempts or 1,
+                        },
+                    ),
                 }
             )
             self._pending_writer.save_partial(record, f"stage1_{err.category}")
@@ -866,6 +984,36 @@ class TwoStageOrchestrator:
             if on_stage2_content is not None:
                 on_stage2_content(chunk)
 
+        s2_validate_kwargs = {
+            "kline_frame": frame,
+            "decision_stance": record.meta.decision_stance,
+            "stage1_json": stage1_json,
+            "skip_next_bar": not _enable_next_bar,
+            "previous_record": previous_record,
+            "structure_flip_cooldown_bars": _flip_cooldown,
+        }
+
+        def _validate_s2_reply(reply: Any) -> Any:
+            from pa_agent.ai.json_validator import coalesce_model_json_text
+
+            content = coalesce_model_json_text(
+                getattr(reply, "content", None) or "",
+                getattr(reply, "reasoning_content", None) or "",
+            )
+            return self._validator.validate("stage2", content, **s2_validate_kwargs)
+
+        s2_usage_calls: list[Any] = []
+        s2_fallback_meta: dict[str, Any] | None = None
+        reply_s2: Any = None
+        result_s2: Any = None
+        s2_validation_attempts = 0
+        s2_primary_error: Exception | None = None
+        s2_primary_error_type = "network_error"
+        _exp_loaded = [
+            e.model_dump() if hasattr(e, "model_dump") else dict(e)
+            for e in experience_entries
+        ]
+
         try:
             reply_s2 = self._stream_chat_resilient(
                 messages_s2,
@@ -877,120 +1025,173 @@ class TwoStageOrchestrator:
                 stage_label="Stage 2",
             )
         except Exception as exc:
-            if self._is_network_error(exc):
+            from pa_agent.ai.sensenova_fallback import is_cancel_or_interrupt
+
+            if is_cancel_or_interrupt(exc):
+                raise
+            if self._sensenova_free_eligible():
+                s2_primary_error = exc
+                s2_primary_error_type = (
+                    "network_error" if self._is_network_error(exc) else "provider_error"
+                )
+                logger.warning("Stage 2 primary error (SenseNova fallback eligible): %s", exc)
+            elif self._is_network_error(exc):
+                s2_primary_error = exc
+                s2_primary_error_type = "network_error"
                 logger.warning("Stage 2 network error: %s", exc)
+            else:
+                raise
+
+        if s2_primary_error is None and reply_s2 is not None:
+            if not s2_streamed_reasoning and reply_s2.reasoning_content:
+                _emit_buffered_stream(reply_s2.reasoning_content, on_stage2_reasoning)
+            if not s2_streamed_content and reply_s2.content:
+                _emit_buffered_stream(reply_s2.content, on_stage2_content)
+
+            # ── Step 16: Post-Stage-2-call cancel check ───────────────────────────
+            if cancel_token.is_set():
                 record = record.model_copy(
                     update={
                         "stage1_messages": messages_s1,
                         "stage1_response": reply_s1.raw,
                         "stage1_diagnosis": stage1_json,
                         "stage2_messages": messages_s2,
+                        "stage2_response": reply_s2.raw,
                         "strategy_files_used": strategy_files,
-                        "experience_loaded": [
-                            e.model_dump() if hasattr(e, "model_dump") else dict(e)
-                            for e in experience_entries
-                        ],
-                        "usage_total": _accumulate_usage(record.usage_total, reply_s1.usage),
-                        "exception": {
-                            "type": "network_error",
-                            "stage": "stage2",
-                            "message": str(exc),
-                        },
+                        "experience_loaded": _exp_loaded,
+                        "usage_total": _accumulate_usage(
+                            _accumulate_usage(record.usage_total, reply_s1.usage),
+                            reply_s2.usage,
+                        ),
                     }
                 )
-                self._pending_writer.save_partial(record, "network_error")
-                on_event(OrchestratorEvent.Stage2Failed)
+                self._pending_writer.save_partial(record, "user_cancelled")
+                on_event(OrchestratorEvent.Cancelled)
                 return record
-            raise
 
-        if not s2_streamed_reasoning and reply_s2.reasoning_content:
-            _emit_buffered_stream(reply_s2.reasoning_content, on_stage2_reasoning)
-        if not s2_streamed_content and reply_s2.content:
-            _emit_buffered_stream(reply_s2.content, on_stage2_content)
+            # ── Step 17: Validate Stage 2 ─────────────────────────────────────────
+            logger.debug("\n" + "="*80)
+            logger.debug("【Stage 2 AI 完整响应】")
+            logger.debug("="*80)
+            logger.debug(reply_s2.content)
+            if reply_s2.reasoning_content:
+                logger.debug("\n--- [思考过程] ---\n%s", reply_s2.reasoning_content)
+            logger.debug(
+                "\n--- [Token 用量] prompt=%s completion=%s latency=%s ---",
+                reply_s2.usage.prompt_tokens,
+                reply_s2.usage.completion_tokens,
+                _latency_ms_label(reply_s2.latency_ms),
+            )
+            logger.debug("="*80 + "\n")
 
-        # ── Step 16: Post-Stage-2-call cancel check ───────────────────────────
-        if cancel_token.is_set():
+            s2_usage_calls = [getattr(reply_s2, "usage", None)]
+
+            def _call_s2_retry(msgs: list[dict]) -> Any:
+                nonlocal s2_streamed_reasoning, s2_streamed_content
+                on_event(OrchestratorEvent.Stage2Retry)
+                s2_streamed_reasoning = False
+                s2_streamed_content = False
+                r = self._client.stream_chat(
+                    msgs,
+                    on_reasoning_token=_on_s2_reasoning,
+                    on_content_token=_on_s2_content,
+                    cancel_token=cancel_token,
+                    thinking=_thinking,
+                    reasoning_effort=_effort,
+                )
+                if not s2_streamed_reasoning and r.reasoning_content:
+                    _emit_buffered_stream(r.reasoning_content, on_stage2_reasoning)
+                if not s2_streamed_content and r.content:
+                    _emit_buffered_stream(r.content, on_stage2_content)
+                s2_usage_calls.append(getattr(r, "usage", None))
+                return r
+
+            try:
+                vr_s2 = validate_with_retry(
+                    stage="stage2",
+                    messages=messages_s2,
+                    reply=reply_s2,
+                    validator=self._validator,
+                    validation_settings=self._validation_settings(),
+                    validate_kwargs=s2_validate_kwargs,
+                    call_api=_call_s2_retry,
+                    provider_settings=getattr(self._settings, "provider", None),
+                )
+                messages_s2 = vr_s2.messages
+                reply_s2 = vr_s2.reply
+                result_s2 = vr_s2.result
+                s2_validation_attempts = vr_s2.attempts
+                if vr_s2.attempts > 1:
+                    logger.info(
+                        "Stage 2 validation succeeded after %d attempt(s)", vr_s2.attempts
+                    )
+            except Exception as exc:
+                from pa_agent.ai.sensenova_fallback import is_cancel_or_interrupt
+
+                if is_cancel_or_interrupt(exc):
+                    raise
+                if self._sensenova_free_eligible():
+                    s2_primary_error = exc
+                    s2_primary_error_type = (
+                        "network_error" if self._is_network_error(exc) else "provider_error"
+                    )
+                    logger.warning(
+                        "Stage 2 validate_with_retry error (SenseNova fallback eligible): %s",
+                        exc,
+                    )
+                else:
+                    raise
+
+        if s2_primary_error is not None or isinstance(result_s2, ValidationError):
+            recovered = self._try_sensenova_free_stage(
+                stage="stage2",
+                messages=messages_s2,
+                validate_reply=_validate_s2_reply,
+                on_reasoning_token=_on_s2_reasoning,
+                on_content_token=_on_s2_content,
+                cancel_token=cancel_token,
+                on_progress=on_stage2_content,
+                reason=(
+                    str(s2_primary_error)
+                    if s2_primary_error is not None
+                    else "阶段二输出未通过校验"
+                ),
+            )
+            if recovered is not None:
+                reply_s2, result_s2, s2_fallback_meta = recovered
+                s2_primary_error = None
+                s2_usage_calls.append(getattr(reply_s2, "usage", None))
+                if s2_fallback_meta:
+                    raw = dict(getattr(reply_s2, "raw", None) or {})
+                    raw.update(s2_fallback_meta)
+                    try:
+                        reply_s2.raw = raw
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        if s2_primary_error is not None:
+            save_reason = (
+                "network_error" if s2_primary_error_type == "network_error" else "provider_error"
+            )
             record = record.model_copy(
                 update={
                     "stage1_messages": messages_s1,
                     "stage1_response": reply_s1.raw,
                     "stage1_diagnosis": stage1_json,
                     "stage2_messages": messages_s2,
-                    "stage2_response": reply_s2.raw,
                     "strategy_files_used": strategy_files,
-                    "experience_loaded": [
-                        e.model_dump() if hasattr(e, "model_dump") else dict(e)
-                        for e in experience_entries
-                    ],
-                    "usage_total": _accumulate_usage(
-                        _accumulate_usage(record.usage_total, reply_s1.usage),
-                        reply_s2.usage,
+                    "experience_loaded": _exp_loaded,
+                    "usage_total": _accumulate_usage(record.usage_total, reply_s1.usage),
+                    "exception": self._sensenova_fallback_exception_fields(
+                        primary_type=s2_primary_error_type,
+                        primary_message=str(s2_primary_error),
+                        stage="stage2",
                     ),
                 }
             )
-            self._pending_writer.save_partial(record, "user_cancelled")
-            on_event(OrchestratorEvent.Cancelled)
+            self._pending_writer.save_partial(record, save_reason)
+            on_event(OrchestratorEvent.Stage2Failed)
             return record
-
-        # ── Step 17: Validate Stage 2 ─────────────────────────────────────────
-        logger.debug("\n" + "="*80)
-        logger.debug("【Stage 2 AI 完整响应】")
-        logger.debug("="*80)
-        logger.debug(reply_s2.content)
-        if reply_s2.reasoning_content:
-            logger.debug("\n--- [思考过程] ---\n%s", reply_s2.reasoning_content)
-        logger.debug(
-            "\n--- [Token 用量] prompt=%s completion=%s latency=%s ---",
-            reply_s2.usage.prompt_tokens,
-            reply_s2.usage.completion_tokens,
-            _latency_ms_label(reply_s2.latency_ms),
-        )
-        logger.debug("="*80 + "\n")
-
-        s2_usage_calls: list[Any] = [getattr(reply_s2, "usage", None)]
-
-        def _call_s2_retry(msgs: list[dict]) -> Any:
-            nonlocal s2_streamed_reasoning, s2_streamed_content
-            on_event(OrchestratorEvent.Stage2Retry)
-            s2_streamed_reasoning = False
-            s2_streamed_content = False
-            r = self._client.stream_chat(
-                msgs,
-                on_reasoning_token=_on_s2_reasoning,
-                on_content_token=_on_s2_content,
-                cancel_token=cancel_token,
-                thinking=_thinking,
-                reasoning_effort=_effort,
-            )
-            if not s2_streamed_reasoning and r.reasoning_content:
-                _emit_buffered_stream(r.reasoning_content, on_stage2_reasoning)
-            if not s2_streamed_content and r.content:
-                _emit_buffered_stream(r.content, on_stage2_content)
-            s2_usage_calls.append(getattr(r, "usage", None))
-            return r
-
-        vr_s2 = validate_with_retry(
-            stage="stage2",
-            messages=messages_s2,
-            reply=reply_s2,
-            validator=self._validator,
-            validation_settings=self._validation_settings(),
-            validate_kwargs={
-                "kline_frame": frame,
-                "decision_stance": record.meta.decision_stance,
-                "stage1_json": stage1_json,
-                "skip_next_bar": not _enable_next_bar,
-                "previous_record": previous_record,
-                "structure_flip_cooldown_bars": _flip_cooldown,
-            },
-            call_api=_call_s2_retry,
-            provider_settings=getattr(self._settings, "provider", None),
-        )
-        messages_s2 = vr_s2.messages
-        reply_s2 = vr_s2.reply
-        result_s2 = vr_s2.result
-        if vr_s2.attempts > 1:
-            logger.info("Stage 2 validation succeeded after %d attempt(s)", vr_s2.attempts)
 
         if isinstance(result_s2, ValidationError):
             err = result_s2
@@ -1006,27 +1207,28 @@ class TwoStageOrchestrator:
                     "stage1_response": reply_s1.raw,
                     "stage1_diagnosis": stage1_json,
                     "stage2_messages": messages_s2,
-                    "stage2_response": reply_s2.raw,
+                    "stage2_response": reply_s2.raw if reply_s2 is not None else {},
                     "strategy_files_used": strategy_files,
-                    "experience_loaded": [
-                        e.model_dump() if hasattr(e, "model_dump") else dict(e)
-                        for e in experience_entries
-                    ],
+                    "experience_loaded": _exp_loaded,
                     "usage_total": _accumulate_usage_calls(
                         _accumulate_usage_calls(record.usage_total, s1_usage_calls),
                         s2_usage_calls,
                     ),
-                    "exception": {
-                        "type": "provider_error" if err.category == "e" else "validation_error",
-                        "stage": "stage2",
-                        "category": err.category,
-                        "message": err_message,
-                        "missing_fields": err.missing_fields,
-                        "invalid_fields": err.invalid_fields,
-                        "raw_text": err.raw_text,
-                        "parse_position": err.parse_position,
-                        "validation_attempts": vr_s2.attempts,
-                    },
+                    "exception": self._sensenova_fallback_exception_fields(
+                        primary_type=(
+                            "provider_error" if err.category == "e" else "validation_error"
+                        ),
+                        primary_message=err_message,
+                        stage="stage2",
+                        extra={
+                            "category": err.category,
+                            "missing_fields": err.missing_fields,
+                            "invalid_fields": err.invalid_fields,
+                            "raw_text": err.raw_text,
+                            "parse_position": err.parse_position,
+                            "validation_attempts": s2_validation_attempts or 1,
+                        },
+                    ),
                 }
             )
             self._pending_writer.save_partial(record, f"stage2_{err.category}")
@@ -1164,9 +1366,149 @@ class TwoStageOrchestrator:
     def _thinking_params(self) -> tuple[bool, str]:
         """Return (thinking, reasoning_effort) from settings defaults."""
         if self._settings is None:
-            return True, "high"
+            return True, "low"
         p = self._settings.provider
         return p.thinking, p.reasoning_effort
+
+    def _sensenova_free_eligible(self) -> bool:
+        """True when configured base_url is the SenseNova token gateway."""
+        from pa_agent.ai.sensenova_fallback import is_sensenova_fallback_eligible
+
+        if self._settings is None:
+            return False
+        return is_sensenova_fallback_eligible(
+            getattr(self._settings.provider, "base_url", "")
+        )
+
+    def _primary_api_key(self) -> str:
+        if self._settings is None:
+            return ""
+        return str(getattr(self._settings.provider, "api_key", "") or "")
+
+    def _try_sensenova_free_stage(
+        self,
+        *,
+        stage: str,
+        messages: list[dict[str, Any]],
+        validate_reply: Callable[[Any], Any],
+        on_reasoning_token: Callable[[str], None] | None,
+        on_content_token: Callable[[str], None] | None,
+        cancel_token: CancelToken,
+        on_progress: Callable[[str], None] | None = None,
+        reason: str = "",
+    ) -> tuple[Any, Any, dict[str, Any]] | None:
+        """On SenseNova primary failure, try bounded free candidates.
+
+        Returns ``(reply, Ok, meta)`` when a free call + validation succeed;
+        otherwise ``None`` (caller keeps the original failure). Cancel /
+        KeyboardInterrupt propagate.
+        """
+        from pa_agent.ai.json_validator import Ok
+        from pa_agent.ai.sensenova_fallback import (
+            FreeStageFailure,
+            FreeStageSuccess,
+            is_cancel_or_interrupt,
+            run_free_stage_fallback,
+        )
+
+        if not self._sensenova_free_eligible():
+            return None
+        if cancel_token.is_set():
+            from pa_agent.ai.deepseek_client import CancelledError
+
+            raise CancelledError("Request cancelled before SenseNova free fallback")
+
+        logger.warning(
+            "SenseNova free fallback triggered for %s (base_url eligible) reason=%s",
+            stage,
+            _short_text(reason, 200),
+        )
+        # User-facing wording stays neutral: never advertise the free lane or the
+        # upstream model, and never surface a raw upstream error payload.
+        _emit_progress(
+            on_progress,
+            f"[提示] {_STAGE_LABELS_ZH.get(stage, stage)}的主通道暂时不可用，"
+            "已自动切换备用通道继续分析。\n"
+            "[提示] 界面会显示当前处理进度，请稍候。\n",
+        )
+        self._last_sensenova_fallback_failure = None  # type: ignore[attr-defined]
+        try:
+            outcome = run_free_stage_fallback(
+                messages=messages,
+                validate=validate_reply,
+                primary_api_key=self._primary_api_key(),
+                cancel_token=cancel_token,
+                on_reasoning_token=on_reasoning_token,
+                on_content_token=on_content_token,
+                on_progress=on_progress,
+            )
+        except Exception as exc:
+            if is_cancel_or_interrupt(exc):
+                raise
+            logger.warning("SenseNova free fallback aborted with error: %s", exc)
+            return None
+
+        if isinstance(outcome, FreeStageSuccess) and isinstance(outcome.result, Ok):
+            meta = {
+                "fallback_provider": outcome.candidate.provider,
+                "fallback_model": outcome.candidate.model,
+                "fallback_attempts": [
+                    {
+                        "provider": a.provider,
+                        "model": a.model,
+                        "ok": a.ok,
+                        "error": a.error,
+                        "latency_ms": round(a.latency_ms, 1),
+                    }
+                    for a in outcome.attempts
+                ],
+            }
+            return outcome.reply, outcome.result, meta
+
+        if isinstance(outcome, FreeStageFailure):
+            # Surface the whole candidate trace in the app log (INFO is filtered there),
+            # so a failed rotation is diagnosable without opening the record JSON.
+            trace = "; ".join(
+                f"{a.provider}/{a.model}: {a.error or 'failed'}" for a in outcome.attempts
+            ) or "no candidate attempted"
+            logger.warning(
+                "SenseNova free fallback exhausted for %s: %s | attempts: %s",
+                stage,
+                outcome.message,
+                trace,
+            )
+            self._last_sensenova_fallback_failure = outcome  # type: ignore[attr-defined]
+        return None
+
+    def _sensenova_fallback_exception_fields(
+        self,
+        *,
+        primary_type: str,
+        primary_message: str,
+        stage: str,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        from pa_agent.ai.sensenova_fallback import format_fallback_exception_meta
+
+        failure = getattr(self, "_last_sensenova_fallback_failure", None)
+        if failure is None and not self._sensenova_free_eligible():
+            base: dict[str, Any] = {
+                "type": primary_type,
+                "stage": stage,
+                "message": primary_message,
+            }
+            if extra:
+                base.update(extra)
+            return base
+        meta = format_fallback_exception_meta(
+            primary_message=primary_message,
+            primary_type=primary_type,
+            failure=failure,
+        )
+        meta["stage"] = stage
+        if extra:
+            meta.update(extra)
+        return meta
 
     def _stream_chat_resilient(
         self,

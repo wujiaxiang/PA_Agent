@@ -38,7 +38,7 @@ class AIProviderSettings(BaseModel):
     # 网关本身忽略鉴权，但 OpenAI SDK 要求 api_key 非空，否则构造客户端即抛错
     api_key: str = "not-needed"
     thinking: bool = True
-    reasoning_effort: Literal["low", "medium", "high", "max"] = "high"
+    reasoning_effort: Literal["low", "medium", "high", "max"] = "low"
     context_window: int = 2_000_000
     #: Optional explicit override for max_tokens sent to provider. 0/None = auto
     #: (use per-provider default, see _provider_max_output_tokens). TODO P2.3.

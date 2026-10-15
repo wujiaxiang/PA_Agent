@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
 from pa_agent.config.settings import AIProviderSettings
 from pa_agent.ai.rate_limit import call_with_rate_limit_backoff, is_rate_limit_error
+from pa_agent.ai.sensenova_fallback import is_sensenova_fallback_eligible
 from pa_agent.util.mask_secret import mask_secret
 from pa_agent.ai.mimo_compat import (
     ReasoningCache,
@@ -730,10 +731,16 @@ class DeepSeekClient:
         if _OpenAI is None:
             raise RuntimeError("openai package is not installed") from _OPENAI_IMPORT_ERROR
 
-        client = _OpenAI(
-            base_url=self._settings.base_url,
-            api_key=self._settings.api_key,
-        )
+        _openai_kwargs: dict[str, Any] = {
+            "base_url": self._settings.base_url,
+            "api_key": self._settings.api_key,
+        }
+        # SenseNova free-fallback path: fail fast on 429/transient SDK retries
+        # so the orchestrator can rotate free candidates without long waits.
+        _sensenova_fast_fail = is_sensenova_fallback_eligible(self._settings.base_url)
+        if _sensenova_fast_fail:
+            _openai_kwargs["max_retries"] = 0
+        client = _OpenAI(**_openai_kwargs)
 
         t0 = time.monotonic()
         create_kwargs: dict[str, Any] = {
@@ -760,6 +767,18 @@ class DeepSeekClient:
         # temperature (DeepSeek/Anthropic spec), so we only inject it when safe.
         if not _thinking_on:
             create_kwargs["temperature"] = 0
+        _rl_kwargs: dict[str, Any] = {
+            "log": self._log,
+            "stage_label": "DeepSeek",
+            "cancel_token": cancel_token,
+        }
+        if _sensenova_fast_fail:
+            _rl_kwargs["max_retries"] = 0
+        # 显式传入者再覆盖上面：默认值属于 rate_limit，不在这里重述一遍。
+        # **探针必须能强行单次**（见本函数 docstring）——上游只按 sensenova
+        # 置 0，会漏掉「非 sensenova 网关上探针仍退避 5 次」这条。
+        if max_retries is not None:
+            _rl_kwargs["max_retries"] = int(max_retries)
         try:
             response = call_with_rate_limit_backoff(
                 lambda: client.chat.completions.create(
@@ -768,11 +787,7 @@ class DeepSeekClient:
                     # frequency_penalty — they are incompatible with thinking mode.
                     # （top_p 例外：thinking 模式下允许，已上方注入）
                 ),
-                log=self._log,
-                stage_label="DeepSeek",
-                cancel_token=cancel_token,
-                # 只在显式传入时覆盖：默认值属于 rate_limit，不在这里重述一遍
-                **({"max_retries": int(max_retries)} if max_retries is not None else {}),
+                **_rl_kwargs,
             )
         except Exception as exc:
             latency_ms = (time.monotonic() - t0) * 1000
@@ -937,10 +952,14 @@ class DeepSeekClient:
         if _OpenAI is None:
             raise RuntimeError("openai package is not installed") from _OPENAI_IMPORT_ERROR
 
-        client = _OpenAI(
-            base_url=self._settings.base_url,
-            api_key=self._settings.api_key,
-        )
+        _openai_kwargs: dict[str, Any] = {
+            "base_url": self._settings.base_url,
+            "api_key": self._settings.api_key,
+        }
+        _sensenova_fast_fail = is_sensenova_fallback_eligible(self._settings.base_url)
+        if _sensenova_fast_fail:
+            _openai_kwargs["max_retries"] = 0
+        client = _OpenAI(**_openai_kwargs)
 
         t0 = time.monotonic()
         reasoning_content = ""
@@ -980,6 +999,8 @@ class DeepSeekClient:
                 except Exception as _exc:  # noqa: BLE001
                     # Rate-limit must bubble up so backoff can retry the same call
                     # (don't silently downgrade to no-stream_options).
+                    # SenseNova: backoff max_retries=0 below, so a 429 fails fast
+                    # and the orchestrator can rotate free candidates.
                     if is_rate_limit_error(_exc):
                         raise
                     # Retry without stream_options if provider rejects it
@@ -988,11 +1009,16 @@ class DeepSeekClient:
                     kwargs_no_so.pop("stream_options", None)
                     return client.chat.completions.create(**kwargs_no_so)
 
+            _rl_kwargs: dict[str, Any] = {
+                "log": self._log,
+                "stage_label": "DeepSeek",
+                "cancel_token": cancel_token,
+            }
+            if _sensenova_fast_fail:
+                _rl_kwargs["max_retries"] = 0
             stream = call_with_rate_limit_backoff(
                 _create_stream,
-                log=self._log,
-                stage_label="DeepSeek",
-                cancel_token=cancel_token,
+                **_rl_kwargs,
             )
 
             for chunk in stream:
