@@ -22,6 +22,114 @@
 
 ## 🔴 进行中（有人正在改这些文件，不要动）
 
+### 2026-10-16 · 修「LLM 配置保存不生效」：`use_custom` 被稀疏化删掉
+
+**状态**：进行中（写入范围已占坑）
+
+#### 需求
+用户报告：Docker 环境下保存 LLM 配置不生效。
+
+#### 根因（已用真实容器数据 + 隔离库复现，非推测）
+`persist_patch` 的落库策略是「与基线同值的键不进用户层」（`compute_diff`），
+而 `provider.use_custom` **不是一个普通配置值**，它是「用户在界面上表过态」的
+凭证 —— `resolve()` 侧的 `_apply_llm_source()` 把「键缺失」判为
+「从未表态 → 跟随系统」，并**整段作废**用户对 provider 的覆盖。
+
+于是形成一个死循环：
+
+```
+baseline.use_custom = True          # 容器实测
+   ↓ 用户勾选「自带模型」保存（前端必然发 use_custom: true）
+compute_diff(基线, 合并层)          # True == True → 该键被稀疏化删掉
+   ↓ 用户层只剩 { model, base_url }
+_apply_llm_source 读到 use_custom 缺失 → 「从未表态」
+   ↓ 整段 provider 覆盖作废
+生效值回落到基线的 space-bunny-free / 8093 —— 用户改的 longcat / 8094 石沉大海
+```
+
+**为什么 10-07 那一轮修完还会复发**：那次是直接改库补 `use_custom: true`
+（治症状）。本轮根治 `persist_patch`，让声明过的开关不再被稀疏化。
+
+**为什么在 Docker 才现形**：baseline 的 `use_custom` 只有在它本身就是 `True`
+时才会吞掉用户的 `True`。容器库是 5 天前建的、长期存活，10-07 那次修 baseline
+把它写成了 `True`；而新装/测试库里它是 `False`，`True != False` 能保住键，
+所以本地与单测全绿。
+
+实测（隔离库，`persist_patch` 返回 **True**，即保存方自认为成功）：
+| baseline.use_custom | 用户勾选 | 落库的 provider 键 | 生效 model |
+|---|---|---|---|
+| False | True | `['model','use_custom']` | MINE ✅ |
+| True | True | `['model']` | SYS ❌ 被丢弃 |
+
+容器库实况与第 2 行逐字吻合：override.provider = `{base_url, model}`，
+**无 `use_custom`**。
+
+#### 附带缺陷（同轮记录）
+- `persist_patch` 全路径**零测试**覆盖 `use_custom`：既有 4 条用例全都不带这个键
+  （`{"provider": {"model": ...}}`）或直接绕道 `save_overrides` —— 所以门控语义
+  与稀疏化策略的这次撞车，测试结构上看不见
+- `apply_user_change()` 有同样隐患（它也对全量配置跑 `compute_diff`），
+  但目前生产无调用方（仅单测），本轮不改行为、只在注释里指路
+
+#### 写入范围
+| 文件 | 改动 |
+|---|---|
+| `pa_agent/config/settings.py` | `persist_patch` 保真 `provider.use_custom` |
+| `tests/unit/test_settings_cascade.py` | 加 2 条回归（含反向验证） |
+| `SESSION_CHANGES.md` / `CHANGELOG.md` | 记录 |
+
+#### 不碰
+`pa_agent/storage/settings_store.py`（门控语义是刻意设计，
+`test_provider_overrides_ignored_until_opted_in` 守护，不放宽）、
+`web/static/**`、容器运行中的配置数据。
+
+---
+
+### 2026-10-12 · 修「切换交易所后品种不联动 → 三轴错配落库」
+
+**状态**：进行中（写入范围已占坑）
+
+#### 需求
+用户报告：切换交易所时「交易对重置」，且记录可能把交易所与品种配错。
+要求把「选项 ↔ 按钮」的联动细节全部走查一遍。
+
+#### 已实测确认的缺陷（真实 Chromium + 真实 app.js，探针见下）
+1. **`setCursorSelect` 在真实浏览器里必抛 TypeError**（P0）：`sel.options` 是
+   `HTMLOptionsCollection`（array-like，**没有 `find`**），`opts.find(...)` 抛
+   `TypeError: opts.find is not a function`。只在「选项已就位」时才走到 →
+   即 `applySubscribe()` 成功后那次 `loadSettings()`（AGENTS.md 硬约束要求的那次）。
+   后果：`loadSettings()` 从该行**静默中断**，其后全部回填被跳过
+   （周期回显、飞书/通知/TradingView 凭据、`updateApiKeyAlert`）。
+   **Node 单测是假绿**：桩把 `options` 实现成真数组，`find` 存在。
+2. **换交易所不联动品种**（P0）：`#ds-symbol` 保留旧值（NVDA），换到 GATEIO
+   后点「应用」发出 `{exchange:'GATEIO', symbol:'NVDA'}`。真实后端
+   `set_exchange` 先生效、`subscribe` **不抛异常**（只是取不到数），
+   于是游标被写成 GATEIO/NVDA → 分析与经验条目按这三轴落库 → 永远结算不了。
+   生产日志里 `experience ... (GATEIO/NVDA/5m) has failed to fetch bars 26 次`
+   就是这个组合。
+3. **`dataset.current` 与 `.value` 漂移**（P1）：`#ds-exchange` 的 change 处理器
+   不更新权威载体，换完后 `dataset.current='NASDAQ'` 而 `.value='GATEIO'`。
+4. **清空搜索框不清权威隐藏域**（P1）：`clearSymbolSearch()` / 清空输入只清可见框，
+   `#ds-symbol` 仍是旧值 → 界面空白、点应用却订阅旧品种。
+5. **`symbolList` 不随交易所失效**（P1）：`loadSymbols()` 失败时不重置，
+   旧交易所的品种表被当成新交易所的（下拉会列出别的交易所的品种）。
+6. **错误提示残留 + 文案误导**（P2）：换品种后 `#switch-error` 仍显示上一条；
+   「品种无效，请检查代码」对用户无意义。
+
+#### 写入范围
+| 文件 | 改动 |
+|---|---|
+| `web/static/js/app.js` | 上述 6 点修复 |
+| `web/static/index.html` | `app.js?v` 递增 |
+| `tests/js/test_exchange_echo.test.js` | 桩改为**无 `find` 的 array-like**，加回归 |
+| `tests/js/test_exchange_switch_linkage.test.js` | 新增：联动行为回归 |
+| `tests/js/probe_exchange_*.py` | 探针（真实浏览器复核用） |
+| `SESSION_CHANGES.md` / `CHANGELOG.md` | 记录 |
+
+#### 不碰
+`web/api/*`（后端三轴逻辑本轮未发现问题，`resolve_view` 单源一致）、
+`chart.js` / `indicators.js` / `style.css`。
+
 ## ✅ 已提交
 
 ### 2026-10-07 · 修 DB baseline 的坏网关组合 + override 无效（当前）

@@ -74,6 +74,23 @@ PA_AGENT 是一个基于 AI 的量化分析工具，提供实时行情数据、�
   `settings_store._apply_llm_source()` 在 `use_custom` 为假时会把用户对
   provider 的覆盖**整段作废**（"跟随系统默认"）。只写 `model` 不写这个开关 ⇒
   改动被静默丢弃、服务照旧旧值，且**没有任何报错**
+- **「与基线同值就稀疏化」不得作用于控制开关**（2026-10-16，同类问题第二次发生）：
+  `provider.use_custom` 是「用户表过态的**凭证**」而非普通配置值，但
+  `persist_patch` 的稀疏化会把它当同值键删掉，而门控把「键缺失」解释为
+  「从未表态」⇒ 用户刚保存的 `model`/`base_url` 被整段作废。
+  **两个各自正确的设计撞在一起就自毁，且伪装成「保存成功」**：`persist_patch`
+  返回 `True`、库里也确实有值，解析结果却一动不动。
+  - 触发条件很窄：仅当 **baseline 自身的 `use_custom` 已是 `True`** 时才吞掉
+    用户的 `True`。故**测试库与新装环境全绿，只在长生命周期的生产库现形**
+  - 判据：凡是「值缺失」与「值等于基线」**语义不同**的键，都不能参与稀疏化。
+    新增此类控制开关时，必须同步 `persist_patch` 的保真清单
+  - 守护：`test_persist_patch_keeps_use_custom_when_baseline_matches` +
+    反向用例 `test_persist_patch_still_sparsifies_ordinary_fields`（后者的作用是
+    **禁止把保真范围扩大**，否则就是用一个 bug 换另一个）
+- **修完「配置不生效」必须验证「下次还生效」**：2026-10-07 那次直接改库补
+  `use_custom: true` 就收工，症状消失但**代码路径没修** ⇒ 2026-10-16 在 Docker
+  原样复发。**改数据库治症状，改代码才治根因**；只改库时必须在 CHANGELOG 里
+  写明「代码未动、会复发」
 - **`save_overrides(patch, user_id)` 参数顺序**是 `(patch, user_id)` ——
   写反会把 dict 当 user_id 绑给 SQLite，报
   `type 'dict' is not supported`，整次写入失败

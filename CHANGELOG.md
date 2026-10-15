@@ -4,6 +4,50 @@
 
 ---
 
+## 2026-10-16
+
+### 33. 修「Docker 里保存 LLM 配置不生效」—— `use_custom` 被稀疏化删掉
+
+- **问题**：用户在 Docker 环境保存 LLM 配置（换 model / base_url）后完全不生效，
+  界面提示「设置已保存」，库里也确实存着，但推理仍走旧配置。**全程无任何报错。**
+- **根因**：`persist_patch` 的落库策略是「与基线同值的键不进用户层」
+  （`compute_diff` 稀疏化），但 `provider.use_custom` **不是普通配置值**，而是
+  「用户表过态的凭证」—— `resolve()` 侧的 `_apply_llm_source()` 把「键缺失」判为
+  「从未表态 → 跟随系统」，并据此**整段作废**用户对 provider 的覆盖。两者撞车：
+  - 基线 `use_custom=True`（容器实际状态）时，用户勾选「自带模型」发出的正是 `True`
+  - 稀疏化判为「与基线同值」→ **删掉该键**
+  - 门控读到缺失 → 判为从未表态 → 把用户刚填的 `model` / `base_url` 整段丢弃
+  - 结果：`persist_patch` 返回 `True`，用户层里也确实躺着那两行，解析值却纹丝不动
+
+  实测对照（隔离库，`persist_patch` 均返回 `True`）：
+
+  | baseline.use_custom | 用户勾选 | 落库的 provider 键 | 生效 model |
+  |---|---|---|---|
+  | False | True | `['model','use_custom']` | 用户值 ✅ |
+  | True | True | `['model']` | 基线值 ❌ 被丢弃 |
+
+  容器库实况与第 2 行逐字吻合（`override.provider = {base_url, model}`，无 `use_custom`）。
+
+- **为什么本地与 CI 全绿**：baseline 的开关只有在它**本身就是 `True`** 时才会吞掉
+  用户的 `True`。测试库与新装环境里它是 `False`（`True != False` 能保住键），
+  而容器库是长生命周期的、10-07 那次修 baseline 时把它写成了 `True`。
+  这解释了「为什么只在 Docker 现形」。
+- **为什么是复发**：2026-10-07 的条目 32 已遇到同一现象，当时**直接改库**补上
+  `use_custom: true`（治症状），代码未动 —— 于是同样的问题在 Docker 再次发生。
+- **修复**：`persist_patch` 对**这一个键**取消稀疏化：调用方显式声明了就原样保留。
+  其余字段（含 provider 的其它字段）稀疏化语义完全不变 —— 否则会用一个 bug
+  换另一个（系统兜底后续更新永远传不到用户）。
+- **测试**：新增 4 条（`tests/unit/test_settings_cascade.py`）——
+  ① 基线同值时开关保真；② 显式 `False` 也留痕；③ **其余字段稀疏化不许被放松**；
+  ④ 两处常量字面量必须同键。
+  **已做反向验证**：撤掉修复后前 3 条立刻变红，失败模式与线上症状逐字一致
+  （`load_overrides("admin")` 里没有 `provider`，即覆盖被整段作废）。
+- **文件**：`pa_agent/config/settings.py`、`tests/unit/test_settings_cascade.py`
+- **遗留**：容器镜像仍需重建并重启才能让该修复在 Docker 生效
+  （代码目录未挂载进容器，重启进程不会加载新代码）。
+
+---
+
 ## 2026-10-07
 
 ### 32. 修 DB baseline 的坏网关组合 + override 被静默丢弃 + CHANGELOG 日期节重排

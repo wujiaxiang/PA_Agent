@@ -344,6 +344,145 @@ def test_persist_patch_refuses_when_db_read_failed(db):
     db._disable("simulated")
     assert persist_patch({"provider": {"model": "should-not-stick"}}) is False
 
+
+# ── use_custom 保真：门控与稀疏化的撞车（2026-10-16）───────────────────────────
+#
+# 这三条用例守护一个**只在生产现形**的缺陷，且它伪装成「保存成功」。
+#
+# 两个设计各自看都对，撞在一起就自毁：
+#   ① 稀疏化：与基线同值的键不进用户层（否则改回默认值会永久挡住系统兜底）
+#   ② 门控：`use_custom` 缺失 = 用户从未表态 = 整段 provider 覆盖作废
+#
+# 当**基线自己的 `use_custom` 恰为 True** 时，用户勾选「自带模型」发出的正是
+# True，①把该键判为「同值」删掉，②随即读到缺失、把用户刚填的 model / base_url
+# 整段丢弃。`persist_patch` 返回 True、用户层里也确实躺着那两行 ——
+# 但解析结果一动不动。
+#
+# 为什么既有测试看不见：它们要么调裸 `compute_diff`（纯函数，天然不含这条
+# 隐式契约），要么走 `persist_patch({"provider": {"model": ...}})` 压根不带
+# 这个键，要么用 `save_overrides` 直接绕过稀疏化。四种写法都碰不到 ①×②。
+
+
+def _baseline_with_use_custom(value: bool) -> dict:
+    """基线自带开关的基准。生产容器里它已是 True（10-07 修 baseline 时写进去的）。"""
+    b = Settings().model_dump()
+    b["provider"]["use_custom"] = value
+    b["provider"]["model"] = "space-bunny-free"
+    b["provider"]["base_url"] = "http://192.168.2.128:8093/v1"
+    return b
+
+
+def test_persist_patch_keeps_use_custom_when_baseline_matches(db):
+    """**核心回归**：键与基线同值时，`use_custom` 也绝不能被稀疏化掉。
+
+    反证（把 `persist_patch` 里的保真逻辑删掉）：本用例在「落库键」断言上失败 ——
+    `sorted(ov) == ['model']` 而没有 `'use_custom'`，随即 resolve 回落到
+    `space-bunny-free`。这正是用户看到「保存不生效」的那条路径。
+    """
+    from pa_agent.config.settings import persist_patch
+    from pa_agent.storage.settings_store import resolve, save_baseline
+
+    save_baseline(_baseline_with_use_custom(True))
+
+    # 前端勾选「自带模型」后必然发出的 body（形状见 app.js::saveSettingsHandler）
+    assert persist_patch({
+        "provider": {
+            "use_custom": True,
+            "model": "longcat-2.5-preview-free",
+            "base_url": "http://192.168.2.128:8094/zen/go/v1",
+        },
+    }, user_id="admin") is True
+
+    ov = load_overrides("admin")["provider"]
+    assert "use_custom" in ov, (
+        f"开关被稀疏化删掉了 —— 落库键只有 {sorted(ov)}；"
+        "而 resolve 侧把『键缺失』当『从未表态』，此处起整段 provider 覆盖作废"
+    )
+    assert ov["use_custom"] is True
+    # 用户真正想改的两个字段必须确实留在用户层
+    assert ov["model"] == "longcat-2.5-preview-free"
+    assert ov["base_url"] == "http://192.168.2.128:8094/zen/go/v1"
+
+    # 闭环：断言**生效值**，不是断言「存进去了」。上面两步都可能过而这里不过。
+    p = resolve("admin")["provider"]
+    assert p["model"] == "longcat-2.5-preview-free", "保存后被门控丢弃，用户看不到任何报错"
+    assert p["base_url"] == "http://192.168.2.128:8094/zen/go/v1"
+
+
+def test_persist_patch_keeps_use_custom_false_explicit(db):
+    """反向：显式选「跟随系统」（False）也要留下痕迹，即便基线也是 False。
+
+    sparse 掉它看似无害（结果都是跟随基线），但会让基线的后续变更**悄悄改变
+    用户界面上显示的模式** —— 用户没动过那个开关，它却自己翻了过去。
+    """
+    from pa_agent.config.settings import persist_patch
+    from pa_agent.storage.settings_store import resolve, save_baseline
+
+    save_baseline(_baseline_with_use_custom(False))
+
+    assert persist_patch(
+        {"provider": {"use_custom": False, "model": "stale"}},
+        user_id="admin",
+    ) is True
+
+    ov = load_overrides("admin")["provider"]
+    assert ov.get("use_custom") is False, "显式选择『跟随系统』必须留痕"
+    p = resolve("admin")["provider"]
+    assert p["use_custom"] is False, "基线日后改成 True 也不该替用户翻开关"
+    assert p["model"] == "space-bunny-free", "stale 覆盖应被门控作废"
+    assert p["base_url"] == "http://192.168.2.128:8093/v1"
+
+
+def test_persist_patch_still_sparsifies_ordinary_fields(db):
+    """保真只对开关本身：**其余字段的稀疏化语义一个都没松**。
+
+    少了这条，上面两条用例的修法（干脆别稀疏化了）也能全绿 ——
+    那会把系统兜底的后续更新永久挡在用户门外，等于用一个 bug 换另一个。
+    """
+    from pa_agent.config.settings import persist_patch
+    from pa_agent.storage.settings_store import load_overrides, save_baseline
+
+    save_baseline(_baseline_with_use_custom(True))
+
+    # ① 非 provider 字段照旧稀疏化
+    persist_patch(
+        {"general": {"context_warning_threshold_pct":
+                     BASE["general"]["context_warning_threshold_pct"]}},
+        user_id="admin",
+    )
+    assert "general" not in (load_overrides("admin") or {}), (
+        "改回与基线同值仍必须退出用户层 —— 保真范围被误扩大了"
+    )
+
+    # ② provider 的**其它**字段也照旧稀疏化（连开关一并提交时）
+    persist_patch({
+        "provider": {
+            "use_custom": True,
+            "model": "space-bunny-free",        # 与基线同值
+            "base_url": "http://192.168.2.128:8093/v1",
+            "reasoning_effort": BASE["provider"]["reasoning_effort"],
+            "thinking": BASE["provider"]["thinking"],
+            "max_output_tokens": BASE["provider"]["max_output_tokens"],
+        },
+    }, user_id="admin")
+    ov = load_overrides("admin")["provider"]
+    assert set(ov) == {"use_custom"}, (
+        f"只应保留开关，其余同值字段仍要稀疏化，实际：{sorted(ov)}"
+    )
+
+
+def test_switch_key_literal_matches_storage_module(db):
+    """两处 `use_custom` 字面量必须指向同一个键。
+
+    `settings.py` 的保真逻辑按 ``_LLM_SWITCH_KEY`` 取值，`settings_store` 的门控
+    按 ``_LLM_CONTROL_KEY`` 判断。名字一旦分叉，保真会写到一个门控不看的键上 ——
+    存储层看起来完全正常，行为却和没修一样。
+    """
+    from pa_agent.config import settings as settings_mod
+    from pa_agent.storage import settings_store
+
+    assert settings_mod._LLM_SWITCH_KEY == settings_store._LLM_CONTROL_KEY
+
 # ── 出厂默认的显式提升（settings.json 不再随保存漂移）─────────────────────────
 
 

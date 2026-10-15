@@ -583,6 +583,13 @@ def save_settings(settings: "Settings", path: Path | None = None) -> None:
 # :func:`persist_patch`。系统兜底层（global_config）在这里不可写：它是所有用户的
 # 只读默认值，只有播种（首次把 settings.json 升格进去）才允许动它。
 
+#: `provider` 段的「自带模型 / 跟随系统」开关。它决定 resolve 时用户对 provider
+#: 的其余覆盖是否被门控作废（见 ``_apply_llm_source``），因此**不可稀疏化**。
+#: 名字与 :data:`pa_agent.storage.settings_store._LLM_CONTROL_KEY` 必须一致，
+#: 在 storage 侧做一次断言守护（测试覆盖），不在这里 duplicate 字面量。
+_LLM_SWITCH_KEY = "use_custom"
+
+
 #: connector / 自动 fallback 有权改写的 provider 字段。其余（thinking /
 #: reasoning_effort / seed / top_p / max_output_tokens …）是用户偏好或 .env，
 #: connector 碰了等于替用户做决定。
@@ -602,6 +609,24 @@ def persist_patch(patch: dict, *, user_id: str | None = None) -> bool:
     写入仍是「合并后再按基准稀疏化」：与基准取值相同的键不会留在用户层里
     （否则用户把某个字段改回默认值后，它会永久挡住系统兜底的后续更新）。
     系统兜底层**绝不被触碰**。
+
+    ## 唯一例外：``provider.use_custom`` 必须保真（2026-10-16）
+
+    ``use_custom`` 不是普通配置值，而是**用户表过态的凭证**：
+    :func:`~pa_agent.storage.settings_store._apply_llm_source` 把「键缺失」判为
+    「从未表态 → 跟随系统」，并据此**整段作废**用户对 provider 的覆盖。
+
+    于是「与基准同值就稀疏化」这条规则在它身上会自毁：基线 ``use_custom=True``
+    时，用户勾选「自带模型」（发出的正是 ``True``）算出的 diff 为空 ⇒ 该键被删
+    ⇒ 门控读到缺失 ⇒ 判为从未表态 ⇒ 用户刚保存的 model / base_url 被整段丢弃。
+    表现为**保存成功、库里也确实有值，就是不生效**，且全程无任何报错。
+
+    实测：基线 ``use_custom=False`` 时该键能保住（故新装环境正常）；
+    一旦基线被提升为 ``True``（如某次「设为出厂默认」），此后每次保存都静默失效
+    —— 这正是 2026-10-07 手工补库后、2026-10-16 又在 Docker 复发的原因。
+
+    故**只对这一个键**取消稀疏化：调用方显式声明了它，就原样保留。其余字段
+    （含 provider 的其它字段）的稀疏化语义完全不变。
 
     不写 settings.json：那份文件只是灾备副本，且 connector 每次启动都会重新探测
     并重放一遍，落不落盘无所谓；而在这里写文件等于把「resolve 读不出来 → 用默认
@@ -635,7 +660,19 @@ def persist_patch(patch: dict, *, user_id: str | None = None) -> bool:
 
         uid = user_id or default_user_id()
         layer = merge_overrides(load_overrides(uid), patch)
-        return save_overrides(compute_diff(load_baseline() or {}, layer), uid)
+        sparse = compute_diff(load_baseline() or {}, layer)
+        # 声明过的开关必须保真，理由见文档字符串「唯一例外」一节。
+        # 值取**合并层**的而非 patch 的：合并层已含本次写入，且能正确处理
+        # 「connector 同步时旧覆盖里遗留的开关」这种非本次声明的场景。
+        layer_provider = layer.get("provider")
+        patch_provider = patch.get("provider")
+        if (
+            isinstance(layer_provider, dict)
+            and isinstance(patch_provider, dict)
+            and _LLM_SWITCH_KEY in patch_provider
+        ):
+            sparse.setdefault("provider", {})[_LLM_SWITCH_KEY] = layer_provider[_LLM_SWITCH_KEY]
+        return save_overrides(sparse, uid)
     except Exception as exc:  # noqa: BLE001 - 落库失败绝不冒泡进业务流
         logger.warning("persist_patch failed (%s): %s", patch, exc)
         return False
