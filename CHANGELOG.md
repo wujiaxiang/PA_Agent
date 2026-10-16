@@ -35,7 +35,7 @@
   `tests/js/test_exchange_echo.test.js`
 - **未修的纵深缺口（已登记）**：后端不校验三轴组合是否存在，直接调 API 仍可写出
   一个永远取不到数的游标并带坏共享数据源。前端守卫只堵住 UI 这一条路径。
-- **提交**：本轮 commit
+- **提交**：`377f12d`（镜像 `pa-agent-web:release-377f12d`）
 
 ## 2026-10-16
 ### 35. 修「推理失败」`400 Upstream temporarily over capacity`：
