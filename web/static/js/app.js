@@ -581,7 +581,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     updateHealth();
-    setInterval(updateHealth, 60000); // 每 60 秒轮询
+    // 5 分钟，不是 60 秒：`/api/health` 不是纯状态查询，它会真打一次 LLM
+    // （`check_model_api` 发一条 1-token 请求）。一个开着的标签页按 60 s 轮询
+    // 就是 1440 次真实模型调用/天，免费配额就是这么耗尽的。横幅不是关键路径，
+    // 5 分钟足够。
+    setInterval(updateHealth, 300000);
   })();
 });
 
@@ -767,7 +771,14 @@ function setCursorSelect(sel, value) {
 
   // ② 选项尚未就位 → 到此为止。loadExchanges/loadTimeframes 会读 dataset.current
   //    选中对应 <option>，这正是「先 settings 后 exchanges」顺序的用途。
-  const opts = sel.options || [];
+  //
+  // ⚠ `sel.options` 是 `HTMLOptionsCollection` —— **array-like 但不是 Array**，
+  //   **没有 `find`/`map`/`filter`**。直接 `opts.find(...)` 在真实浏览器里抛
+  //   `TypeError: opts.find is not a function`，而 Node 桩把它实现成真数组 ⇒
+  //   「单测绿、浏览器红」的假绿灯（2026-10-12 实测：`applySubscribe()` 成功后那次
+  //   `loadSettings()` 每次都抛，其后所有回填被静默跳过）。
+  //   这里显式转成数组，是让两侧语义重新对齐的唯一修法。
+  const opts = Array.from(sel.options || []);
   if (!opts.length) return;
 
   // ③ 选项已就位：兑现 .value，让 dataset 与可见值不漂移
@@ -941,6 +952,7 @@ async function loadSymbols() {
       && (Date.now() - (symbolListCacheTs.get(exchange) || 0)) < SYMBOL_CACHE_TTL) {
     const cached = symbolListCache.get(exchange) || [];
     symbolList = cached;
+    symbolListExchange = exchange;
     // 重新渲染下拉（用户可能切回了之前的交易所，需要恢复搜索框内容）
     const curSymbol = $('#ds-symbol').value || (currentSettings?.general?.last_symbol || 'BTCUSDT');
     const searchInput = $('#ds-symbol-search');
@@ -958,20 +970,79 @@ async function loadSymbols() {
   try {
     const data = await API.get(`/api/tv/symbols?exchange=${encodeURIComponent(exchange)}`);
     const syms = data.symbols || [];
-    // 写入缓存
+    // 写入缓存（按交易所分键，任何时刻写都不会串）
     symbolListCache.set(exchange, syms);
     symbolListCacheTs.set(exchange, Date.now());
-    symbolList = syms;
-    const curSymbol = $('#ds-symbol').value || (currentSettings?.general?.last_symbol || 'BTCUSDT');
-    const searchInput = $('#ds-symbol-search');
-    if (searchInput) {
-      searchInput.value = curSymbol;
+    // **只有界面仍停在这个交易所时才写「当前表」**：快速来回切换（A→B→A）
+    // 时，B 的响应可能晚于第二次 A 的调用落地，那时若照写，`symbolList`/
+    // `symbolListExchange` 就变成 B 的，而下拉明明是 A —— 判定
+    // 「品种是否属于本交易所」的正是这份表，串了就得出相反结论。
+    const selNow = $('#ds-exchange');
+    if (((selNow && selNow.value) || '') === exchange) {
+      symbolList = syms;
+      symbolListExchange = exchange;
+      const curSymbol = $('#ds-symbol').value || (currentSettings?.general?.last_symbol || 'BTCUSDT');
+      const searchInput = $('#ds-symbol-search');
+      if (searchInput) {
+        searchInput.value = curSymbol;
+      }
     }
   } catch (e) {
     console.error('loadSymbols:', e);
+    // **取不到就清空，绝不保留上一个交易所的表**：留着会让 GATEIO 的下拉
+    // 列出 NASDAQ 的品种（用户看着像对的，选出来是错的），且
+    // 「品种是否属于本交易所」这道校验会拿别人的表当依据。
+    const selNow = $('#ds-exchange');
+    if (((selNow && selNow.value) || '') === exchange) {
+      symbolList = [];
+      symbolListExchange = exchange;
+    }
   } finally {
     _inflightExchange = null;
   }
+}
+
+/**
+ * 换交易所后，把「已不属于该交易所」的品种清掉并提示。
+ *
+ * **为什么必须做**：`#ds-symbol` 是出站订阅的**唯一真源**，而它是
+ * **交易所私有**的 —— NVDA 只挂在 NASDAQ，换到 GATEIO 后它并不存在。
+ * 保留旧值会让「应用」发出 `{exchange:'GATEIO', symbol:'NVDA'}`：真实后端
+ * `set_exchange()` 先生效、`subscribe()` **不抛异常**（只是取不到数），于是
+ * 会话游标被写成 GATEIO/NVDA，分析与经验条目按这三轴落库 ⇒
+ * 一条**永远结算不了**的记录（生产日志实测该组合累计取数失败 26 次）。
+ * 清空比「猜一个替代品」安全：猜错用户看不见，清空至少看得见。
+ *
+ * 判据只用**本交易所**的品种表（`symbolListExchange` 必须相等）：
+ * 拿别的交易所的表当依据会误清。
+ */
+async function resetSymbolIfAbsentFromExchange(exchange) {
+  await loadSymbols();
+  const hidden = $('#ds-symbol');
+  if (!hidden) return;
+  const cur = (hidden.value || '').trim().toUpperCase();
+  if (!cur) return;
+  // 表不属于本交易所（并发/请求未回来）→ 没有依据，不动
+  if (symbolListExchange !== exchange) return;
+  // 表为空 = 这次没取到（网络/上游抖动）。宁可让后端拒绝，也不要把用户
+  // 刚选好的品种因为一次抖动清掉；但也**不能**当作「品种合法」放行。
+  if (!symbolList.length) {
+    showToast(`未能获取 ${exchangeDisplayName(exchange) || exchange} 的品种列表，`
+      + `请确认 ${cur} 是否属于该交易所`, 'error');
+    return;
+  }
+  const codes = symbolList.map(s => String(typeof s === 'object' ? s.code : s).toUpperCase());
+  if (codes.includes(cur)) return;
+
+  hidden.value = '';
+  const shown = $('#ds-symbol-search');
+  if (shown) shown.value = '';
+  const alert = $('#symbol-alert');
+  if (alert) {
+    alert.textContent = `${cur} 在 ${exchangeDisplayName(exchange) || exchange} 不存在，请重新选择品种`;
+    alert.removeAttribute('hidden');
+  }
+  showToast(`${cur} 不属于 ${exchangeDisplayName(exchange) || exchange}，已清空，请重新选择品种`, 'error');
 }
 
 async function loadDataSources() {
@@ -1250,7 +1321,16 @@ function bindEvents() {
   });
   // 交易所切换：重新拉对应的品种列表
   $('#ds-exchange').addEventListener('change', () => {
-    loadSymbols();
+    const sel = $('#ds-exchange');
+    // 用户的选择立刻成为「待应用游标」：`dataset.current` 是**权威载体**，
+    // 不写它，后续任何一次重渲染（loadExchanges/loadSettings 的回显）都会
+    // 把界面弹回旧交易所 —— 界面显示 GATEIO、逻辑仍认为 NASDAQ，两处
+    // 投影各说各话，且全程无报错。
+    if (sel) sel.dataset.current = sel.value || '';
+    // 品种是**交易所私有**的：换交易所后必须确认旧品种还在不在。
+    // 不在就清掉 —— 否则点「应用」会发出三轴错配，落库成一条永远
+    // 结算不了的记录（见 resetSymbolIfAbsentFromExchange 的说明）。
+    resetSymbolIfAbsentFromExchange(sel ? sel.value : '');
     // 不自动应用，等用户点"应用"按钮
   });
   // 品种搜索输入事件
@@ -1914,7 +1994,10 @@ async function applySubscribe() {
     if (type === 'timeout') {
       displayMsg = '切换超时，请重试。';
     } else if (type === 'symbol') {
-      displayMsg = '品种无效，请检查代码：' + msg;
+      // 文案必须是**给用户**看的，不能复述后端/内部报错原文。原写法
+      // 「品种无效，请检查代码：symbol NVDA not found on GATEIO」把英文
+      // 内部错误甩给用户，「请检查代码」对用户更是无从下手。
+      displayMsg = `所选品种在该交易所不存在，请重新选择。${msg}`;
     } else {
       // 连接错误：包含 tvDatafeed 未安装的兜底提示
       if (/tvDatafeed|tradingview.*connect|importerror|module/.test(msg.toLowerCase())) {
@@ -2067,6 +2150,10 @@ function startLiveRefresh(intervalMs) {
 // ── 品种输入模式切换（下拉 ↔ 自定义输入） ────────────────────────────
 let symbolInputMode = 'select';  // 'select' or 'custom'
 let symbolList = [];              // 品类列表数据，供搜索使用
+//: `symbolList` 属于哪个交易所。**必须与 symbolList 同进同退**：换交易所后
+//: 旧表若不失效，下拉会列出别的交易所的品种，而「品种是否属于本交易所」
+//: 这道校验也会拿别人的表当依据。
+let symbolListExchange = '';
 
 function toggleSymbolInputMode() {
   const searchInput = $('#ds-symbol-search');
@@ -2120,6 +2207,13 @@ function handleSymbolSearch(e) {
   const clearBtn = $('#btn-symbol-clear');
   if (clearBtn) {
     clearBtn.toggleAttribute('hidden', !query);
+  }
+  // 输入被清空 = 用户明确「不要这个品种」。`#ds-symbol` 是**出站订阅的唯一
+  // 真源**，只清可见框会让界面显示空白、点「应用」却仍订阅旧品种 ——
+  // 用户看到的是「我明明清空了」，实际发出去的是另一个代码。
+  if (!query) {
+    const hidden = $('#ds-symbol');
+    if (hidden) hidden.value = '';
   }
   filterSymbolList(query);
 }
@@ -2320,6 +2414,10 @@ function selectSymbol(symbol) {
 
   const alert = $('#symbol-alert');
   if (alert) alert.setAttribute('hidden', '');
+  // 上一条「切换失败」提示说的是**上一个品种/交易所**，用户已经重新选好了
+  // 却还挂着旧错误，会让人以为这次的选择也被否掉了。
+  const switchErr = $('#switch-error');
+  if (switchErr) switchErr.setAttribute('hidden', '');
 }
 
 function clearSymbolSearch() {
@@ -2332,6 +2430,9 @@ function clearSymbolSearch() {
   if (clearBtn) {
     clearBtn.setAttribute('hidden', '');
   }
+  // 同 handleSymbolSearch：可见框与权威隐藏域必须**一起清**。
+  const hidden = $('#ds-symbol');
+  if (hidden) hidden.value = '';
   filterSymbolList('');
 }
 
@@ -6056,15 +6157,24 @@ async function loadExperienceLibrary(opts) {
           // 视窗定位按**实际周期**换算成逻辑 bar 偏移。此前写死 `/3600`，
           // 只在 1h 下正确：5m 会偏 12 倍、15m 偏 4 倍、4h 反向偏 4 倍，
           // 结果被 Math.max(0, ...) 夹到最左边 —— 定位到错误的区域。
+          //
+          // 但光换算还不够：`setVisibleLogicalRange` 要的是**从最老那根算起的
+          // 绝对索引**，而 `logicalOffsetFrom` 给的是**相对最新那根**的偏移
+          // （历史记录是负数）。直接 `Math.max(0, off - 10)` 于是把视窗夹到最
+          // 左边 —— 实测点一条 48 根前的记录，画面跳到最老的 80 根，入场点
+          // 根本不在视野里。必须加回 `(barCount - 1)`。
           const anchor = Number(rec.entry_ts_open_ms || 0);
-          const win = Number(window.__PA_LAST_BAR_TIME__ || 0);
-          if (anchor > 0 && win > 0) {
-            const sec = anchor / 1000;
-            const off = typeof window.logicalOffsetFrom === 'function'
-              ? window.logicalOffsetFrom(sec - win, rec.timeframe)
-              : Math.round((sec - win) / 3600);
-            const from = Math.max(0, off - 10);
-            chart.timeScale().setVisibleLogicalRange({ from, to: from + 80 });
+          const newestSec = Number(window.__PA_LAST_BAR_TIME__ || 0);
+          const barCount = (lastBars || []).length;
+          if (anchor > 0 && barCount > 0) {
+            const range = typeof window.experienceViewportRange === 'function'
+              ? window.experienceViewportRange(
+                  anchor / 1000, newestSec, barCount, rec.timeframe,
+                  Number(rec.resolved_ts_open_ms || 0) / 1000)
+              : null;
+            // 锚点落在数据范围外时不硬夹到边界（会退化成两三根超宽 K 线），
+            // 保持当前视窗；图例已说明「入场点不在当前 K 线范围内，未标注」。
+            if (range) chart.timeScale().setVisibleLogicalRange(range);
           }
         }
         showToast(`已在主图标出：${rec.symbol} ${rec.timeframe} 的入场 / 止盈 / 止损`, 'success');

@@ -4,6 +4,39 @@
 
 ---
 
+## 2026-10-17
+
+### 36. 修「切换交易所后品种不联动」→ 第二个浏览器 K 线全无（固化上线）
+
+- **问题**：用户报告「两个浏览器访问 admin，第二个窗口没有 K 线」。生产日志中
+  该浏览器唯一一条失败请求是 `GET /api/bars?count=300 → 500`，异常为
+  `TradingView 无数据（NASDAQ / BTCUSDT）` —— 前端向 TradingView 要了
+  「**NASDAQ 交易所上的 BTCUSDT**」，该组合不存在。
+- **根因**：换交易所时 `#ds-symbol` 保留旧交易所的品种，点「应用」就发出
+  `{exchange:'NASDAQ', symbol:'BTCUSDT'}` 这类三轴错配。后端
+  `resolve_tv_pair()` 只修正黄金品种、其余一律信任调用方，于是错配被接受并
+  写进**会话游标**；`get_hist` 取不到数 → 抛 `DataSourceTransientError` →
+  `/api/bars` 返回 500 → 图上空白。
+- **为什么像「只有第二个窗口坏」**：会话游标按标签页/浏览器各一份，谁执行了
+  「只改交易所」谁就坏，另一个窗口不受影响。
+- **外溢副作用**：坏组合同时经 `set_exchange()` / `subscribe()` 写进**共享
+  数据源**，健康探针也去查 `BTCUSDT@NASDAQ`，实测 **189 秒** 并把状态拖成
+  `degraded` —— 健康检查被同一个 bug 带偏，这正是它没能提前报警的原因。
+- **修复**（前端，2026-10-12 会话编写，本轮核对后固化上线）：`app.js` 新增
+  `resetSymbolIfAbsentFromExchange()` —— 换交易所后若当前品种不属于新交易所
+  即清空并提示；`symbolListExchange` 让品种表随交易所失效；`setCursorSelect`
+  改用 `Array.from(sel.options)`（真实 `HTMLOptionsCollection` **没有 `find`**，
+  而 Node 桩把它实现成真数组 ⇒ 单测假绿灯）；清空搜索框同步清 `#ds-symbol`；
+  健康轮询 60s → 300s（每次真的打一次 LLM，一个常开标签页一天 1440 次调用）。
+- **测试**：`tests/js/test_exchange_echo.test.js` 新增 H/I/J/K 四例。
+  **反向验证**：撤掉 `resetSymbolIfAbsentFromExchange` 调用后 H 立刻变红
+  （`'NVDA' !== ''`），恢复后 5 个前端测试文件全绿。
+- **文件**：`web/static/js/app.js`、`web/static/index.html`（`?v=80`→`?v=81`）、
+  `tests/js/test_exchange_echo.test.js`
+- **未修的纵深缺口（已登记）**：后端不校验三轴组合是否存在，直接调 API 仍可写出
+  一个永远取不到数的游标并带坏共享数据源。前端守卫只堵住 UI 这一条路径。
+- **提交**：本轮 commit
+
 ## 2026-10-16
 ### 35. 修「推理失败」`400 Upstream temporarily over capacity`：
 

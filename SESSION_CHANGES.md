@@ -22,51 +22,6 @@
 
 ## 🔴 进行中（有人正在改这些文件，不要动）
 
-### 2026-10-12 · 修「切换交易所后品种不联动 → 三轴错配落库」
-
-**状态**：进行中（写入范围已占坑）
-
-#### 需求
-用户报告：切换交易所时「交易对重置」，且记录可能把交易所与品种配错。
-要求把「选项 ↔ 按钮」的联动细节全部走查一遍。
-
-#### 已实测确认的缺陷（真实 Chromium + 真实 app.js，探针见下）
-1. **`setCursorSelect` 在真实浏览器里必抛 TypeError**（P0）：`sel.options` 是
-   `HTMLOptionsCollection`（array-like，**没有 `find`**），`opts.find(...)` 抛
-   `TypeError: opts.find is not a function`。只在「选项已就位」时才走到 →
-   即 `applySubscribe()` 成功后那次 `loadSettings()`（AGENTS.md 硬约束要求的那次）。
-   后果：`loadSettings()` 从该行**静默中断**，其后全部回填被跳过
-   （周期回显、飞书/通知/TradingView 凭据、`updateApiKeyAlert`）。
-   **Node 单测是假绿**：桩把 `options` 实现成真数组，`find` 存在。
-2. **换交易所不联动品种**（P0）：`#ds-symbol` 保留旧值（NVDA），换到 GATEIO
-   后点「应用」发出 `{exchange:'GATEIO', symbol:'NVDA'}`。真实后端
-   `set_exchange` 先生效、`subscribe` **不抛异常**（只是取不到数），
-   于是游标被写成 GATEIO/NVDA → 分析与经验条目按这三轴落库 → 永远结算不了。
-   生产日志里 `experience ... (GATEIO/NVDA/5m) has failed to fetch bars 26 次`
-   就是这个组合。
-3. **`dataset.current` 与 `.value` 漂移**（P1）：`#ds-exchange` 的 change 处理器
-   不更新权威载体，换完后 `dataset.current='NASDAQ'` 而 `.value='GATEIO'`。
-4. **清空搜索框不清权威隐藏域**（P1）：`clearSymbolSearch()` / 清空输入只清可见框，
-   `#ds-symbol` 仍是旧值 → 界面空白、点应用却订阅旧品种。
-5. **`symbolList` 不随交易所失效**（P1）：`loadSymbols()` 失败时不重置，
-   旧交易所的品种表被当成新交易所的（下拉会列出别的交易所的品种）。
-6. **错误提示残留 + 文案误导**（P2）：换品种后 `#switch-error` 仍显示上一条；
-   「品种无效，请检查代码」对用户无意义。
-
-#### 写入范围
-| 文件 | 改动 |
-|---|---|
-| `web/static/js/app.js` | 上述 6 点修复 |
-| `web/static/index.html` | `app.js?v` 递增 |
-| `tests/js/test_exchange_echo.test.js` | 桩改为**无 `find` 的 array-like**，加回归 |
-| `tests/js/test_exchange_switch_linkage.test.js` | 新增：联动行为回归 |
-| `tests/js/probe_exchange_*.py` | 探针（真实浏览器复核用） |
-| `SESSION_CHANGES.md` / `CHANGELOG.md` | 记录 |
-
-#### 不碰
-`web/api/*`（后端三轴逻辑本轮未发现问题，`resolve_view` 单源一致）、
-`chart.js` / `indicators.js` / `style.css`。
-
 ## ✅ 已提交
 
 ### 2026-10-16 · 合并上游 main + 固化为镜像 + 修「测试污染 config/settings.json」
@@ -112,6 +67,84 @@
 **根因**：`promote_to_baseline()` 写完 baseline 后还会把同一份配置写进
 `paths.SETTINGS_JSON_PATH`，那是**导入期常量**，`PA_AGENT_DB_PATH` 管不到。
 `tests/conftest.py` 原本只隔离 DB。
+
+### 2026-10-12 · 修「切换交易所后品种不联动 → 三轴错配落库」
+
+**状态**：已提交（2026-10-17 固化上线）
+
+#### 需求
+用户报告：切换交易所时「交易对重置」，且记录可能把交易所与品种配错。
+要求把「选项 ↔ 按钮」的联动细节全部走查一遍。
+
+#### 已实测确认的缺陷（真实 Chromium + 真实 app.js，探针见下）
+1. **`setCursorSelect` 在真实浏览器里必抛 TypeError**（P0）：`sel.options` 是
+   `HTMLOptionsCollection`（array-like，**没有 `find`**），`opts.find(...)` 抛
+   `TypeError: opts.find is not a function`。只在「选项已就位」时才走到 →
+   即 `applySubscribe()` 成功后那次 `loadSettings()`（AGENTS.md 硬约束要求的那次）。
+   后果：`loadSettings()` 从该行**静默中断**，其后全部回填被跳过
+   （周期回显、飞书/通知/TradingView 凭据、`updateApiKeyAlert`）。
+   **Node 单测是假绿**：桩把 `options` 实现成真数组，`find` 存在。
+2. **换交易所不联动品种**（P0）：`#ds-symbol` 保留旧值（NVDA），换到 GATEIO
+   后点「应用」发出 `{exchange:'GATEIO', symbol:'NVDA'}`。真实后端
+   `set_exchange` 先生效、`subscribe` **不抛异常**（只是取不到数），
+   于是游标被写成 GATEIO/NVDA → 分析与经验条目按这三轴落库 → 永远结算不了。
+   生产日志里 `experience ... (GATEIO/NVDA/5m) has failed to fetch bars 26 次`
+   就是这个组合。
+3. **`dataset.current` 与 `.value` 漂移**（P1）：`#ds-exchange` 的 change 处理器
+   不更新权威载体，换完后 `dataset.current='NASDAQ'` 而 `.value='GATEIO'`。
+4. **清空搜索框不清权威隐藏域**（P1）：`clearSymbolSearch()` / 清空输入只清可见框，
+   `#ds-symbol` 仍是旧值 → 界面空白、点应用却订阅旧品种。
+5. **`symbolList` 不随交易所失效**（P1）：`loadSymbols()` 失败时不重置，
+   旧交易所的品种表被当成新交易所的（下拉会列出别的交易所的品种）。
+6. **错误提示残留 + 文案误导**（P2）：换品种后 `#switch-error` 仍显示上一条；
+   「品种无效，请检查代码」对用户无意义。
+
+#### 写入范围
+| 文件 | 改动 |
+|---|---|
+| `web/static/js/app.js` | 上述 6 点修复 |
+| `web/static/index.html` | `app.js?v` 递增 |
+| `tests/js/test_exchange_echo.test.js` | 桩改为**无 `find` 的 array-like**，加回归 |
+| `tests/js/test_exchange_switch_linkage.test.js` | 新增：联动行为回归 |
+| `tests/js/probe_exchange_*.py` | 探针（真实浏览器复核用） |
+| `SESSION_CHANGES.md` / `CHANGELOG.md` | 记录 |
+
+#### 实际提交与偏差（2026-10-17 固化时核对）
+- **`tests/js/test_exchange_switch_linkage.test.js` 未单独建文件**：联动行为已由
+  `test_exchange_echo.test.js` 的 **H/I/J/K** 四例覆盖（换交易所清无效品种 /
+  保留合法品种 / 清空搜索同步清隐藏域 / 真实 `options` 形状不抛），并已做
+  **反向验证**：撤掉 `resetSymbolIfAbsentFromExchange` 调用后 H 立刻变红
+  （`'NVDA' !== ''`），恢复后 5 个前端测试文件全绿。同一行为不两处断言。
+- **`tests/js/probe_exchange_*.py` 未提交**：真实浏览器人工复核用探针，不进 CI。
+- **不属本条目、保持未提交（勿动）**：`web/static/js/chart.js`（经验回放图例
+  说明，另一会话）、`tests/unit/test_experience_natural_loop.py`、
+  `web/Dockerfile.overlay`。
+
+#### 生产实证（2026-10-17 排查「第二个浏览器没有 K 线」时取得）
+用户报告「两个浏览器访问 admin，第二个窗口没有 K 线」。定位为**同一根因**：
+换交易所后品种未联动 → 发出三轴错配 → 取数失败。
+
+- 生产日志唯一一条浏览器侧失败：`192.168.2.121 - "GET /api/bars?count=300" 500`，
+  异常为 `TradingView 无数据（NASDAQ / BTCUSDT）`——
+  `get_hist(symbol=BTCUSDT, exchange=NASDAQ)` 返回空（BTCUSDT 不在 NASDAQ）。
+- 线上**确定性复现**：会话先订阅 `BTCUSDT/GATEIO`，再只切交易所发
+  `{"exchange":"NASDAQ"}`；后端用会话里的旧品种补齐，返回
+  `"symbol":"BTCUSDT","exchange":"NASDAQ"`，随后 `/api/bars` → HTTP 500，
+  错误文本与生产逐字一致。
+- **为什么表现为「只有第二个窗口坏」**：会话游标是**每标签页各一份**的，
+  谁执行了「只改交易所」谁就坏，另一个窗口不受影响。
+- **副作用会外溢**：同一个坏组合经 `set_exchange()` / `subscribe()` 写进
+  **共享数据源**，使健康探针也去查 `BTCUSDT@NASDAQ`——实测耗时
+  **189 246 ms** 并把整体状态拖成 `degraded`。健康检查被同一个 bug 带偏，
+  这正是它没能提前报警的原因。
+- **纵深缺口（本轮未修，登记待办）**：后端对「该三轴组合是否存在」**完全不校验**
+  （`resolve_tv_pair()` 只修正黄金品种，其余一律信任调用方），故任何客户端
+  ——包括直接调 API——仍能写出一个永远取不到数的游标，并把共享数据源带坏。
+  前端守卫只堵住了 UI 这一条路径。
+#### 不碰
+`web/api/*`（后端三轴逻辑本轮未发现问题，`resolve_view` 单源一致）、
+`chart.js` / `indicators.js` / `style.css`。
+
 **它伪装成无害**：值全合法、模型可用、无任何报错，直到清库重播种时用户
 才拿到被改坏的出厂配置；而 `use_custom` 与 DB baseline 一旦不一致，
 `_apply_llm_source` 门控会整段作废用户覆盖（正是本次 bug 的判据）。

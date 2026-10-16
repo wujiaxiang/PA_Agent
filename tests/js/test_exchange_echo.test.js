@@ -64,6 +64,29 @@ class ClassList {
   get value() { return [...this._s].join(' '); }
 }
 
+/* ⚠ 本文件最重要的一处「桩不许比现实更好」。
+ *
+ * 真实 `select.options` 是 **`HTMLOptionsCollection`**：array-like、可迭代，
+ * 但 **没有 `find` / `map` / `filter`**（它不是 Array）。
+ *
+ * 2026-10-12 实测事故：桩把 `options` 实现成 `[...].map(...)` 返回的**真数组**，
+ * 于是 `opts.find(o => o.value === v)` 在桩里畅通无阻，在 Chromium 里抛
+ * `TypeError: opts.find is not a function` —— 单测 7 条全绿，真机上
+ * `applySubscribe()` 成功后那次 `loadSettings()` 每次都中断，其后所有回填
+ * （周期回显、飞书/通知/TradingView 凭据）被静默跳过。**假绿灯比没有测试更坏。**
+ *
+ * 故这里显式复刻「没有 find」这一条：谁再写 `opts.find(...)`，桩立刻抛。 */
+class OptionsCollection {
+  constructor(list) {
+    this._list = list;
+    this.length = list.length;
+    list.forEach((o, i) => { this[i] = o; });
+  }
+  item(i) { return this._list[i] || null; }
+  namedItem() { return null; }
+  [Symbol.iterator]() { return this._list[Symbol.iterator](); }
+}
+
 class El {
   constructor(tag, id) {
     this.tagName = (tag || 'div').toUpperCase();
@@ -130,8 +153,10 @@ class El {
     }
   }
 
+  /** 与真实 `HTMLOptionsCollection` 同形：**不是数组，没有 find**。 */
   get options() {
-    return (this._options || []).map((o, i) => ({ value: o.value, selected: i === this._sel }));
+    return new OptionsCollection(
+      (this._options || []).map((o, i) => ({ value: o.value, selected: i === this._sel })));
   }
   get selectedIndex() { return this._sel; }
   /** 已就位的选项值集合；空壳 select 返回空数组（= 选项还没加载） */
@@ -211,6 +236,13 @@ class El {
   setAttribute(k, v) { this.attrs[k] = v; }
   removeAttribute(k) { delete this.attrs[k]; }
   hasAttribute(k) { return k in this.attrs; }
+  /** 真实 DOM 有 `toggleAttribute`（handleSymbolSearch 依赖它）—— 桩必须补齐。 */
+  toggleAttribute(name, force) {
+    const want = force === undefined ? !this.hasAttribute(name) : !!force;
+    if (want) this.attrs[name] = '';
+    else delete this.attrs[name];
+    return want;
+  }
   focus() {} blur() {} click() { this.fire('click'); }
   closest() { return null; }
   matches() { return false; }
@@ -273,6 +305,19 @@ const TIMEFRAMES_PAYLOAD = ['1m', '3m', '5m', '15m', '30m', '45m', '1h', '2h', '
 /** 生产库实况：会话游标 NVDA / 5m / NASDAQ。 */
 const CURSOR = { last_symbol: 'NVDA', last_tradingview_exchange: 'NASDAQ', last_timeframe: '5m' };
 
+/**
+ * 各交易所的品种表（形状取自实测）。刻意让 **NVDA 只存在于美股交易所** ——
+ * 现实就是如此，而 `GATEIO/NVDA/5m` 正是生产库里那条永远结算不了的经验条目。
+ * `NYSE` 也含 NVDA，用来验证「换交易所但品种仍合法时不得误清」。
+ */
+const SYMBOLS_BY_EXCHANGE = {
+  NASDAQ: ['NVDA', 'AAPL', 'TSM'],
+  NYSE: ['NVDA', 'TSM'],
+  GATEIO: ['BTCUSDT', 'ETHUSDT'],
+  SSE: ['600519', '601318'],
+  '': ['BTCUSDT'],
+};
+
 /* ══ 3. 装载真实 app.js ═══════════════════════════════════════════════════ */
 
 function makeToken(claims) {
@@ -327,7 +372,11 @@ function buildPage(opts) {
     if (u.startsWith('/api/tv/exchanges')) return o.exchangesFail ? bad() : ok(o.exchanges || EXCHANGES_PAYLOAD);
     if (u.startsWith('/api/timeframes')) return ok(o.timeframes || TIMEFRAMES_PAYLOAD);
     if (u.includes('/api/bars/next-close')) return ok({ next_close_ts: 1791236100000, seconds_remaining: 30, market_closed: false });
-    if (u.startsWith('/api/tv/symbols')) return ok({ symbols: ['NVDA', 'AAPL'] });
+    if (u.startsWith('/api/tv/symbols')) {
+      const m = u.match(/[?&]exchange=([^&]*)/);
+      const ex = m ? decodeURIComponent(m[1]) : '';
+      return ok({ symbols: (o.symbolsByExchange || SYMBOLS_BY_EXCHANGE)[ex] || [] });
+    }
     if (u.startsWith('/api/bars')) return ok({ bars: [], meta: {} });
     if (u.startsWith('/api/records')) return ok([]);
     return ok({});
@@ -376,6 +425,21 @@ function buildPage(opts) {
       await sandbox.loadSymbols();
       await sandbox.loadTimeframes();
     },
+    /**
+     * 绑事件（`bindEvents()`，app.js:519 处调用）。
+     *
+     * 交易所 change、品种 input/清空这些联动**只存在于事件处理器里**，不显式
+     * 调 bindEvents 就一条都测不到 —— 桩把整个 bindEvents 跳过，是「测了个
+     * 不存在的世界」的又一种形态。返回是否抛出，让用例自己断言。
+     */
+    bindEvents: () => {
+      try {
+        sandbox.bindEvents();
+        return null;
+      } catch (e) {
+        return e;
+      }
+    },
     async nextCloseExchange() {
       const url = await nextCloseUrl();
       const m = url.match(/[?&]exchange=([^&]*)/);
@@ -410,7 +474,19 @@ function testStubImplementsRealSelectSemantics() {
   const empty = new El('select', 'y');
   assert.strictEqual(empty.value, '', '空壳 select 的 value 应为 ""');
   assert.deepStrictEqual(empty.optionValues(), [], '空壳 select 没有 option');
-  console.log('✅ A 桩复刻了 select/option 语义（不存在值→""，无 selected→首项）');
+
+  // ⚠ 桩的**诚实性**断言：options 必须与真实 HTMLOptionsCollection 同形 ——
+  // 没有 find/map/filter。少了这条，桩就会比现实「更好用」，把真机必抛的
+  // `opts.find(...)` 放行（2026-10-12 实测事故）。
+  assert.strictEqual(typeof s.options.find, 'undefined',
+    '桩的 options 不得有 find —— 真实 HTMLOptionsCollection 没有它');
+  assert.strictEqual(typeof s.options.map, 'undefined', '桩的 options 不得有 map');
+  assert.strictEqual(Array.isArray(s.options), false, '桩的 options 不得是真数组');
+  assert.strictEqual(s.options.length, 2, 'options 必须有 length（array-like）');
+  assert.strictEqual(s.options[1].value, 'NASDAQ', 'options 必须支持下标访问');
+  assert.deepStrictEqual(Array.from(s.options).map((o) => o.value), ['GATEIO', 'NASDAQ'],
+    'options 必须可被 Array.from 转换（这是正确的取用方式）');
+  console.log('✅ A 桩复刻了 select/option 语义（不存在值→""，无 selected→首项，options 无 find）');
 }
 
 /* ══ B. 刷新后正常回显：游标是 NASDAQ，.value 必须是 NASDAQ ══════════════ */
@@ -437,7 +513,7 @@ async function testRefreshEchoesCursorIntoValue() {
   assert.strictEqual(g.last_timeframe, p.el('ds-timeframe').value, 'currentSettings 与 .value 必须一致');
 
   // 必须是**用户能看见的那个**选项被选中，而不是碰巧 value 字符串相等
-  const sel = p.el('ds-exchange').options.filter((o) => o.selected);
+  const sel = Array.from(p.el('ds-exchange').options).filter((o) => o.selected);
   assert.strictEqual(sel.length, 1, '应恰好选中一个 option');
   assert.strictEqual(sel[0].value, 'NASDAQ', '被选中的就是 NASDAQ 那个 option');
   console.log('✅ B 刷新回显：exchange=%s timeframe=%s', p.el('ds-exchange').value, p.el('ds-timeframe').value);
@@ -610,6 +686,118 @@ async function testReentryKeepsDatasetAndValueInSync() {
     p.el('ds-exchange').value, p.el('ds-timeframe').value);
 }
 
+/* ══ H. 切换交易所后不属于新交易所的品种必须被清掉 ══════════════════════
+ * 要守护的生产事故：游标 NASDAQ/NVDA，换到 GATEIO 后直接点「应用」，
+ * 出站 `{exchange:'GATEIO', symbol:'NVDA'}` —— 该组合的 K 线永远取不到，
+ * 分析与经验条目按这三轴落库 ⇒ 一条**永远结算不了**的记录。
+ * （生产日志：`experience ... (GATEIO/NVDA/5m) has failed to fetch bars 26 次`。）
+ *
+ * 用户能做的正确操作是「先挑该交易所存在的品种再应用」，而界面必须保证
+ * **用户什么都不做时也不会发错**：`#ds-symbol` 是出站真源，它不清，任何
+ * 下游都救不回来（后端 subscribe 不抛异常、只是取不到数）。 */
+
+async function testSwitchExchangeInvalidatesAbsentSymbol() {
+  const p = buildPage();
+  await p.boot();
+  const be = p.bindEvents();
+  assert.strictEqual(be, null, `bindEvents 不得抛，实际 ${be && be.message}`);
+  const st = () => ({
+    exch: p.el('ds-exchange').value,
+    hid: p.el('ds-symbol').value,
+    shown: p.el('ds-symbol-search').value,
+  });
+  assert.deepStrictEqual(st(), { exch: 'NASDAQ', hid: 'NVDA', shown: 'NVDA' }, '前置：初始游标 NASDAQ/NVDA');
+
+  // 用户只换交易所（不挑品种），事件触发真实 change 处理器
+  p.el('ds-exchange').value = 'GATEIO';
+  p.el('ds-exchange').fire('change');
+  await flush(); await flush();
+
+  const after = st();
+  assert.strictEqual(after.exch, 'GATEIO', '交易所已换走');
+  assert.strictEqual(after.hid, '', `出站真源 #ds-symbol 必须被清空（NVDA 不在 GATEIO），实际 ${JSON.stringify(after.hid)}`);
+  assert.strictEqual(after.shown, '', `可见搜索框必须同步清空（否则两种表情各说各话），实际 ${JSON.stringify(after.shown)}`);
+  console.log('✅ H 换交易所清掉不属于它的品种：GATEIO 下 NVDA→清空');
+}
+
+/* ══ I. 换到「品种仍合法」的交易所时不得误清 ═════════════════════════════
+ * H 的反面：NASDAQ/NVDA → NYSE，NVDA 同样挂在 NYSE。判据只用**本交易所**的
+ * 表，不能看见「换了」就清空 —— 否则跨美股交易所切换永远要重选品种。 */
+
+async function testSwitchExchangeKeepsValidSymbol() {
+  const p = buildPage();
+  await p.boot();
+  p.bindEvents();
+  p.el('ds-exchange').value = 'NYSE';
+  p.el('ds-exchange').fire('change');
+  await flush(); await flush();
+
+  assert.strictEqual(p.el('ds-exchange').value, 'NYSE', '交易所已换走');
+  assert.strictEqual(p.el('ds-symbol').value, 'NVDA', 'NVDA 仍属于 NYSE，不得误清');
+  assert.strictEqual(p.el('ds-symbol-search').value, 'NVDA', '可见框也不得动');
+  console.log('✅ I 换到品种仍合法的交易所时不误清：NYSE 下 NVDA 保留');
+}
+
+/* ══ J. 清空搜索框必须清空权威隐藏域 ════════════════════════════════════
+ * 搜索框只是「皮肤」，`#ds-symbol` 才是出站真源。只清皮肤会让界面显示空白、
+ * 点「应用」却仍订阅旧品种 —— 用户看到的是「我明明清空了」。 */
+
+async function testClearingSearchAlsoClearsHiddenSymbol() {
+  const p = buildPage();
+  await p.boot();
+  p.bindEvents();
+  assert.strictEqual(p.el('ds-symbol').value, 'NVDA', '前置：NVDA');
+
+  // 真实事件入口：input 走真实路径
+  const input = p.el('ds-symbol-search');
+  input.value = '';
+  input.fire('input');
+  await flush();
+
+  assert.strictEqual(p.el('ds-symbol').value, '',
+    `清空搜索框后 #ds-symbol 必须同步清空，实际 ${JSON.stringify(p.el('ds-symbol').value)}`);
+
+  // ✕ 按钮同理
+  const q = buildPage();
+  await q.boot();
+  q.bindEvents();
+  q.el('ds-symbol-search').value = '';
+  q.sandbox.clearSymbolSearch();
+  await flush();
+  assert.strictEqual(q.el('ds-symbol').value, '', '点 ✕ 后 #ds-symbol 必须同步清空');
+  console.log('✅ J 清空搜索框同步清空 #ds-symbol（输入框与 ✕ 按钮各走一遍）');
+}
+
+/* ══ K. setCursorSelect 不得依赖「options 有 find」 ════════════════════════
+ * 2026-10-12 实测事故的回归：`opts.find(...)` 在桩（真数组）里畅通、
+ * 在 Chromium（HTMLOptionsCollection）里抛 TypeError —— 且抛的时机恰好是
+ * `applySubscribe()` 成功后那次 `loadSettings()`，其后全部回填被静默跳过。
+ *
+ * A 已锁死「桩的 options 没有 find」，此处锁死「实现不许调用它」：
+ * 用选项已就位的页面跑一次 loadSettings—— 走的就是曾经抛的那条分支，
+ * 不抛且回填完整才算过。 */
+
+async function testSetCursorSelectSurvivesRealOptionsShape() {
+  const p = buildPage();
+  await p.boot();
+  p.bindEvents();
+  // 确切条件：选项已就位 + 游标合法 → 曾抛的正是这一分支
+  assert.ok(p.el('ds-exchange').options.length > 0, '前置：选项已就位');
+  let threw = null;
+  try {
+    await p.sandbox.loadSettings();
+  } catch (e) {
+    threw = e;
+  }
+  assert.strictEqual(threw, null, `选项已就位时 loadSettings 不得抛，实际抛出 ${threw && threw.message}`);
+  // 抛点就在回填中段：过后的字段一个都不能少（loadSettings 抛到哪一行，
+  // 其后的全部回填都会被静默跳过——周期是最直接的目击者）
+  assert.strictEqual(p.el('ds-timeframe').value, '5m',
+    '周期回显必须完整（它是 setCursorSelect 抛点之后的字段）');
+  assert.strictEqual(p.el('ds-exchange').dataset.current, 'NASDAQ', '权威载体必须跟上');
+  console.log('✅ K setCursorSelect 在真实 options 形状下不抛、回填完整');
+}
+
 /* ══ 运行全部 ═══════════════════════════════════════════════════════════ */
 
 (async () => {
@@ -621,6 +809,10 @@ async function testReentryKeepsDatasetAndValueInSync() {
     ['E 未知游标', testUnknownCursorIsReportedNotSilentlyReselected],
     ['F next-close', testNextCloseUsesEchoedExchange],
     ['G 重入不漂移', testReentryKeepsDatasetAndValueInSync],
+    ['H 换交易所清无效品种', testSwitchExchangeInvalidatesAbsentSymbol],
+    ['I 换交易所保留合法品种', testSwitchExchangeKeepsValidSymbol],
+    ['J 清空搜索同步清隐藏域', testClearingSearchAlsoClearsHiddenSymbol],
+    ['K 真实 options 形状', testSetCursorSelectSurvivesRealOptionsShape],
   ];
   let failed = 0;
   for (const [name, fn] of cases) {
