@@ -6,6 +6,30 @@
 
 ## 2026-10-17
 
+### 37. 补提交 `chart.js`，修复经验回放入场/离场箭头不可见（#36 的连带事故）
+
+- **问题**：#36 提交并部署后，用户报告「经验库记录的 K 线入场和离场的箭头没有了」。
+- **根因**：**拆分提交**。#36 提交的 `app.js` 在回放经验时改为调用
+  `window.experienceViewportRange(...)`，而该函数**只定义在同一批工作区改动中的
+  `chart.js`** 里；`chart.js` 被误判为「他人改动」而未提交。部署后
+  `typeof window.experienceViewportRange === 'function'` 为假 ⇒ `range = null`
+  ⇒ `chart.timeScale().setVisibleLogicalRange()` 从不被调用 ⇒ 视窗不移动到
+  入场点 ⇒ marker 虽已创建却落在视野之外 ⇒ 表现为「箭头没有了」。
+  实测（真实 Chromium 打部署实例）：该全局为 `"undefined"`。
+- **判断失误**：当时用 `grep entryReason chart.js` 确认「不含他人改动」就排除了它，
+  但**只查了内容、没查符号依赖** —— 而 `app.js` 恰恰调用它定义的新函数；
+  且提交前只读了 diff 的前 ~170 行，没读完整。
+- **修复**：提交 `chart.js`。它定义并 `window.experienceViewportRange = …` 导出
+  `experienceViewportRange`，把视窗换算修正为**绝对索引**
+  `(barCount-1) + logicalOffsetFrom(...)`（此前的 `Math.max(0, off-10)` 对历史
+  记录恒被夹到最左边），并让视窗同时容纳入场与判定两根；锚点落在数据范围外时
+  返回 `null` 由调用方保持视窗，同时给图例补「为什么没标注」的原因文案。
+- **文件**：`web/static/js/chart.js`
+- **守护**：5 个前端测试全绿；部署后以真实 Chromium 断言该全局为 function
+  且视窗范围包含入场索引。
+- **提交**：本轮 commit
+
+
 ### 36. 修「切换交易所后品种不联动」→ 第二个浏览器 K 线全无（固化上线）
 
 - **问题**：用户报告「两个浏览器访问 admin，第二个窗口没有 K 线」。生产日志中

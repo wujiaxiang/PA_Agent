@@ -697,6 +697,7 @@ function setExperienceReplay(series, entry) {
   // 老案例的入场 bar 早已不在当前 200 根窗口里 —— 这种情况不画，
   // 而在图例里说明「入场点不在当前 K 线范围内」。
   let entryMarked = false;
+  let entryReason = '';
   if (from > 0 && Number.isFinite(from)) {
     const sec = Math.floor(from / 1000);
     const has = _hasBarAt(series, sec);
@@ -704,12 +705,17 @@ function setExperienceReplay(series, entry) {
       markers.push({ time: sec, position: 'aboveBar', shape: 'arrowDown',
                      color: '#2962ff', text: '入场' });
       entryMarked = true;
+    } else {
+      entryReason = '入场点不在当前 K 线范围内，未标注';
     }
+  } else {
+    entryReason = '该记录没有入场 K 线锚点，无法标注';
   }
   // 出场（判定）那根：盈利画向上箭头、亏损画向下箭头 —— 方向本身就是结论。
   // LWC 的 marker 时间必须落在真实 bar 上，否则**静默丢弃**，所以和入场点
   // 一样要先 _hasBarAt 校验，并在图例里说明没标出来的原因。
   let exitMarked = false;
+  let exitReason = '';
   const exitMs = Number(entry.resolved_ts_open_ms || 0);
   if (exitMs > 0 && Number.isFinite(exitMs)) {
     const sec = Math.floor(exitMs / 1000);
@@ -730,8 +736,17 @@ function setExperienceReplay(series, entry) {
           text: statusLabel,
         });
         exitMarked = true;
+      } else {
+        exitReason = '判定 K 线不在当前范围内，未标注';
       }
+    } else {
+      exitReason = '判定 K 线早于入场点，未标注';
     }
+  } else {
+    // 「字段为空」和「不在窗口内」是两件事：前者是这条记录**从来没被写入过**
+    // 判定锚点（结算发生在写入方接受该参数之前），后者只是当前窗口没覆盖到。
+    // 图例必须说清楚是哪一种，否则用户以为数据在、只是没画。
+    exitReason = '该记录没有判定 K 线锚点，无法标注';
   }
   // **必须走 _applyMarkers，不能直接 series.setMarkers()**：后者绕过 overlay
   // 状态，换一条记录时上一条的 marker 不会被清 —— 实测连续点开 3 条经验，
@@ -745,7 +760,8 @@ function setExperienceReplay(series, entry) {
   st.markers = st.markers.concat(markers.map(m => Object.assign({ __src: MARKER_SRC.EXP }, m)));
   _applyMarkers(series);
 
-  _renderExperienceLegend(entry, statusLabel, isLong, dir, entryMarked, exitMarked);
+  _renderExperienceLegend(entry, statusLabel, isLong, dir,
+                         entryMarked, exitMarked, entryReason, exitReason);
 }
 
 // 该时间点是否存在于已加载的 bar 中
@@ -774,7 +790,8 @@ function clearExperienceReplay(series) {
 }
 
 function _renderExperienceLegend(entry, statusLabel, isLong, dir,
-                                 entryMarked = true, exitMarked = true) {
+                                 entryMarked = true, exitMarked = true,
+                                 entryReason = '', exitReason = '') {
   const el = document.getElementById('experience-legend');
   if (!el) return;
   const pnl = typeof entry.pnl_pct === 'number' ? entry.pnl_pct : null;
@@ -793,8 +810,8 @@ function _renderExperienceLegend(entry, statusLabel, isLong, dir,
     ${bars ? `<div class="exp-lg-row">判定窗口 ${escapeHtml(bars)} ${pnlText}</div>` : ''}
     ${entry.status === 'pending' ? '<div class="exp-lg-row dim">K 线尚未走完，继续等待结算</div>' : ''}
     ${entry.status === 'unresolved' ? '<div class="exp-lg-row dim">窗口内未触及任一价位</div>' : ''}
-    ${entryMarked ? '' : '<div class="exp-lg-row dim">入场点不在当前 K 线范围内，未标注</div>'}
-    ${exitMarked ? '' : '<div class="exp-lg-row dim">判定 K 线不在当前范围内，未标注</div>'}
+    ${entryMarked ? '' : `<div class="exp-lg-row dim">${escapeHtml(entryReason || '入场点不在当前 K 线范围内，未标注')}</div>`}
+    ${exitMarked ? '' : `<div class="exp-lg-row dim">${escapeHtml(exitReason || '判定 K 线不在当前范围内，未标注')}</div>`}
   `;
 }
 
@@ -811,10 +828,41 @@ function logicalOffsetFrom(secDiff, timeframe) {
   return Math.round(secDiff / step);
 }
 
+/**
+ * 经验回放的视窗范围。
+ *
+ * `setVisibleLogicalRange` 的索引是**从最老那根算起的绝对位置**，而
+ * `logicalOffsetFrom` 返回的是**相对最新那根**的偏移（历史记录为负）。
+ * 两者混用会把视窗夹到最左边 —— 实测点一条 48 根前的记录，视窗跳到最老的
+ * 80 根，完全看不到入场点。必须把相对偏移换算成绝对索引：`(barCount - 1) + off`。
+ *
+ * 视窗必须同时装下**入场那根**和**判定那根**：判定可能发生在几十根之后，
+ * 只按入场点画固定宽度就会把结论那根留在视野外。
+ *
+ * 锚点落在数据范围外时返回 `null`：不硬夹到边界（那会退化成两三根超宽 K 线），
+ * 由调用方保持当前视窗，图例已经说明「入场点不在当前 K 线范围内，未标注」。
+ */
+function experienceViewportRange(anchorSec, newestSec, barCount, timeframe, exitSec) {
+  const n = Number(barCount) || 0;
+  const anchor = Number(anchorSec) || 0;
+  if (anchor <= 0 || n <= 0) return null;
+  const idx = (n - 1) + logicalOffsetFrom(anchor - newestSec, timeframe);
+  if (idx < 0 || idx > n - 1) return null;
+
+  let to = idx + 30;
+  const exit = Number(exitSec) || 0;
+  if (exit > 0) {
+    const eidx = (n - 1) + logicalOffsetFrom(exit - newestSec, timeframe);
+    if (eidx >= 0 && eidx <= n - 1) to = Math.max(to, eidx + 5);
+  }
+  return { from: Math.max(0, idx - 10), to: Math.min(n, to), idx };
+}
+
 // 挂到全局，供 app.js 调用
 if (typeof window !== 'undefined') {
   window.setExperienceReplay = setExperienceReplay;
   window.clearExperienceReplay = clearExperienceReplay;
   window.experienceReplayMatches = experienceReplayMatches;
   window.logicalOffsetFrom = logicalOffsetFrom;
+  window.experienceViewportRange = experienceViewportRange;
 }

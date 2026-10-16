@@ -141,6 +141,27 @@
   （`resolve_tv_pair()` 只修正黄金品种，其余一律信任调用方），故任何客户端
   ——包括直接调 API——仍能写出一个永远取不到数的游标，并把共享数据源带坏。
   前端守卫只堵住了 UI 这一条路径。
+#### 补充：拆分提交造成的事故与修正（2026-10-17）
+本条目原本声明「不碰 `chart.js`」，但**该声明与实际不符**：`app.js` 的
+`loadExperienceLibrary()` 在回放经验时改为调用
+`window.experienceViewportRange(...)`，而该函数**只定义在同时被改动的
+`chart.js` 里**。两者是**一对**，被拆开提交后：
+
+- 部署镜像里 `app.js` 调 `window.experienceViewportRange`，而 `chart.js` 未定义它
+  ⇒ `typeof … === 'function'` 为假 ⇒ `range = null`
+  ⇒ `setVisibleLogicalRange()` **从不被调用** ⇒ 视窗不移动到入场点
+  ⇒ 入场/判定 marker 落在视野之外 ⇒ 用户报告「经验库的入场/离场箭头没有了」。
+- 实测（真实 Chromium 打部署实例）：`typeof window.experienceViewportRange`
+  = `"undefined"`，而 `setExperienceReplay` / `logicalOffsetFrom` 均为 function。
+
+**修正**：把 `chart.js` 一并提交（它定义并导出 `experienceViewportRange`，
+并给图例补「为什么没标注」的原因文案）。
+
+**教训（已写进 AGENTS.md 硬约束）**：
+1. 用 `grep` 确认「某文件不含他人改动」**不足以**判断能否排除它 ——
+   还必须确认两边**没有符号依赖**（谁调用谁、谁定义谁）。
+2. 提交他人工作区的改动前必须**读完整 diff**，不能只看前几十行。
+
 #### 不碰
 `web/api/*`（后端三轴逻辑本轮未发现问题，`resolve_view` 单源一致）、
 `chart.js` / `indicators.js` / `style.css`。
