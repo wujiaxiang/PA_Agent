@@ -27,7 +27,7 @@
 - **文件**：`web/static/js/chart.js`
 - **守护**：5 个前端测试全绿；部署后以真实 Chromium 断言该全局为 function
   且视窗范围包含入场索引。
-- **提交**：本轮 commit
+- **提交**：`c9a4d32`（镜像 `pa-agent-web:release-c9a4d32`）
 
 
 ### 36. 修「切换交易所后品种不联动」→ 第二个浏览器 K 线全无（固化上线）
