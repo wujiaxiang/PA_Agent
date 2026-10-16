@@ -5,6 +5,23 @@
 ---
 
 ## 2026-10-16
+### 35. 修「推理失败」`400 Upstream temporarily over capacity`：
+
+- **问题**：切到 `longcat-2.5-preview-free` @ 8094 `/zen/go/v1` 后，每次分析都报
+  `400 Upstream temporarily over capacity`；看似负载问题，实为确定性参数错误。
+- **根因**：该网关未被任何 `_is_*` 识别 ⇒ `_provider_max_output_tokens` 走
+  unknown 分支 clamp `_GLOBAL_MAX_OUTPUT_TOKENS=384000`；但本模型**最高只接
+  262144 (256K)**（262144 → 200，262145 → 400，4/4 稳定）。而 400 在
+  `call_with_rate_limit_backoff` 中直接上抛且文案伪装成 capacity，故不可恢复、
+  无线索。
+- **修复**：`DeepSeekClient.chat()` 与 `stream_chat()` 在 400 + capacity/limit 语
+  针命中时，把 max_tokens 折半重试（最多 4 次，下限 8192）；仍失败原样抛出。
+  stream_options 回退也跳过同型 400，避免白打上游。
+- **证据**：本机 Python 从 host 直打 4/4 确认 262144 边界；
+  end-to-end `stream_chat` 已在真实网上跑通。
+- **文件**：`pa_agent/ai/deepseek_client.py` (+90/-18)
+- **提交**：本条 commit
+
 
 ### 34. 合并上游 main + 固化为镜像 + 修「测试污染 config/settings.json」
 

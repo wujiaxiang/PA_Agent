@@ -145,6 +145,36 @@ test_defaults` 写死 `"high"`，让这条**本该守住默认值一致性**的�
 `POST /api/settings/promote-default` 的播种源写入目标在**测试环境**下
 改为 tmp 目录（生产未变）。
 
+### 2026-10-16 · 排查并修「推理失败」：max_tokens 超出模型真实上限（误报 capacity）
+
+**状态**：已提交（commit 见下方）
+
+#### 根因（真实网关重现，非推测）
+用户切到 `longcat-2.5-preview-free` @ 8094 `/zen/go/v1` 后所有分析
+报 `HTTP 400 Upstream temporarily over capacity.`，看似负载问题，实为**确定性参数错误**：
+1. 该网关从不被 `_is_*` 识别 → `_provider_max_output_tokens` 走 unknown 分支
+   → `_GLOBAL_MAX_OUTPUT_TOKENS = 384000`，而本模型**能接受的最大输出是
+   ⌈262144 = 256×1024⌉**（262144 → 200，262145 → 400，4/4 稳定）。
+2. 400 不重试（`call_with_rate_limit_backoff` 只重试 429），且文案伪装成
+   capacity → 用户永远撞死，日志里无有用线索。
+
+#### 修复
+`DeepSeekClient.chat()` 与 `stream_chat()`：当 HTTP 400 且文案命中
+`_OUTPUT_LIMIT_HINTS`（over capacity / max_tokens / token limit …）时，
+把 max_tokens 折半重试，最多 4 次、下限 8192；仍失败则原样抛出
+（不包转异常，保留 SDK 语义；警告里打出 max_tokens 值）。
+`_create_stream` 的 stream_options 回退也跳过同型 400，避免白打上游。
+- 已用真实网关 end-to-end 验证：384000→400→192000→200，产出正常。
+
+#### 守门
+`_OUTPUT_LIMIT_HINTS` **刻意**不收 "context length"/"exceeds" —— 那些通常
+指**提示词**超长，折半输出治不了；收进去只会白打几次上游。
+提示词超长是另一类问题，应单独处理。
+
+#### 接口变更
+无（异常类型不变）。
+
+---
 
 ### 2026-10-16 · 修「LLM 配置保存不生效」：`use_custom` 被稀疏化删掉
 

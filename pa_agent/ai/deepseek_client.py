@@ -287,6 +287,25 @@ _DEEPSEEK_MAX_OUTPUT_TOKENS = 393_216
 # glm-5.2: [1, 131072]; deepseek-v4-flash / sensenova-*-flash-lite: [1, 65536].
 # Global gateway hard cap observed on several OpenAI-compatible proxies (incl. SenseNova).
 _GLOBAL_MAX_OUTPUT_TOKENS = 384_000
+# 有些网关把「max_tokens 超出本模型输出上限」报成 400，文案却是
+# "Upstream temporarily over capacity" —— 听起来像限流，实为确定性参数错误，
+# 且不指出是哪个参数。未知网关上默认 clamp=_GLOBAL_MAX_OUTPUT_TOKENS，无法
+# 预知模型真实上限，故只能命中后折半重试。
+# 2026-10-16 实测 192.168.2.128:8094/zen/go/v1 + longcat-2.5-preview-free：
+# max_tokens=262144 → 200，262145 → 400（4/4 稳定，不是偶发）。
+_OUTPUT_LIMIT_RETRY_FLOOR = 8_192
+_OUTPUT_LIMIT_RETRY_MAX_ATTEMPTS = 4
+#: 只认「输出预算过大」的措辞。刻意不收 "context length" / "exceeds" ——
+#: 那些多指**提示词**超长，折半输出预算治不了，只会白打几次上游。
+_OUTPUT_LIMIT_HINTS = (
+    "over capacity",
+    "capacity",
+    "max_tokens",
+    "max tokens",
+    "max output",
+    "output token",
+    "token limit",
+)
 _SENSENOVA_GLM_MAX_OUTPUT_TOKENS = 131_072
 _SENSENOVA_DEFAULT_MAX_OUTPUT_TOKENS = 65_536
 # B.AI (api.b.ai) 网关：deepseek-v4-flash 的 completion 上限（官方路由配 8192）。
@@ -433,6 +452,21 @@ def _provider_max_output_tokens(settings: AIProviderSettings) -> int:
     else:
         cap = _GLOBAL_MAX_OUTPUT_TOKENS
     return min(cap, _GLOBAL_MAX_OUTPUT_TOKENS)
+
+
+def _is_output_limit_400(exc: BaseException) -> bool:
+    """True when a 400 really means "max_tokens exceeds this model's limit".
+
+    Gateways word this as a capacity/load problem and never name the offending
+    parameter, so the only reliable signal is HTTP 400 + one of the capacity /
+    limit phrasings. Verified on 192.168.2.128:8094/zen/go/v1 with
+    longcat-2.5-preview-free: max_tokens=262144 -> 200, 262145 -> 400
+    "Upstream temporarily over capacity" (4/4 deterministic, *not* transient).
+    """
+    if getattr(exc, "status_code", None) != 400:
+        return False
+    text = str(exc).lower()
+    return any(h in text for h in _OUTPUT_LIMIT_HINTS)
 
 
 def _completion_max_tokens(
@@ -779,20 +813,37 @@ class DeepSeekClient:
         # 置 0，会漏掉「非 sensenova 网关上探针仍退避 5 次」这条。
         if max_retries is not None:
             _rl_kwargs["max_retries"] = int(max_retries)
-        try:
-            response = call_with_rate_limit_backoff(
-                lambda: client.chat.completions.create(
-                    **create_kwargs,
-                    # IMPORTANT: do NOT add temperature, top_p, presence_penalty,
-                    # frequency_penalty — they are incompatible with thinking mode.
-                    # （top_p 例外：thinking 模式下允许，已上方注入）
-                ),
-                **_rl_kwargs,
-            )
-        except Exception as exc:
-            latency_ms = (time.monotonic() - t0) * 1000
-            self._log.error("DeepSeekClient API error after %.0f ms: %s", latency_ms, exc)
-            raise
+        # 自适应折半：模型真实输出上限可能低于代码 clamp，此时网关确定性 400
+        # 且文案误导（见 _OUTPUT_LIMIT_HINTS）。命中就折半 max_tokens 重试。
+        _attempt = 0
+        while True:
+            try:
+                response = call_with_rate_limit_backoff(
+                    lambda: client.chat.completions.create(
+                        **create_kwargs,
+                        # IMPORTANT: do NOT add temperature, top_p, presence_penalty,
+                        # frequency_penalty — they are incompatible with thinking mode.
+                        # （top_p 例外：thinking 模式下允许，已上方注入）
+                    ),
+                    **_rl_kwargs,
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                _mt = int(create_kwargs.get("max_tokens", 0) or 0)
+                if (not _is_output_limit_400(exc)
+                        or _mt <= _OUTPUT_LIMIT_RETRY_FLOOR
+                        or _attempt >= _OUTPUT_LIMIT_RETRY_MAX_ATTEMPTS):
+                    latency_ms = (time.monotonic() - t0) * 1000
+                    self._log.error("DeepSeekClient API error after %.0f ms: %s", latency_ms, exc)
+                    raise
+                _new_mt = max(_OUTPUT_LIMIT_RETRY_FLOOR, _mt // 2)
+                self._log.warning(
+                    "DeepSeekClient.chat: 400 疑似 max_tokens (%d) 超出模型上限，"
+                    "折半重试 max_tokens=%d（第 %d/%d 次）",
+                    _mt, _new_mt, _attempt + 1, _OUTPUT_LIMIT_RETRY_MAX_ATTEMPTS,
+                )
+                create_kwargs["max_tokens"] = _new_mt
+                _attempt += 1
 
         latency_ms = (time.monotonic() - t0) * 1000
 
@@ -1003,6 +1054,9 @@ class DeepSeekClient:
                     # and the orchestrator can rotate free candidates.
                     if is_rate_limit_error(_exc):
                         raise
+                    if _is_output_limit_400(_exc):
+                        # max_tokens 超出模型上限，stream_options 无关；别再白打一次
+                        raise
                     # Retry without stream_options if provider rejects it
                     self._log.debug("stream_options not supported; retrying without it")
                     kwargs_no_so = dict(stream_kwargs)
@@ -1016,10 +1070,29 @@ class DeepSeekClient:
             }
             if _sensenova_fast_fail:
                 _rl_kwargs["max_retries"] = 0
-            stream = call_with_rate_limit_backoff(
-                _create_stream,
-                **_rl_kwargs,
-            )
+            _stream_attempt = 0
+            while True:
+                try:
+                    stream = call_with_rate_limit_backoff(
+                        _create_stream,
+                        **_rl_kwargs,
+                    )
+                    break
+                except Exception as _exc_st:  # noqa: BLE001
+                    _mt = int(stream_kwargs.get("max_tokens", 0) or 0)
+                    if (not _is_output_limit_400(_exc_st)
+                            or _mt <= _OUTPUT_LIMIT_RETRY_FLOOR
+                            or _stream_attempt >= _OUTPUT_LIMIT_RETRY_MAX_ATTEMPTS):
+                        raise
+                    _new_mt = max(_OUTPUT_LIMIT_RETRY_FLOOR, _mt // 2)
+                    self._log.warning(
+                        "DeepSeekClient.stream_chat: 400 疑为 max_tokens (%d) 超出模型上限，"
+                        "折半重试 max_tokens=%d（第 %d/%d 次）",
+                        _mt, _new_mt, _stream_attempt + 1,
+                        _OUTPUT_LIMIT_RETRY_MAX_ATTEMPTS,
+                    )
+                    stream_kwargs["max_tokens"] = _new_mt
+                    _stream_attempt += 1
 
             for chunk in stream:
                 # Check cancellation on each chunk
